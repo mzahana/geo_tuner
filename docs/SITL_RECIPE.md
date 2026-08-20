@@ -9,6 +9,49 @@ Open three container terminals (each: `cd ~/src/d2dtracker_sim_docker &&
 ./docker_run_with_cuda.sh`). If your setup uses the zenoh RMW, keep your
 zenoh router terminal as usual.
 
+## 0. (Optional) PX4 autotune + hover-ulog analysis — SITL rehearsal
+
+Both Phase-0/Phase-1 steps of the tuning guide can be rehearsed in SITL.
+The numbers you get apply to the *simulated* vehicle only — their value in
+SITL is validating the procedure and the tooling end-to-end before doing
+the same two flights on the real X500v2.
+
+**Autotune (rate + attitude loops).** With the sim flying in Position
+mode (after step 2 below):
+
+```bash
+$PX4BIN/px4-param set MC_AT_EN 1        # enable the autotune module (once, then restart PX4)
+# ... hover in Position/Altitude mode, then:
+$PX4BIN/px4-param set MC_AT_START 1     # start the identification sequence
+```
+
+The vehicle injects small excitation for ~40 s, computes rate/attitude
+gains, and applies them (per MC_AT_APPLY). Easier alternative: QGroundControl
+→ Vehicle Setup → PID Tuning → Autotune, which drives the same module with
+progress UI.
+
+**Hover ulog → max_thrust.** SITL logs ulog automatically while armed.
+Fly 1–2 min of steady hover (Position mode), disarm, then find the log —
+it's inside the shared volume, so it's visible on the host too:
+
+```bash
+ls -t ~/shared_volume/PX4-Autopilot/build/px4_sitl_default/rootfs/log/*/  | head
+```
+
+Analyze it on the host with the geo_tuner venv (pyulog lives there):
+
+```bash
+cd ~/src/ihunter_fixes/geo_tuner
+.venv/bin/python -m geo_tuner.cli.analyze_hover \
+    ~/d2dtracker_cuda_shared_volume/PX4-Autopilot/build/px4_sitl_default/rootfs/log/<date>/<file>.ulg \
+    --mass 2.0 --design
+```
+
+(2.0 kg ≈ the sim x500's mass.) It prefers PX4's `hover_thrust_estimate`
+topic — which SITL logs — and prints the hover throttle, the implied
+`max_thrust`, and ready-to-use yaml. Cross-check: the in-flight tuner's
+identified α and the ulog-derived `max_thrust` should agree.
+
 ## 1. Bring up sim + PX4 + mavros + controller (terminal A)
 
 ```bash
