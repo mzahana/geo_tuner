@@ -1,0 +1,32 @@
+/interceptor/tuning_conductor:
+  ros__parameters:
+    # Matches d2dtracker_sim SITL (sitl_bringup.launch.py, default world,
+    # spawn at origin, `commander takeoff` altitude ~2.5 m).
+    controller_node: "interceptor/geometric_controller_node"
+    setpoint_topic: "geometric_controller/multi_dof_setpoint"
+    odom_topic: "geometric_controller/odom"
+
+    hover_position: [0.0, 0.0, 2.5]
+
+    step_size: 0.5
+    step_size_z: 0.4
+    settle_time: 4.0
+    episode_time: 6.0
+    hover_timeout: 25.0
+
+    axes: "z,x,y"
+    wn_ladder: [1.2, 1.6, 2.0]
+    zeta_target: 0.95
+    max_gain_change_factor: 1.6
+
+    # Written into the shared volume so it is visible on the host too
+    report_path: "/home/user/shared_volume/geo_tuner_report.yaml"
+
+    safety:
+      max_tilt: 0.6
+      max_pos_error: 2.5
+      max_velocity: 4.0
+      min_altitude: 0.8
+      max_altitude: 20.0
+      odom_timeout: 0.4
+      osc_rate_rms: 1.2
