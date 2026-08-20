@@ -1,0 +1,32 @@
+geometric_controller_node:
+  ros__parameters:
+    mass: 2.0
+    use_external_yaw: true
+    gains:
+      pos:
+        x: 2.778
+        y: 2.778
+        z: 4.444
+      vel:
+        x: 3.167
+        y: 3.167
+        z: 4.006
+      ki:
+        x: 0.0
+        y: 0.0
+        z: 0.0
+      kib:
+        x: 0.0
+        y: 0.0
+        z: 0.0
+    drag:
+      kd:
+        x: 0.0
+        y: 0.0
+        z: 0.0
+    attctrl_tau: 0.3
+    max_pos_int: 0.5
+    mas_pos_int_b: 0.5
+    max_tilt_angle: 0.52
+    max_accel: 5.0
+    yaw_gain: 0.4

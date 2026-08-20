@@ -335,6 +335,30 @@ clamped to a factor 1.6, ladder monotonic in $\omega_n^\star$, and each
 new gain set starts from a configuration that just flew safely — so the
 iteration is confined to a box around a known-stable point.
 
+**Identifiability.** For near-critically-damped responses the triple
+$(\hat\omega_n, \hat\zeta, \hat T_d)$ is weakly identifiable: because the
+true response is higher-order (inner-loop lag stacks on the position
+loop), "high $\omega_n$, overdamped, large delay" explains the data as
+well as — sometimes better than — the physically correct description.
+Left alone, this produces absurd $\hat\alpha$ (7× observed in SITL). The
+fitter therefore (i) runs multi-start optimization, and (ii) constrains
+$\hat\omega_n$ to the *physically possible* interval implied by the
+applied gains, $\hat\omega_n \in \sqrt{k_x^{app}} \cdot
+[\sqrt{\alpha_{min}}, \sqrt{\alpha_{max}}]$ with
+$[\alpha_{min},\alpha_{max}] = [0.4, 2.5]$ (a real thrust map is not off
+by more than 2.5×). Within that box, $\hat\zeta$ and $\hat T_d$ absorb
+the unmodeled lag. Fits with $\hat\zeta$ pinned at its optimizer bounds
+are rejected outright, and a resulting $\hat\alpha$ outside the box
+discards the episode instead of updating gains.
+
+**Mode supervision.** Episodes only run while PX4 reports OFFBOARD
+(`mavros/state`): outside OFFBOARD the vehicle ignores the controller's
+setpoints and any "response" is noise. Before OFFBOARD the conductor
+streams the current position as setpoint (bumpless engage; the stream is
+also what makes PX4 accept the mode switch); leaving OFFBOARD
+mid-session pauses tuning — episode discarded, gains kept — and it
+resumes from a fresh hover when OFFBOARD returns.
+
 ### A.8 Body-rate feedforward (differential flatness)
 
 Write the specific-force vector $f = a + g e_3 = \tfrac{T}{m} z_B$ with

@@ -80,9 +80,12 @@ ros2 launch geo_tuner field_tune.launch.py ns:=interceptor \
 ```
 
 The conductor reads the controller's current gains (its safe baseline)
-and starts streaming hover setpoints at (0, 0, 2.5) — this stream is what
-makes PX4 willing to enter OFFBOARD. It waits in hover until you switch
-modes; nothing moves yet.
+and starts streaming setpoints — this stream is what makes PX4 willing
+to enter OFFBOARD. It explicitly waits for `mavros/state` to report
+OFFBOARD before any episode runs (status: "Waiting for PX4 mode
+OFFBOARD"); until then it tracks the current position so the mode switch
+is bumpless. If you flip out of OFFBOARD mid-session, tuning pauses
+(episode discarded, gains kept) and resumes when you switch back.
 
 ## 4. Hand control to the geometric controller (terminal B)
 

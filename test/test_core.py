@@ -122,6 +122,37 @@ class TestStepFit:
         with pytest.raises(ValueError):
             fit_step_response(np.arange(5), np.zeros(5), step=0.5)
 
+    def test_bound_pinned_fit_rejected(self):
+        # A ramp (pure integrator response) cannot be explained by the
+        # 2nd-order model inside the bounds; params pin and ok must be False
+        t = np.arange(0, 6, 0.01)
+        y = 0.02 * t  # slow ramp, never settles
+        r = fit_step_response(t, y, step=0.5)
+        assert not r.ok
+
+    def test_ambiguous_higher_order_response_prefers_prior(self):
+        # True plant: 2nd order (wn=1.41, zeta=0.95) cascaded with an
+        # inner-loop lag (tau=0.15 s) — the case where a naive fit locks
+        # onto "high wn, overdamped, huge delay" (alpha ~ 3.7). The
+        # multi-start fitter must return wn near the truth instead.
+        from scipy.signal import lsim, TransferFunction
+        wn, zeta, tau = 1.41, 0.95, 0.15
+        num = [wn * wn]
+        den = np.polymul([1, 2 * zeta * wn, wn * wn], [tau, 1])
+        t = np.arange(0, 6, 0.01)
+        _, y, _ = lsim(TransferFunction(num, den), np.ones_like(t), t)
+        r = fit_step_response(t, 0.5 * y, step=0.5, wn_guess=wn,
+                              zeta_guess=zeta)
+        alpha = r.wn ** 2 / wn ** 2
+        assert 0.4 <= alpha <= 2.5, f"alpha={alpha:.2f} (wn={r.wn:.2f})"
+
+    def test_zero_delay_is_legitimate(self):
+        # delay pinned at its LOWER bound (0) must not reject the fit
+        t, y = self._simulate(1.8, 0.9, delay=0.0, step=0.5)
+        r = fit_step_response(t, y, step=0.5)
+        assert not r.at_bounds
+        assert r.ok
+
 
 class TestSafety:
     def _sample(self, t=0.0, pos=(0, 0, 10), vel=(0, 0, 0),

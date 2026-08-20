@@ -67,6 +67,7 @@ def generate_launch_description():
             "axes": "z,x,y",
             "wn_ladder": [1.2, 1.6],
             "zeta_target": 0.95,
+            "require_offboard": False,  # quad_sim has no mavros/PX4
             "report_path": report_path,
             "safety.min_altitude": 1.0,
             "safety.max_altitude": 20.0,

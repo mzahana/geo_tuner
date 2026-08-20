@@ -42,6 +42,7 @@ from rcl_interfaces.srv import GetParameters, SetParameters
 
 import yaml
 from geometry_msgs.msg import Transform, Twist
+from mavros_msgs.msg import State as MavrosState
 from nav_msgs.msg import Odometry
 from std_msgs.msg import String
 from trajectory_msgs.msg import (MultiDOFJointTrajectory,
@@ -56,6 +57,7 @@ from geo_tuner.core.step_fit import fit_step_response
 class State(Enum):
     WAIT_ODOM = auto()
     WAIT_ENABLE = auto()
+    WAIT_OFFBOARD = auto()
     GOTO_HOVER = auto()
     SETTLE = auto()
     STEP = auto()
@@ -66,6 +68,16 @@ class State(Enum):
 
 
 AXES = {"x": 0, "y": 1, "z": 2}
+
+# Identified plant-gain factors outside this range are physically
+# implausible (thrust maps are not off by >2.5x on a flying vehicle) and
+# indicate a corrupted episode — such identifications are discarded.
+ALPHA_MIN, ALPHA_MAX = 0.4, 2.5
+
+# States in which the conductor is actively flying the vehicle (safety
+# monitoring + offboard supervision apply).
+ACTIVE_STATES = frozenset({State.GOTO_HOVER, State.SETTLE, State.STEP,
+                           State.ANALYZE, State.UPDATE_GAINS})
 
 
 class TuningConductor(Node):
@@ -92,6 +104,12 @@ class TuningConductor(Node):
         self.declare_parameter("zeta_target", 0.95)
         self.declare_parameter("max_gain_change_factor", 1.6)
         self.declare_parameter("require_enable", False)  # gate on a Bool topic
+        # OFFBOARD supervision: episodes only run while PX4 is in OFFBOARD
+        # (otherwise the vehicle ignores our setpoints and every fit is
+        # garbage). Disable only for plant simulators without mavros.
+        self.declare_parameter("require_offboard", True)
+        self.declare_parameter("mavros_state_topic", "mavros/state")
+        self.declare_parameter("offboard_mode", "OFFBOARD")
         self.declare_parameter("report_path", "/tmp/geo_tuner_report.yaml")
         # safety limits
         self.declare_parameter("safety.max_tilt", 0.6)
@@ -134,6 +152,12 @@ class TuningConductor(Node):
         self.odom_sub = self.create_subscription(
             Odometry, gp("odom_topic"), self._odom_cb,
             qos_profile_sensor_data)
+        self.require_offboard = bool(gp("require_offboard"))
+        self.offboard_mode = str(gp("offboard_mode"))
+        self.px4_mode: str | None = None
+        if self.require_offboard:
+            self.state_sub = self.create_subscription(
+                MavrosState, gp("mavros_state_topic"), self._state_cb, 10)
         ctrl = str(gp("controller_node")).strip("/")
         self.get_param_cli = self.create_client(
             GetParameters, f"/{ctrl}/get_parameters")
@@ -175,6 +199,13 @@ class TuningConductor(Node):
     # ------------------------------------------------------------------
     def _now(self) -> float:
         return self.get_clock().now().nanoseconds * 1e-9
+
+    def _state_cb(self, msg: MavrosState):
+        self.px4_mode = msg.mode
+
+    @property
+    def _in_offboard(self) -> bool:
+        return (not self.require_offboard) or self.px4_mode == self.offboard_mode
 
     def _odom_cb(self, msg: Odometry):
         self.odom = OdomSample(
@@ -235,16 +266,27 @@ class TuningConductor(Node):
     def _tick(self):
         now = self._now()
 
-        # Safety runs in every state after we have odometry, except ABORT/DONE
-        if self.odom is not None and self.state not in (State.ABORT, State.DONE,
-                                                        State.WAIT_ODOM):
+        # Safety runs while the conductor is actively flying the vehicle.
+        # It deliberately does NOT run in WAIT_OFFBOARD: there the pilot /
+        # another mode is in command and e.g. tilt limits don't apply.
+        if self.odom is not None and self.state in ACTIVE_STATES:
             active_sp = tuple(self.setpoint)
             violations = self.safety.check(self.odom, active_sp)
             violations += self.safety.check_stale(now)
             if violations:
                 self._abort(", ".join(v.value for v in violations))
 
-        # Setpoint stream must never stop while OFFBOARD is active
+        # Pilot/mode supervision: leaving OFFBOARD mid-session pauses the
+        # tuner (episode discarded, gains kept) until OFFBOARD returns.
+        if self.state in ACTIVE_STATES and not self._in_offboard:
+            self._status(f"PX4 left {self.offboard_mode} "
+                         f"(now: {self.px4_mode}); pausing tuning")
+            self.recording = []
+            self.safety.reset()
+            self._goto(State.WAIT_OFFBOARD)
+
+        # Setpoint stream must never stop while OFFBOARD is active (and it
+        # must already flow in WAIT_OFFBOARD, or PX4 refuses the switch).
         if self.state not in (State.WAIT_ODOM, State.WAIT_ENABLE):
             self._publish_setpoint()
 
@@ -276,6 +318,23 @@ class TuningConductor(Node):
                 wn, zeta = wn_zeta_from_pd(kx, kv)
                 self._status(f"baseline {ax}: kx={kx:.2f} kv={kv:.2f} "
                              f"(wn={wn:.2f}, zeta={zeta:.2f})")
+            self.setpoint = list(self.hover)
+            if not self._in_offboard:
+                self._status(f"Waiting for PX4 mode {self.offboard_mode} "
+                             "(setpoint stream active; switch modes to start)")
+                self._goto(State.WAIT_OFFBOARD)
+            else:
+                self._goto(State.GOTO_HOVER)
+
+    def _st_wait_offboard(self, now):
+        # Track the current position so the eventual OFFBOARD engage is
+        # bumpless; the session then proceeds via GOTO_HOVER.
+        if self.odom is not None:
+            self.setpoint = list(self.odom.pos)
+        if self._in_offboard:
+            self._status(f"{self.offboard_mode} engaged; resuming "
+                         f"(rung {self.rung + 1}/{len(self.wn_ladder)}, "
+                         f"axis {self.axes[self.axis_idx]})")
             self.setpoint = list(self.hover)
             self._goto(State.GOTO_HOVER)
 
@@ -368,8 +427,11 @@ class TuningConductor(Node):
         kx_now, kv_now = self.gains[ax]
         wn_pred = math.sqrt(kx_now)
         try:
-            fit = fit_step_response(t, y, step=step, wn_guess=wn_pred,
-                                    zeta_guess=self.zeta_target)
+            fit = fit_step_response(
+                t, y, step=step, wn_guess=wn_pred,
+                zeta_guess=self.zeta_target,
+                wn_bounds=(wn_pred * math.sqrt(ALPHA_MIN),
+                           wn_pred * math.sqrt(ALPHA_MAX)))
         except (ValueError, RuntimeError) as e:
             self._abort(f"step fit failed on {ax}: {e}")
             return
@@ -403,6 +465,17 @@ class TuningConductor(Node):
 
         kx_new, kv_new, alpha = correct_gains_from_identification(
             kx_now, fit.wn, wn_target, self.zeta_target)
+        # Plausibility gate: a real vehicle's thrust map is not off by
+        # more than ~2.5x. An alpha outside the box means the episode was
+        # corrupted (bias transient, mode change, fit ambiguity) — discard.
+        if not (ALPHA_MIN <= alpha <= ALPHA_MAX):
+            rec.update({"alpha": round(alpha, 3),
+                        "action": "alpha implausible; keeping gains"})
+            self.results.append(rec)
+            self._status(f"{ax}: alpha={alpha:.2f} outside "
+                         f"[{ALPHA_MIN}, {ALPHA_MAX}]; discarding episode")
+            self._next_episode()
+            return
         # Rate-limit gain changes per episode
         kx_new = float(np.clip(kx_new, kx_now / self.max_change,
                                kx_now * self.max_change))
