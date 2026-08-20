@@ -154,6 +154,47 @@ class TestStepFit:
         assert r.ok
 
 
+class TestFirstOrderFit:
+    def _simulate(self, T, delay, step, t_end=6.0, dt=0.01, noise=0.0):
+        from geo_tuner.core.first_order_fit import first_order_step
+        t = np.arange(0.0, t_end, dt)
+        y = step * first_order_step(t - delay, T)
+        if noise > 0:
+            y = y + np.random.default_rng(3).normal(0, noise, t.size)
+        return t, y
+
+    @pytest.mark.parametrize("T,delay", [(0.15, 0.05), (0.4, 0.1), (0.25, 0.0)])
+    def test_recovers_known_system(self, T, delay):
+        from geo_tuner.core.first_order_fit import fit_first_order
+        t, y = self._simulate(T, delay, step=0.5)
+        r = fit_first_order(t, y, step=0.5)
+        assert r.ok
+        assert r.T == pytest.approx(T, rel=0.05)
+        assert r.delay == pytest.approx(delay, abs=0.02)
+
+    def test_noise_robust(self):
+        from geo_tuner.core.first_order_fit import fit_first_order
+        t, y = self._simulate(0.2, 0.05, step=0.5, noise=0.01)
+        r = fit_first_order(t, y, step=0.5)
+        assert r.ok and r.T == pytest.approx(0.2, rel=0.15)
+
+    def test_garbage_rejected(self):
+        from geo_tuner.core.first_order_fit import fit_first_order
+        rng = np.random.default_rng(9)
+        t = np.arange(0, 5, 0.01)
+        r = fit_first_order(t, rng.normal(0, 0.5, t.size), step=0.5)
+        assert not r.ok
+
+    def test_tau_update_rule(self):
+        # T scales linearly with tau through the (cancelling) efficiency:
+        # tau_new = tau * T_target/T_meas reaches the target exactly.
+        beta = 0.8                       # unknown plant efficiency
+        tau = 0.3
+        T_meas = tau / (2 * beta)
+        tau_new = tau * 0.35 / T_meas
+        assert tau_new / (2 * beta) == pytest.approx(0.35)
+
+
 class TestSafety:
     def _sample(self, t=0.0, pos=(0, 0, 10), vel=(0, 0, 0),
                 quat=(1, 0, 0, 0), rates=(0, 0, 0)):

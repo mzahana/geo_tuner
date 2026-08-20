@@ -15,7 +15,7 @@
     episode_time: 6.0       # s recorded per step
     hover_timeout: 25.0     # s to reach/keep the hover point
 
-    axes: "z,x,y"           # z first: thrust-map errors show up there
+    axes: "z,x,y,yaw"           # z first: thrust-map errors show up there
     # Bandwidth ladder [rad/s]: each rung is identified before moving up.
     # Keep the last rung <= (2/attctrl_tau)/4 and <= 0.35/latency.
     wn_ladder: [1.2, 1.6, 2.0]

@@ -379,6 +379,35 @@ is identically zero — it cannot affect the tuning episodes. Implemented
 with a defensive $\pm 3$ rad/s clamp and disabled near free-fall
 ($\lVert a_{des}\rVert < 1$ m/s²).
 
+### A.8b Yaw loop: model, identification, tuning
+
+Yaw authority on a multirotor comes only from rotor drag torque, so the
+heading loop is deliberately slower than tilt. The hardened controller
+scales the body-z attitude-error component by $2/\tau_{yaw}$
+(`yawctrl_tau`) instead of $2/\tau_{att}$, decoupling the two.
+
+Small-angle closed loop for a heading step $\psi_{ref}$:
+
+$$\dot\psi = \frac{2\beta}{\tau_{yaw}}(\psi_{ref}-\psi)
+\;\Rightarrow\;
+\psi(t) = \psi_{ref}\big(1 - e^{-(t-T_d)/T}\big),
+\qquad T = \frac{\tau_{yaw}}{2\beta},$$
+
+where $\beta$ lumps the PX4 yaw-rate-loop efficiency and drag-torque
+authority. The conductor identifies $(T, T_d)$ from a yaw step by
+first-order least squares, and because $T \propto \tau_{yaw}$ through the
+*same* unknown $\beta$, the update
+
+$$\tau_{yaw}^{new} = \tau_{yaw}^{app}\,\frac{T^\star}{\hat T}$$
+
+converges to the target time constant $T^\star$ (default 0.35 s,
+i.e. ~3 rad/s heading bandwidth) with $\beta$ cancelling — the exact
+analogue of the $\alpha$-correction in A.7. Updates are rate-limited
+(factor 1.6) and clamped to $\tau_{yaw} \in [0.15, 1.2]$ s; the safety
+monitor watches yaw-rate oscillation energy separately (threshold
+1.5 rad/s RMS). Yaw steps hold the hover position constant, and position
+steps hold yaw constant, so the identifications don't cross-contaminate.
+
 ### A.9 Online thrust-scale estimator
 
 The accelerometer measures specific force; its body-z component in flight

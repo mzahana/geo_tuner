@@ -33,7 +33,8 @@ class SafetyLimits:
     odom_timeout: float = 0.3      # s
     # Oscillation detector: RMS of mean-removed body rates over the window
     osc_window: float = 2.0        # s
-    osc_rate_rms: float = 1.2      # rad/s
+    osc_rate_rms: float = 1.2      # rad/s, roll+pitch combined
+    osc_yaw_rate_rms: float = 1.5  # rad/s, yaw alone (drag-torque axis)
     osc_min_samples: int = 20
 
 
@@ -89,12 +90,15 @@ class SafetyMonitor:
             self._rates.popleft()
         if len(self._rates) >= self.limits.osc_min_samples:
             n = len(self._rates)
-            rms2 = 0.0
-            for axis in (1, 2):  # roll & pitch rates (yaw excluded)
+
+            def _var(axis):
                 vals = [r[axis] for r in self._rates]
                 mean = sum(vals) / n
-                rms2 += sum((x - mean) ** 2 for x in vals) / n
-            if math.sqrt(rms2) > self.limits.osc_rate_rms:
+                return sum((x - mean) ** 2 for x in vals) / n
+
+            if math.sqrt(_var(1) + _var(2)) > self.limits.osc_rate_rms:
+                v.append(Violation.OSCILLATION)
+            if math.sqrt(_var(3)) > self.limits.osc_yaw_rate_rms:
                 v.append(Violation.OSCILLATION)
 
         return v

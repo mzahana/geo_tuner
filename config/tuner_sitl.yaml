@@ -14,7 +14,7 @@
     episode_time: 6.0
     hover_timeout: 25.0
 
-    axes: "z,x,y"
+    axes: "z,x,y,yaw"
     wn_ladder: [1.2, 1.6, 2.0]
     zeta_target: 0.95
     max_gain_change_factor: 1.6

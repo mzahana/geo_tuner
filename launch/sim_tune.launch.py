@@ -64,7 +64,7 @@ def generate_launch_description():
             "step_size_z": 0.4,
             "settle_time": 3.0,
             "episode_time": 6.0,
-            "axes": "z,x,y",
+            "axes": "z,x,y,yaw",
             "wn_ladder": [1.2, 1.6],
             "zeta_target": 0.95,
             "require_offboard": False,  # quad_sim has no mavros/PX4

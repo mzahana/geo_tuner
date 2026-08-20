@@ -48,6 +48,7 @@ from std_msgs.msg import String
 from trajectory_msgs.msg import (MultiDOFJointTrajectory,
                                  MultiDOFJointTrajectoryPoint)
 
+from geo_tuner.core.first_order_fit import fit_first_order
 from geo_tuner.core.gain_design import (
     correct_gains_from_identification, wn_zeta_from_pd)
 from geo_tuner.core.safety import OdomSample, SafetyLimits, SafetyMonitor
@@ -97,8 +98,13 @@ class TuningConductor(Node):
         self.declare_parameter("settle_time", 4.0)      # s before each step
         self.declare_parameter("hover_timeout", 20.0)   # s to reach hover point
         self.declare_parameter("episode_time", 6.0)     # s of recording
-        # comma-separated to dodge YAML 1.1 parsing of bare "y" as a bool
-        self.declare_parameter("axes", "z,x,y")  # z first
+        # comma-separated to dodge YAML 1.1 parsing of bare "y" as a bool;
+        # may include "yaw" for heading-loop identification
+        self.declare_parameter("axes", "z,x,y,yaw")  # z first
+        self.declare_parameter("yaw_step", 0.5)          # rad
+        self.declare_parameter("yaw_time_constant", 0.35)  # s, target T
+        self.declare_parameter("yawctrl_tau_min", 0.15)
+        self.declare_parameter("yawctrl_tau_max", 1.2)
         # wn ladder: identify at each rung before pushing bandwidth up
         self.declare_parameter("wn_ladder", [1.2, 1.6, 2.0])
         self.declare_parameter("zeta_target", 0.95)
@@ -129,7 +135,11 @@ class TuningConductor(Node):
         self.hover_timeout = float(gp("hover_timeout"))
         self.episode_time = float(gp("episode_time"))
         self.axes = [a.strip() for a in str(gp("axes")).split(",")
-                     if a.strip() in AXES]
+                     if a.strip() in AXES or a.strip() == "yaw"]
+        self.yaw_step = float(gp("yaw_step"))
+        self.yaw_T_target = float(gp("yaw_time_constant"))
+        self.yaw_tau_min = float(gp("yawctrl_tau_min"))
+        self.yaw_tau_max = float(gp("yawctrl_tau_max"))
         self.wn_ladder = [float(w) for w in gp("wn_ladder")]
         self.zeta_target = float(gp("zeta_target"))
         self.max_change = float(gp("max_gain_change_factor"))
@@ -169,6 +179,9 @@ class TuningConductor(Node):
         self.state_t0 = self._now()
         self.odom: OdomSample | None = None
         self.setpoint = list(self.hover)
+        self.setpoint_yaw = 0.0
+        self.yaw_tau: float | None = None   # effective yaw time-constant param
+        self.pre_step_yaw = 0.0
         self.rung = 0                  # index into wn_ladder
         self.axis_idx = 0
         self.step_sign = 1.0
@@ -225,7 +238,8 @@ class TuningConductor(Node):
         pt = MultiDOFJointTrajectoryPoint()
         tr = Transform()
         tr.translation.x, tr.translation.y, tr.translation.z = self.setpoint
-        tr.rotation.w = 1.0
+        tr.rotation.w = math.cos(0.5 * self.setpoint_yaw)
+        tr.rotation.z = math.sin(0.5 * self.setpoint_yaw)
         pt.transforms.append(tr)
         pt.velocities.append(Twist())
         acc = Twist()
@@ -243,13 +257,27 @@ class TuningConductor(Node):
         self.state = state
         self.state_t0 = self._now()
 
+    @staticmethod
+    def _yaw_of(q: tuple) -> float:
+        w, x, y, z = q
+        return math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+
     # ------------------------------------------------------------------
     # gain get/set through the controller's parameter interface
     def _request_gains(self):
         req = GetParameters.Request()
         req.names = ["gains.pos.x", "gains.pos.y", "gains.pos.z",
-                     "gains.vel.x", "gains.vel.y", "gains.vel.z"]
+                     "gains.vel.x", "gains.vel.y", "gains.vel.z",
+                     "yawctrl_tau", "attctrl_tau"]
         self._pending_future = self.get_param_cli.call_async(req)
+
+    def _apply_yaw_tau(self, tau: float):
+        req = SetParameters.Request()
+        req.parameters.append(ParameterMsg(
+            name="yawctrl_tau",
+            value=ParameterValue(type=ParameterType.PARAMETER_DOUBLE,
+                                 double_value=float(tau))))
+        self._pending_future = self.set_param_cli.call_async(req)
 
     def _apply_gains(self, gains: dict[str, tuple[float, float]]):
         req = SetParameters.Request()
@@ -306,8 +334,8 @@ class TuningConductor(Node):
             res = self._pending_future.result()
             self._pending_future = None
             try:
-                vals = [p.double_value for p in res.values]
-            except AttributeError:
+                vals = [p.double_value for p in res.values[:6]]
+            except (AttributeError, IndexError):
                 self._abort("could not read controller gains")
                 return
             self.gains = {"x": (vals[0], vals[3]),
@@ -318,6 +346,27 @@ class TuningConductor(Node):
                 wn, zeta = wn_zeta_from_pd(kx, kv)
                 self._status(f"baseline {ax}: kx={kx:.2f} kv={kv:.2f} "
                              f"(wn={wn:.2f}, zeta={zeta:.2f})")
+            # Yaw time constant: yawctrl_tau if the controller has it and
+            # it is > 0, else it follows attctrl_tau. A controller without
+            # the parameter (upstream build) can't be yaw-tuned.
+            yaw_tau = att_tau = 0.0
+            if len(res.values) >= 8:
+                if res.values[6].type == ParameterType.PARAMETER_DOUBLE:
+                    yaw_tau = res.values[6].double_value
+                if res.values[7].type == ParameterType.PARAMETER_DOUBLE:
+                    att_tau = res.values[7].double_value
+            if yaw_tau > 0.0:
+                self.yaw_tau = yaw_tau
+            elif att_tau > 0.0:
+                self.yaw_tau = att_tau
+            if "yaw" in self.axes:
+                if self.yaw_tau is None:
+                    self._status("controller has no yawctrl_tau/attctrl_tau "
+                                 "params; skipping yaw axis")
+                    self.axes = [a for a in self.axes if a != "yaw"]
+                else:
+                    self._status(f"baseline yaw: tau={self.yaw_tau:.3f} "
+                                 f"(target T={self.yaw_T_target:.2f}s)")
             self.setpoint = list(self.hover)
             if not self._in_offboard:
                 self._status(f"Waiting for PX4 mode {self.offboard_mode} "
@@ -398,28 +447,80 @@ class TuningConductor(Node):
         if now - self.state_t0 < self.settle_time:
             return
         ax = self.axes[self.axis_idx]
-        i = AXES[ax]
-        step = self.step_size_z if ax == "z" else self.step_size
-        step *= self.step_sign
-        self.pre_step_pos = self.odom.pos[i]
-        self.setpoint = list(self.hover)
-        self.setpoint[i] += step
         self.recording = []
         self.step_t0 = now
-        self._status(f"Step {step:+.2f} m on {ax}")
+        if ax == "yaw":
+            step = self.yaw_step * self.step_sign
+            self.pre_step_yaw = self._yaw_of(self.odom.quat)
+            self.setpoint = list(self.hover)
+            self.setpoint_yaw = self.pre_step_yaw + step
+            self._status(f"Yaw step {step:+.2f} rad")
+        else:
+            i = AXES[ax]
+            step = self.step_size_z if ax == "z" else self.step_size
+            step *= self.step_sign
+            self.pre_step_pos = self.odom.pos[i]
+            self.setpoint = list(self.hover)
+            self.setpoint[i] += step
+            self._status(f"Step {step:+.2f} m on {ax}")
         self._goto(State.STEP)
 
     def _st_step(self, now):
         ax = self.axes[self.axis_idx]
-        i = AXES[ax]
         if self.odom is not None:
-            self.recording.append((now - self.step_t0,
-                                   self.odom.pos[i] - self.pre_step_pos))
+            if ax == "yaw":
+                dyaw = self._yaw_of(self.odom.quat) - self.pre_step_yaw
+                dyaw = math.atan2(math.sin(dyaw), math.cos(dyaw))  # unwrap
+                self.recording.append((now - self.step_t0, dyaw))
+            else:
+                i = AXES[ax]
+                self.recording.append((now - self.step_t0,
+                                       self.odom.pos[i] - self.pre_step_pos))
         if now - self.state_t0 >= self.episode_time:
             self._goto(State.ANALYZE)
 
+    def _analyze_yaw(self, now):
+        t = np.array([r[0] for r in self.recording])
+        y = np.array([r[1] for r in self.recording])
+        step = self.yaw_step * self.step_sign
+        try:
+            fit = fit_first_order(t, y, step=step,
+                                  T_guess=max(self.yaw_tau / 2.0, 0.05))
+        except (ValueError, RuntimeError) as e:
+            self._abort(f"yaw fit failed: {e}")
+            return
+        rec = {"axis": "yaw", "rung": self.rung,
+               "T_target": self.yaw_T_target, "step": round(step, 3),
+               "T_meas": round(fit.T, 3), "delay": round(fit.delay, 3),
+               "nrmse": round(fit.nrmse, 3),
+               "yaw_tau_applied": round(self.yaw_tau, 3)}
+        self._status(f"yaw: T={fit.T:.2f}s delay={fit.delay * 1e3:.0f}ms "
+                     f"nrmse={fit.nrmse:.2f}")
+        self.setpoint_yaw = 0.0  # heading back to nominal after episode
+        if not fit.ok:
+            rec["action"] = "fit rejected; keeping yawctrl_tau"
+            self.results.append(rec)
+            self._status("Yaw fit quality gate failed; not updating")
+            self._next_episode()
+            return
+        # T scales with the applied tau through the same (unknown)
+        # efficiency factor, which cancels in the ratio update.
+        tau_new = self.yaw_tau * self.yaw_T_target / fit.T
+        tau_new = float(np.clip(tau_new, self.yaw_tau / self.max_change,
+                                self.yaw_tau * self.max_change))
+        tau_new = float(np.clip(tau_new, self.yaw_tau_min, self.yaw_tau_max))
+        rec.update({"yaw_tau_new": round(tau_new, 3), "action": "tau updated"})
+        self.results.append(rec)
+        self._status(f"yaw: tau {self.yaw_tau:.3f} -> {tau_new:.3f}")
+        self.yaw_tau = tau_new
+        self._apply_yaw_tau(tau_new)
+        self._goto(State.UPDATE_GAINS)
+
     def _st_analyze(self, now):
         ax = self.axes[self.axis_idx]
+        if ax == "yaw":
+            self._analyze_yaw(now)
+            return
         i = AXES[ax]
         step = (self.step_size_z if ax == "z" else self.step_size) * self.step_sign
         t = np.array([r[0] for r in self.recording])
@@ -579,6 +680,8 @@ class TuningConductor(Node):
             "status": status,
             "diagnosis": self.diagnosis,
             "accel_trim": [round(a, 3) for a in self.a_trim],
+            "final_yawctrl_tau": (round(self.yaw_tau, 3)
+                                  if self.yaw_tau is not None else None),
             "time": time.strftime("%Y-%m-%d %H:%M:%S"),
             "zeta_target": self.zeta_target,
             "wn_ladder": self.wn_ladder,
