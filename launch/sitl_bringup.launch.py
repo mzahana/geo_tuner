@@ -1,6 +1,6 @@
 """Minimal PX4 SITL bringup for geometric-controller testing/tuning.
 
-Launches ONLY: Gazebo + PX4 SITL (x500_d435 in ihunter_world), the
+Launches ONLY: Gazebo + PX4 SITL (x500_d435 in the empty default world), the
 map->odom static TF, the /clock bridge, and mavros — the same wiring and
 parameters as d2dtracker_sim's interceptor.launch.py, minus the
 perception/prediction/MPC stack.
@@ -26,7 +26,7 @@ from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 
 NS = "interceptor"
-XPOS, YPOS, ZPOS = "-24.0", "8.0", "1.0"  # ihunter_world spawn
+XPOS, YPOS, ZPOS = "0.0", "0.0", "0.1"  # spawn in the empty default world
 
 
 def generate_launch_description():
@@ -41,7 +41,7 @@ def generate_launch_description():
         launch_arguments={
             "gz_ns": NS,
             "headless": headless,
-            "gz_world": "ihunter_world",
+            "gz_world": "default",
             "gz_model_name": "x500_d435",
             "px4_autostart_id": "4020",
             "instance_id": "1",
