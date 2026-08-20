@@ -134,7 +134,7 @@ class TuningConductor(Node):
         self.odom_sub = self.create_subscription(
             Odometry, gp("odom_topic"), self._odom_cb,
             qos_profile_sensor_data)
-        ctrl = gp("controller_node")
+        ctrl = str(gp("controller_node")).strip("/")
         self.get_param_cli = self.create_client(
             GetParameters, f"/{ctrl}/get_parameters")
         self.set_param_cli = self.create_client(
