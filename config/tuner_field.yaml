@@ -1,0 +1,34 @@
+/tuning_conductor:
+  ros__parameters:
+    # Node name of the running geometric controller (must match its launch)
+    controller_node: "geometric_controller_node"
+    setpoint_topic: "geometric_controller/multi_dof_setpoint"
+    odom_topic: "geometric_controller/odom"
+
+    # Where to hover while tuning (odom/local frame!). Pick >= 10 m AGL
+    # over clear ground and inside your geofence.
+    hover_position: [0.0, 0.0, 10.0]
+
+    step_size: 0.5          # m, lateral test steps
+    step_size_z: 0.4        # m, vertical test steps
+    settle_time: 4.0        # s of quiet hover before each step
+    episode_time: 6.0       # s recorded per step
+    hover_timeout: 25.0     # s to reach/keep the hover point
+
+    axes: "z,x,y"           # z first: thrust-map errors show up there
+    # Bandwidth ladder [rad/s]: each rung is identified before moving up.
+    # Keep the last rung <= (2/attctrl_tau)/4 and <= 0.35/latency.
+    wn_ladder: [1.2, 1.6, 2.0]
+    zeta_target: 0.95
+    max_gain_change_factor: 1.6
+
+    report_path: "/tmp/geo_tuner_report.yaml"
+
+    safety:
+      max_tilt: 0.6         # rad; RC takeover threshold is the pilot
+      max_pos_error: 2.0    # m from active setpoint
+      max_velocity: 4.0     # m/s
+      min_altitude: 5.0     # m — well above ground for field tuning
+      max_altitude: 40.0
+      odom_timeout: 0.4     # s without odometry -> abort
+      osc_rate_rms: 1.2     # rad/s roll/pitch rate RMS -> abort
