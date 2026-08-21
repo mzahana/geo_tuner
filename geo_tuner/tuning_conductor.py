@@ -48,6 +48,7 @@ from std_msgs.msg import String
 from trajectory_msgs.msg import (MultiDOFJointTrajectory,
                                  MultiDOFJointTrajectoryPoint)
 
+from geo_tuner.core.aggregate import EpisodeBucket, robust_ratio_estimate
 from geo_tuner.core.first_order_fit import fit_first_order
 from geo_tuner.core.gain_design import (
     correct_gains_from_identification, wn_zeta_from_pd)
@@ -109,6 +110,13 @@ class TuningConductor(Node):
         self.declare_parameter("wn_ladder", [1.2, 1.6, 2.0])
         self.declare_parameter("zeta_target", 0.95)
         self.declare_parameter("max_gain_change_factor", 1.6)
+        # Repeat each step N times per (axis, rung) and update from the
+        # MEDIAN identified alpha/T: single-episode fits are noisy (the
+        # lateral response is truly higher-order) and that noise maps
+        # 1:1 into the gains. The consistency gate refuses any update
+        # when the accepted estimates disagree by more than this factor.
+        self.declare_parameter("episodes_per_rung", 3)
+        self.declare_parameter("estimate_consistency", 1.35)
         self.declare_parameter("require_enable", False)  # gate on a Bool topic
         # OFFBOARD supervision: episodes only run while PX4 is in OFFBOARD
         # (otherwise the vehicle ignores our setpoints and every fit is
@@ -143,6 +151,8 @@ class TuningConductor(Node):
         self.wn_ladder = [float(w) for w in gp("wn_ladder")]
         self.zeta_target = float(gp("zeta_target"))
         self.max_change = float(gp("max_gain_change_factor"))
+        self.episodes_per_rung = max(1, int(gp("episodes_per_rung")))
+        self.consistency = float(gp("estimate_consistency"))
         self.report_path = str(gp("report_path"))
 
         self.safety = SafetyMonitor(SafetyLimits(
@@ -184,6 +194,8 @@ class TuningConductor(Node):
         self.pre_step_yaw = 0.0
         self.rung = 0                  # index into wn_ladder
         self.axis_idx = 0
+        self.rep = 0                   # episode repetition within (axis, rung)
+        self.bucket = EpisodeBucket()  # accepted estimates for this bucket
         self.step_sign = 1.0
         self.recording: list[tuple[float, float]] = []  # (t, pos[axis])
         self.step_t0 = 0.0
@@ -483,35 +495,63 @@ class TuningConductor(Node):
         t = np.array([r[0] for r in self.recording])
         y = np.array([r[1] for r in self.recording])
         step = self.yaw_step * self.step_sign
+        rec = {"axis": "yaw", "rung": self.rung, "rep": self.rep,
+               "T_target": self.yaw_T_target, "step": round(step, 3),
+               "yaw_tau_applied": round(self.yaw_tau, 3)}
         try:
             fit = fit_first_order(t, y, step=step,
                                   T_guess=max(self.yaw_tau / 2.0, 0.05))
         except (ValueError, RuntimeError) as e:
-            self._abort(f"yaw fit failed: {e}")
+            rec["action"] = f"episode discarded (fit error: {e})"
+            self.results.append(rec)
+            self._status(f"yaw fit failed ({e}); discarding episode")
+            self.setpoint_yaw = 0.0
+            self._episode_finished()
             return
-        rec = {"axis": "yaw", "rung": self.rung,
-               "T_target": self.yaw_T_target, "step": round(step, 3),
-               "T_meas": round(fit.T, 3), "delay": round(fit.delay, 3),
-               "nrmse": round(fit.nrmse, 3),
-               "yaw_tau_applied": round(self.yaw_tau, 3)}
+        rec.update({"T_meas": round(fit.T, 3), "delay": round(fit.delay, 3),
+                    "nrmse": round(fit.nrmse, 3)})
         self._status(f"yaw: T={fit.T:.2f}s delay={fit.delay * 1e3:.0f}ms "
                      f"nrmse={fit.nrmse:.2f}")
         self.setpoint_yaw = 0.0  # heading back to nominal after episode
         if not fit.ok:
-            rec["action"] = "fit rejected; keeping yawctrl_tau"
+            rec["action"] = "fit rejected"
+            self._status("Yaw fit quality gate failed; episode discarded")
+        else:
+            rec["action"] = "accepted"
+            self.bucket.add(fit.T, fit.delay)
+        self.results.append(rec)
+        self._episode_finished()
+
+    def _finalize_yaw_bucket(self):
+        """All reps for this yaw bucket flown: aggregate the accepted T
+        estimates and update yawctrl_tau from their median."""
+        est = robust_ratio_estimate(
+            self.bucket.alphas, min_count=min(2, self.episodes_per_rung),
+            max_spread=self.consistency)
+        rec = {"axis": "yaw", "rung": self.rung,
+               "n_episodes": self.episodes_per_rung, "n_used": est.n_used,
+               "spread": (round(est.spread, 3)
+                          if math.isfinite(est.spread) else None)}
+        if not est.ok:
+            rec["action"] = f"keeping yawctrl_tau ({est.reason})"
             self.results.append(rec)
-            self._status("Yaw fit quality gate failed; not updating")
-            self._next_episode()
+            self._status(f"yaw: {est.reason}; keeping tau")
+            self._advance_axis()
             return
+        T_med = est.value
         # T scales with the applied tau through the same (unknown)
         # efficiency factor, which cancels in the ratio update.
-        tau_new = self.yaw_tau * self.yaw_T_target / fit.T
+        tau_new = self.yaw_tau * self.yaw_T_target / T_med
         tau_new = float(np.clip(tau_new, self.yaw_tau / self.max_change,
                                 self.yaw_tau * self.max_change))
         tau_new = float(np.clip(tau_new, self.yaw_tau_min, self.yaw_tau_max))
-        rec.update({"yaw_tau_new": round(tau_new, 3), "action": "tau updated"})
+        rec.update({"T_median": round(T_med, 3),
+                    "yaw_tau_new": round(tau_new, 3),
+                    "action": "tau updated (median)"})
         self.results.append(rec)
-        self._status(f"yaw: tau {self.yaw_tau:.3f} -> {tau_new:.3f}")
+        self._status(f"yaw: median T={T_med:.2f}s (n={est.n_used}, "
+                     f"spread {est.spread:.2f}x) -> tau "
+                     f"{self.yaw_tau:.3f} -> {tau_new:.3f}")
         self.yaw_tau = tau_new
         self._apply_yaw_tau(tau_new)
         self._goto(State.UPDATE_GAINS)
@@ -527,6 +567,10 @@ class TuningConductor(Node):
         y = np.array([r[1] for r in self.recording])
         kx_now, kv_now = self.gains[ax]
         wn_pred = math.sqrt(kx_now)
+        wn_target = self.wn_ladder[self.rung]
+        rec = {"axis": ax, "rung": self.rung, "rep": self.rep,
+               "wn_target": wn_target, "step": step,
+               "kx_applied": round(kx_now, 3), "kv_applied": round(kv_now, 3)}
         try:
             fit = fit_step_response(
                 t, y, step=step, wn_guess=wn_pred,
@@ -534,63 +578,94 @@ class TuningConductor(Node):
                 wn_bounds=(wn_pred * math.sqrt(ALPHA_MIN),
                            wn_pred * math.sqrt(ALPHA_MAX)))
         except (ValueError, RuntimeError) as e:
-            self._abort(f"step fit failed on {ax}: {e}")
+            rec["action"] = f"episode discarded (fit error: {e})"
+            self.results.append(rec)
+            self._status(f"step fit failed on {ax} ({e}); discarding episode")
+            self._episode_finished()
             return
 
-        wn_target = self.wn_ladder[self.rung]
-        rec = {"axis": ax, "rung": self.rung, "wn_target": wn_target,
-               "step": step, "wn_meas": round(fit.wn, 3),
-               "zeta_meas": round(fit.zeta, 3), "delay": round(fit.delay, 3),
-               "nrmse": round(fit.nrmse, 3),
-               "overshoot": round(fit.overshoot, 3),
-               "kx_applied": round(kx_now, 3), "kv_applied": round(kv_now, 3)}
+        rec.update({"wn_meas": round(fit.wn, 3),
+                    "zeta_meas": round(fit.zeta, 3),
+                    "delay": round(fit.delay, 3), "nrmse": round(fit.nrmse, 3),
+                    "overshoot": round(fit.overshoot, 3)})
         self._status(f"{ax}: wn={fit.wn:.2f} zeta={fit.zeta:.2f} "
                      f"delay={fit.delay * 1e3:.0f}ms nrmse={fit.nrmse:.2f} "
                      f"os={fit.overshoot * 100:.0f}%")
 
         if not fit.ok:
-            rec["action"] = "fit rejected; keeping gains"
+            rec["action"] = "fit rejected"
             self.results.append(rec)
-            self._status(f"Fit quality gate failed on {ax}; not updating gains")
-            self._next_episode()
+            self._status(f"Fit quality gate failed on {ax}; episode discarded")
+            self._episode_finished()
+            return
+
+        alpha_ep = fit.wn ** 2 / kx_now
+        # Plausibility gate: a real vehicle's thrust map is not off by
+        # more than ~2.5x. An alpha outside the box means the episode was
+        # corrupted (bias transient, mode change, fit ambiguity) — discard.
+        if not (ALPHA_MIN <= alpha_ep <= ALPHA_MAX):
+            rec.update({"alpha": round(alpha_ep, 3),
+                        "action": "alpha implausible; episode discarded"})
+            self.results.append(rec)
+            self._status(f"{ax}: alpha={alpha_ep:.2f} outside "
+                         f"[{ALPHA_MIN}, {ALPHA_MAX}]; discarding episode")
+            self._episode_finished()
+            return
+
+        rec.update({"alpha": round(alpha_ep, 3), "action": "accepted"})
+        self.results.append(rec)
+        self.bucket.add(alpha_ep, fit.delay)
+        self._episode_finished()
+
+    def _finalize_pos_bucket(self, ax: str):
+        """All reps for this (axis, rung) flown: aggregate the accepted
+        alpha estimates and update gains from their median."""
+        kx_now, kv_now = self.gains[ax]
+        wn_target = self.wn_ladder[self.rung]
+        est = robust_ratio_estimate(
+            self.bucket.alphas, min_count=min(2, self.episodes_per_rung),
+            max_spread=self.consistency)
+        rec = {"axis": ax, "rung": self.rung, "wn_target": wn_target,
+               "n_episodes": self.episodes_per_rung, "n_used": est.n_used,
+               "spread": (round(est.spread, 3)
+                          if math.isfinite(est.spread) else None)}
+        if not est.ok:
+            rec["action"] = f"keeping gains ({est.reason})"
+            self.results.append(rec)
+            self._status(f"{ax}: {est.reason}; keeping gains")
+            self._advance_axis()
             return
 
         # Latency sanity: don't push bandwidth into the delay margin
-        if fit.delay > 0 and wn_target * fit.delay > 0.45:
-            rec["action"] = (f"wn_target {wn_target:.2f} unsafe with measured "
-                             f"delay {fit.delay * 1e3:.0f} ms; ladder stopped")
+        delay_med = self.bucket.median_delay()
+        if delay_med > 0 and wn_target * delay_med > 0.45:
+            rec["action"] = (f"wn_target {wn_target:.2f} unsafe with median "
+                             f"delay {delay_med * 1e3:.0f} ms; ladder stopped")
             self.results.append(rec)
             self._status(rec["action"])
             self._finish()
             return
 
-        kx_new, kv_new, alpha = correct_gains_from_identification(
-            kx_now, fit.wn, wn_target, self.zeta_target)
-        # Plausibility gate: a real vehicle's thrust map is not off by
-        # more than ~2.5x. An alpha outside the box means the episode was
-        # corrupted (bias transient, mode change, fit ambiguity) — discard.
-        if not (ALPHA_MIN <= alpha <= ALPHA_MAX):
-            rec.update({"alpha": round(alpha, 3),
-                        "action": "alpha implausible; keeping gains"})
-            self.results.append(rec)
-            self._status(f"{ax}: alpha={alpha:.2f} outside "
-                         f"[{ALPHA_MIN}, {ALPHA_MAX}]; discarding episode")
-            self._next_episode()
-            return
-        # Rate-limit gain changes per episode
+        alpha = est.value
+        kx_new, kv_new, _ = correct_gains_from_identification(
+            kx_now, math.sqrt(alpha * kx_now), wn_target, self.zeta_target)
+        # Rate-limit gain changes per bucket
         kx_new = float(np.clip(kx_new, kx_now / self.max_change,
                                kx_now * self.max_change))
         kv_new = float(np.clip(kv_new, kv_now / self.max_change,
                                kv_now * self.max_change))
         rec.update({"alpha": round(alpha, 3), "kx_new": round(kx_new, 3),
-                    "kv_new": round(kv_new, 3), "action": "gains updated"})
+                    "kv_new": round(kv_new, 3),
+                    "action": "gains updated (median)"})
         self.results.append(rec)
 
         self.safe_gains = dict(self.gains)  # current set flew safely
         self.gains[ax] = (kx_new, kv_new)
         self._analysis = {"axis": ax}
         self._apply_gains({ax: self.gains[ax]})
-        self._status(f"{ax}: alpha={alpha:.2f} -> kx {kx_now:.2f}->{kx_new:.2f}, "
+        self._status(f"{ax}: median alpha={alpha:.2f} (n={est.n_used}, "
+                     f"spread {est.spread:.2f}x) -> "
+                     f"kx {kx_now:.2f}->{kx_new:.2f}, "
                      f"kv {kv_now:.2f}->{kv_new:.2f}")
         self._goto(State.UPDATE_GAINS)
 
@@ -608,11 +683,28 @@ class TuningConductor(Node):
         if not ok:
             self._abort("controller rejected parameter update")
             return
-        self._next_episode()
+        self._advance_axis()
 
-    def _next_episode(self):
+    def _episode_finished(self):
+        """One step episode analyzed (accepted or discarded). Fly the
+        next repetition of the same (axis, rung), or — when the bucket
+        is full — aggregate and decide on a gain update."""
         # Alternate step direction to stay centered on the hover point
         self.step_sign *= -1.0
+        self.rep += 1
+        if self.rep < self.episodes_per_rung:
+            self.setpoint = list(self.hover)
+            self._goto(State.GOTO_HOVER)
+            return
+        ax = self.axes[self.axis_idx]
+        if ax == "yaw":
+            self._finalize_yaw_bucket()
+        else:
+            self._finalize_pos_bucket(ax)
+
+    def _advance_axis(self):
+        self.rep = 0
+        self.bucket = EpisodeBucket()
         self.axis_idx += 1
         if self.axis_idx >= len(self.axes):
             self.axis_idx = 0

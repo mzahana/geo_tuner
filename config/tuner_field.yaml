@@ -21,6 +21,12 @@
     wn_ladder: [1.2, 1.6, 2.0]
     zeta_target: 0.95
     max_gain_change_factor: 1.6
+    # Repeat each step this many times per (axis, rung); gains update
+    # from the MEDIAN identified alpha. 3 gives reproducible gains at
+    # ~2x session length; the consistency gate blocks updates when the
+    # accepted estimates disagree by more than this factor.
+    episodes_per_rung: 3
+    estimate_consistency: 1.35
 
     report_path: "/tmp/geo_tuner_report.yaml"
 

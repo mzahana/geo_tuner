@@ -67,6 +67,8 @@ def generate_launch_description():
             "axes": "z,x,y,yaw",
             "wn_ladder": [1.2, 1.6],
             "zeta_target": 0.95,
+            "episodes_per_rung": 2,  # median-of-N path, kept short in sim
+            "estimate_consistency": 1.35,
             "require_offboard": False,  # quad_sim has no mavros/PX4
             "report_path": report_path,
             "safety.min_altitude": 1.0,

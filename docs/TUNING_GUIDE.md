@@ -114,6 +114,31 @@ Once Phase 4 is stable: `attctrl_tau: 0.2` (separation cap rises to
 toward mission values and re-run one field session. Validate tracking on a
 lemniscate/target-chase trajectory before mission use.
 
+**The aggressive-tracking recipe, in full.** Feedback bandwidth is only
+one third of aggressive tracking — and the smallest third. In order of
+payoff:
+
+1. **Feedforward carries the maneuver.** The controller consumes the
+   setpoint's velocity, acceleration *and* jerk (rate feedforward from
+   differential flatness, `enable_rate_feedforward: true`). A trajectory
+   generator that fills those fields moves the feedback loop's job from
+   "chase the reference" to "reject disturbance" — tracking error during
+   a 15 m/s² maneuver is then set by model error, not by ωn. Never
+   command aggressive motion through bare position setpoints.
+2. **An honest thrust map + integral action.** `ki.z` ≈ 1.0 with the
+   online thrust-scale estimator keeps the feedforward calibrated as the
+   battery sags; a 5% thrust error during a vertical maneuver is
+   0.5 m/s² of acceleration the feedback must supply.
+3. **Feedback bandwidth last**, raised only against measurement:
+   inner loops first (PX4 autotune, then `attctrl_tau` 0.3 → 0.2),
+   which raises the separation cap, then the ladder — with
+   `episodes_per_rung: 3` so the identified α (and hence the final
+   gains) are reproducible, and the report's median delay telling you
+   where the latency ceiling `ωn ≤ 0.35/T_d` actually is. Stop at the
+   first rung where the measured overshoot exceeds ~10% or the
+   consistency gate starts refusing updates: past that point you are
+   tuning to noise, and disturbance rejection no longer improves.
+
 ---
 
 ## 3. Safety architecture (all phases)
@@ -350,6 +375,27 @@ by more than 2.5×). Within that box, $\hat\zeta$ and $\hat T_d$ absorb
 the unmodeled lag. Fits with $\hat\zeta$ pinned at its optimizer bounds
 are rejected outright, and a resulting $\hat\alpha$ outside the box
 discards the episode instead of updating gains.
+
+**Repetition and robust aggregation (median-of-N).** A single 6-second
+step fit is a *noisy estimator* of $\alpha$: process noise and the
+structural 2nd-order approximation of a truly higher-order lateral
+response give it episode-to-episode variance, and because the applied
+gain is $k_x = (\omega_n^\star)^2/\hat\alpha$, that variance maps 1:1
+(inverted) into the gains — which is why two sessions can end with
+visibly different gain sets that describe the same closed loop (the
+reproducible quantity is $\omega_n^{eff} = \sqrt{\hat\alpha\,k_x}$, not
+$k_x$ itself). The conductor therefore flies `episodes_per_rung` steps
+(default 3, alternating ±) per (axis, rung) and updates from the
+**median** of the accepted $\hat\alpha$ — robust to one corrupted
+episode. A consistency gate refuses *any* update when the accepted
+estimates disagree by more than `estimate_consistency` (default 1.35×,
+i.e. worst pair within 35%): inconsistent estimates mean the
+identification, not the plant, is the problem, and applying any of them
+would bake noise into the gains. The latency gate likewise uses the
+median measured delay. Yaw episodes aggregate the identified time
+constant $\hat T$ the same way. With the median of 3, the standard error
+of the gain update falls by $\approx\sqrt{3}$ *and* single-outlier
+sensitivity drops to zero, at the cost of ~2× session time.
 
 **Mode supervision.** Episodes only run while PX4 reports OFFBOARD
 (`mavros/state`): outside OFFBOARD the vehicle ignores the controller's

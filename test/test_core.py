@@ -195,6 +195,53 @@ class TestFirstOrderFit:
         assert tau_new / (2 * beta) == pytest.approx(0.35)
 
 
+class TestAggregate:
+    def test_median_of_three(self):
+        from geo_tuner.core.aggregate import robust_ratio_estimate
+        est = robust_ratio_estimate([0.9, 1.0, 1.1])
+        assert est.ok and est.value == pytest.approx(1.0)
+        assert est.n_used == 3
+
+    def test_outlier_resistant(self):
+        from geo_tuner.core.aggregate import robust_ratio_estimate
+        # median ignores one wild episode... but the spread gate must
+        # then refuse the update (2.2/0.95 >> 1.35)
+        est = robust_ratio_estimate([0.95, 1.0, 2.2])
+        assert not est.ok
+        assert "inconsistent" in est.reason
+        # ...unless the gate is opened
+        est = robust_ratio_estimate([0.95, 1.0, 2.2], max_spread=3.0)
+        assert est.ok and est.value == pytest.approx(1.0)
+
+    def test_consistent_pair_accepted(self):
+        from geo_tuner.core.aggregate import robust_ratio_estimate
+        est = robust_ratio_estimate([1.1, 1.25])
+        assert est.ok
+        assert est.value == pytest.approx(1.175)
+        assert est.spread == pytest.approx(1.25 / 1.1)
+
+    def test_single_estimate_rejected_by_default(self):
+        from geo_tuner.core.aggregate import robust_ratio_estimate
+        est = robust_ratio_estimate([1.0])
+        assert not est.ok and est.n_used == 1
+        # but allowed when the session is configured for 1 episode/rung
+        est = robust_ratio_estimate([1.0], min_count=1)
+        assert est.ok
+
+    def test_empty_and_garbage(self):
+        from geo_tuner.core.aggregate import robust_ratio_estimate
+        assert not robust_ratio_estimate([]).ok
+        assert not robust_ratio_estimate([-1.0, float("nan")]).ok
+
+    def test_bucket_median_delay(self):
+        from geo_tuner.core.aggregate import EpisodeBucket
+        b = EpisodeBucket()
+        for a, d in [(1.0, 0.06), (1.1, 0.30), (0.9, 0.08)]:
+            b.add(a, d)
+        assert b.count == 3
+        assert b.median_delay() == pytest.approx(0.08)
+
+
 class TestSafety:
     def _sample(self, t=0.0, pos=(0, 0, 10), vel=(0, 0, 0),
                 quat=(1, 0, 0, 0), rates=(0, 0, 0)):
