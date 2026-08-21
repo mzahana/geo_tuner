@@ -7,6 +7,10 @@ geometric attitude controller (PX4 offboard, body-rates + thrust via mavros).
 **SITL quick start: [docs/SITL_RECIPE.md](docs/SITL_RECIPE.md)** — the full
 tuning cycle in the d2dtracker PX4 SITL, command by command.
 
+**Field day: [docs/FIELD_CHECKLIST.md](docs/FIELD_CHECKLIST.md)** — the
+printable step-by-step checklist for tuning the real vehicle in the field
+(bench prep → PX4 autotune → controller sanity → auto-tune → agility).
+
 **Start here: [docs/TUNING_GUIDE.md](docs/TUNING_GUIDE.md)** — the complete
 tuning plan (phases 0–5), the safety architecture, validation status, and
 Appendix A with the full mathematical foundations behind every formula
