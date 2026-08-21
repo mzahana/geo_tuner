@@ -16,8 +16,8 @@ under namespace `/interceptor`.
 
 | Repo | Branch | State |
 |---|---|---|
-| `mzahana/geo_tuner` | `main` | complete tuning toolkit (this repo) |
-| `mzahana/mav_controllers_ros` | `main` = `ros2_humble` = `production-hardening` | all fast-forwarded to the hardened controller |
+| `mzahana/geo_tuner` | `main` (90db467) | tuning toolkit + field checklist (this repo) |
+| `mzahana/mav_controllers_ros` | `main` = `ros2_humble` = `production-hardening` (139f3ad) | hardened controller + trajectory test node + hold failsafe |
 | `mzahana/d2dtracker_sim` | `main` | SITL bringup launch + tuned configs |
 
 Local checkouts: `~/src/ihunter_fixes/{geo_tuner, mav_controllers_ros}`;
@@ -35,7 +35,33 @@ fixed (hold 1 s then release to PX4 failsafe instead of feeding stale
 setpoints forever), IMU-based online thrust-scale estimator
 (`enable_thrust_estimator`, publishes `geometric_mavros/thrust_scale_estimate`),
 **yawctrl_tau** (decoupled yaw bandwidth; ≤0 → follows attctrl_tau),
-yaw reference extraction fixed (atan2, not eulerAngles).
+yaw reference extraction fixed (atan2, not eulerAngles),
+**hold-on-setpoint-loss failsafe** (`hold_on_setpoint_timeout: true`,
+50 Hz watchdog in geometric_controller_node: if the setpoint stream dies
+mid-flight with fresh odom + motors enabled, latch a closed-loop position
+hold at the current pose; new setpoints release it, disarm/odom-stale
+clears it — planner death is now field-safe by itself).
+
+### 1b. Trajectory test node (mav_controllers_ros, 2026-08-21)
+`trajectory_test_node` (test/trajectory_test_node.cpp) — safety-gated
+reference generator to evaluate the controller in SITL and the field:
+setpoint / circle / lemniscate (Gerono), full pos/vel/acc/jerk + yaw/
+yaw_dot references. Key design (user requirement — the controller goes
+unstable on far/step setpoints): idle = hold-setpoint stream glued to the
+current pose (safe OFFBOARD engage); start = min-jerk transition to the
+*nearest* point on the curve, then C2 smoothstep speed ramp; stop = ramp
+down + hold. Closed-form feasibility derating (speed/accel/jerk from max
+|p'|,|p''|,|p'''|), geofence pre-check + runtime abort, OFFBOARD/armed/
+motors/odom gating, `trajectory_test/start|stop` Trigger services,
+`auto_start` for SITL only. RViz: planned/reference/actual paths +
+setpoint pose, layout in rviz/trajectory_test.rviz, launch arg
+`rviz:=true` (namespace auto-filled). Files: config/trajectory_test.yaml,
+launch/trajectory_test.launch.py, docs/TRAJECTORY_TESTING.md (simple
+field/SITL guide), test/scripts/ python harnesses (fake vehicle; verify
+limits/continuity/derating/dropout-abort/hold-failsafe — all passing in
+the Humble container). Container gotcha: process comm truncates to 15
+chars, so kill with `pkill -f 'lib/mav_controllers_ros/[t]raj'`, never
+`pkill -x trajectory_test_node`.
 
 ### 2. geo_tuner package (this repo)
 - `core/gain_design.py` — pole-placement gain design from vehicle
@@ -65,7 +91,10 @@ yaw reference extraction fixed (atan2, not eulerAngles).
   Gazebo (real compiled controller + this sim + conductor:
   `ros2 launch geo_tuner sim_tune.launch.py`).
 - Docs: `TUNING_GUIDE.md` (phases + full math appendix A.1–A.11),
-  `SITL_RECIPE.md` (step-by-step SITL cycle incl. PX4 autotune + ulog).
+  `SITL_RECIPE.md` (step-by-step SITL cycle incl. PX4 autotune + ulog),
+  `FIELD_CHECKLIST.md` (printable field-day checklist: bench prep →
+  PX4 autotune/hover ulog → controller sanity flight → conductor
+  session → circle/lemniscate agility ladder + emergency card).
 - 39 unit tests (`pytest test/test_core.py`, use the repo `.venv`).
 
 ### 3. SITL environment
@@ -105,8 +134,13 @@ PX4 + mavros ns `/interceptor`, auto-sets 100 Hz streams for msgs
 
 - Re-run SITL session with median-of-N (expect α≈1, consistent gains);
   then ladder to 2.0 rad/s with attctrl_tau 0.3.
-- Phase 4/5: field tuning on the real X500v2 (config/tuner_field.yaml,
-  launch/field_tune.launch.py, hover ≥10 m), then agility pass.
+- Fly the trajectory_test_node in full PX4 SITL (so far verified against
+  a faked vehicle, not the closed sim loop): circle then lemniscate,
+  ramp `speed`, watch reference vs actual paths in RViz.
+- Phase 4/5: field tuning on the real X500v2 — follow
+  `docs/FIELD_CHECKLIST.md` (config/tuner_field.yaml,
+  launch/field_tune.launch.py, hover ≥10 m), then the agility pass with
+  trajectory_test (mav_controllers_ros docs/TRAJECTORY_TESTING.md).
 - Real vehicle: set mass 2.5 and re-derive max_thrust before flight.
 
 ## Working constraints (respect these)
