@@ -16,6 +16,8 @@
   <depend>trajectory_msgs</depend>
   <depend>std_msgs</depend>
   <depend>mavros_msgs</depend>
+  <depend>std_srvs</depend>
+  <depend>diagnostic_msgs</depend>
   <depend>mav_controllers_ros</depend>
   <exec_depend>python3-numpy</exec_depend>
   <exec_depend>python3-scipy</exec_depend>

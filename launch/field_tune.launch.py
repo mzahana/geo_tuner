@@ -16,6 +16,7 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description():
@@ -40,7 +41,9 @@ def generate_launch_description():
                 # With a namespace, the controller node lives under it too;
                 # relative topics already follow the namespace.
                 {"controller_node": [LaunchConfiguration("ns"),
-                                     "/geometric_controller_node"]},
+                                     "/geometric_controller_node"],
+                 "require_enable": ParameterValue(
+                     LaunchConfiguration("require_enable"), value_type=bool)},
             ],
         ),
     ])

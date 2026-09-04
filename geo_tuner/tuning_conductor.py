@@ -45,6 +45,8 @@ from geometry_msgs.msg import Transform, Twist
 from mavros_msgs.msg import State as MavrosState
 from nav_msgs.msg import Odometry
 from std_msgs.msg import String
+from std_srvs.srv import Trigger
+from diagnostic_msgs.msg import DiagnosticStatus, KeyValue
 from trajectory_msgs.msg import (MultiDOFJointTrajectory,
                                  MultiDOFJointTrajectoryPoint)
 
@@ -117,7 +119,9 @@ class TuningConductor(Node):
         # when the accepted estimates disagree by more than this factor.
         self.declare_parameter("episodes_per_rung", 3)
         self.declare_parameter("estimate_consistency", 1.35)
-        self.declare_parameter("require_enable", False)  # gate on a Bool topic
+        # Hold at WAIT_ENABLE until the ~/start service is called, rather
+        # than starting as soon as the vehicle is in OFFBOARD.
+        self.declare_parameter("require_enable", False)
         # OFFBOARD supervision: episodes only run while PX4 is in OFFBOARD
         # (otherwise the vehicle ignores our setpoints and every fit is
         # garbage). Disable only for plant simulators without mavros.
@@ -154,6 +158,10 @@ class TuningConductor(Node):
         self.episodes_per_rung = max(1, int(gp("episodes_per_rung")))
         self.consistency = float(gp("estimate_consistency"))
         self.report_path = str(gp("report_path"))
+        # When set, the conductor holds at WAIT_ENABLE until ~/start is
+        # called, instead of beginning the moment OFFBOARD is engaged. The
+        # parameter existed but nothing acted on it.
+        self.require_enable = bool(gp("require_enable"))
 
         self.safety = SafetyMonitor(SafetyLimits(
             max_tilt=float(gp("safety.max_tilt")),
@@ -169,6 +177,12 @@ class TuningConductor(Node):
         self.sp_pub = self.create_publisher(
             MultiDOFJointTrajectory, gp("setpoint_topic"), 10)
         self.status_pub = self.create_publisher(String, "geo_tuner/status", 10)
+        # Structured status for a ground station. The String above is a
+        # human log line that only appears when something happens; a panel
+        # needs the state, the progress through the ladder, and the reason
+        # it is waiting, at a steady rate.
+        self.health_pub = self.create_publisher(
+            DiagnosticStatus, "geo_tuner/health", 10)
         self.odom_sub = self.create_subscription(
             Odometry, gp("odom_topic"), self._odom_cb,
             qos_profile_sensor_data)
@@ -216,7 +230,19 @@ class TuningConductor(Node):
         self._pending_future = None
         self._analysis: dict | None = None
 
+        # Session control from the ground. Without these a session could only
+        # be started by launching the node and stopped by killing it -- over
+        # a field datalink, in flight.
+        self.start_srv = self.create_service(Trigger, "~/start", self._srv_start)
+        self.abort_srv = self.create_service(Trigger, "~/abort", self._srv_abort)
+        self.accept_srv = self.create_service(Trigger, "~/accept", self._srv_accept)
+        self.restore_srv = self.create_service(
+            Trigger, "~/restore_safe", self._srv_restore_safe)
+        self.reset_srv = self.create_service(Trigger, "~/reset", self._srv_reset)
+
+        self.start_requested = not self.require_enable
         self.timer = self.create_timer(1.0 / self.rate_hz, self._tick)
+        self.health_timer = self.create_timer(0.2, self._publish_health)
         self.get_logger().info(
             f"Tuning conductor up. axes={self.axes} wn_ladder={self.wn_ladder} "
             f"zeta={self.zeta_target} hover={self.hover}")
@@ -341,6 +367,18 @@ class TuningConductor(Node):
             self._goto(State.WAIT_ENABLE)
 
     def _st_wait_enable(self, now):
+        # Baseline already captured on an earlier tick: we are simply
+        # holding for the operator to press start.
+        if getattr(self, "baseline_read", False):
+            if self.start_requested:
+                if self._in_offboard:
+                    self._goto(State.GOTO_HOVER)
+                else:
+                    self._status(f"Start requested; waiting for PX4 mode "
+                                 f"{self.offboard_mode}")
+                    self._goto(State.WAIT_OFFBOARD)
+            return
+
         # Capture the controller's current gains as the known-safe baseline
         if self._pending_future is not None and self._pending_future.done():
             res = self._pending_future.result()
@@ -380,6 +418,11 @@ class TuningConductor(Node):
                     self._status(f"baseline yaw: tau={self.yaw_tau:.3f} "
                                  f"(target T={self.yaw_T_target:.2f}s)")
             self.setpoint = list(self.hover)
+            self.baseline_read = True
+            if self.require_enable and not self.start_requested:
+                self._status("Gains read. Waiting for the ~/start service "
+                             "(require_enable is set)")
+                return
             if not self._in_offboard:
                 self._status(f"Waiting for PX4 mode {self.offboard_mode} "
                              "(setpoint stream active; switch modes to start)")
@@ -724,6 +767,162 @@ class TuningConductor(Node):
 
     def _st_done(self, now):
         pass  # keep publishing hover setpoint until pilot takes over
+
+    # ---- ground-station control ----
+    def _srv_start(self, request, response):
+        if self.state in (State.ABORT, State.DONE):
+            response.success = False
+            response.message = (f"Session already finished ({self.state.name}); "
+                                "call ~/reset to arm another one.")
+            return response
+        if self.state not in (State.WAIT_ODOM, State.WAIT_ENABLE, State.WAIT_OFFBOARD):
+            response.success = False
+            response.message = f"Already running ({self.state.name})."
+            return response
+        self.start_requested = True
+        response.success = True
+        response.message = ("Start requested. The session begins once odometry, "
+                            "the baseline gains and OFFBOARD are all present.")
+        self._status(response.message)
+        return response
+
+    def _srv_abort(self, request, response):
+        # Always allowed, in every state: an abort you cannot press is not
+        # an abort. It restores the last known-safe gains and holds hover.
+        if self.state == State.ABORT:
+            response.success = True
+            response.message = (f"Already aborted: {self.abort_reason}. "
+                                "Call ~/reset to arm another session.")
+            return response
+        self._abort("aborted from the ground station")
+        response.success = True
+        response.message = "Aborted: gains restored, holding hover."
+        return response
+
+    def _srv_accept(self, request, response):
+        if self.gains is None:
+            response.success = False
+            response.message = "No gains identified yet."
+            return response
+        # Accepting means the CURRENT gains become the ones an abort would
+        # restore, so a later problem cannot silently undo a good result.
+        self.safe_gains = dict(self.gains)
+        self._write_report(status="accepted")
+        response.success = True
+        response.message = (f"Accepted the current gains as the safe set. "
+                            f"Report: {self.report_path}. They are live on the "
+                            "controller but not persisted -- use gain_saver to "
+                            "write them to the vehicle.")
+        self._status(response.message)
+        return response
+
+    def _srv_restore_safe(self, request, response):
+        if self.safe_gains is None:
+            response.success = False
+            response.message = "No safe gain set captured yet."
+            return response
+        self.gains = dict(self.safe_gains)
+        self._apply_gains(self.gains)
+        response.success = True
+        response.message = "Restored the last known-safe gains."
+        self._status(response.message)
+        return response
+
+    def _srv_reset(self, request, response):
+        """Return an aborted or finished session to the waiting state.
+
+        Without this the only way to try again after an abort is to restart
+        the node -- which in the field means an SSH session, in flight, to
+        recover from a condition the tuner detected on purpose.
+        """
+        if self.state not in (State.ABORT, State.DONE):
+            response.success = False
+            response.message = (f"Nothing to reset: session is {self.state.name}. "
+                                "Abort first if you want to stop it.")
+            return response
+
+        # Fly on whatever gains are currently in force: an abort has already
+        # restored the safe set, and silently changing them here would hide
+        # what the vehicle is actually using.
+        self.abort_reason = ""
+        self.diagnosis = ""
+        self.results = []
+        self.recording = []
+        self.bucket = EpisodeBucket()
+        self.rung = 0
+        self.axis_idx = 0
+        self.rep = 0
+        self.a_trim = [0.0, 0.0, 0.0]
+        self.trim_updates = 0
+        self.start_requested = not self.require_enable
+        self.safety.reset()
+        if self.odom is not None:
+            self.setpoint = list(self.odom.pos)
+        self.baseline_read = False
+        self._request_gains()
+        self._goto(State.WAIT_ENABLE)
+        response.success = True
+        response.message = ("Reset. Fix what caused the abort, then press START "
+                            "again. The gains in force are unchanged.")
+        self._status(response.message)
+        return response
+
+    def _publish_health(self):
+        st = DiagnosticStatus()
+        st.name = "geo_tuner"
+        st.hardware_id = self.get_name()
+
+        if self.state == State.ABORT:
+            st.level = DiagnosticStatus.ERROR
+            st.message = f"aborted: {self.abort_reason}"
+        elif self.state == State.DONE:
+            st.level = DiagnosticStatus.OK
+            st.message = "complete"
+        elif self.state in ACTIVE_STATES:
+            st.level = DiagnosticStatus.OK
+            st.message = f"tuning: {self.state.name}"
+        else:
+            st.level = DiagnosticStatus.WARN
+            st.message = f"waiting: {self.state.name}"
+
+        def add(key, value):
+            st.values.append(KeyValue(key=str(key), value=str(value)))
+
+        axis = self.axes[self.axis_idx] if self.axis_idx < len(self.axes) else "-"
+        add("state", self.state.name)
+        add("axis", axis)
+        add("axis_index", f"{self.axis_idx + 1}/{len(self.axes)}" if self.axes else "-")
+        add("rung", f"{self.rung + 1}/{len(self.wn_ladder)}" if self.wn_ladder else "-")
+        add("wn_target", f"{self.wn_ladder[self.rung]:.2f}"
+                         if self.rung < len(self.wn_ladder) else "-")
+        add("episode", f"{self.rep + 1}/{self.episodes_per_rung}")
+        add("zeta_target", f"{self.zeta_target:.2f}")
+        add("start_requested", str(bool(self.start_requested)).lower())
+        add("require_enable", str(bool(self.require_enable)).lower())
+        add("offboard", str(bool(self._in_offboard)).lower())
+        add("px4_mode", self.px4_mode or "-")
+        add("abort_reason", self.abort_reason)
+        add("diagnosis", self.diagnosis)
+        add("report_path", self.report_path)
+
+        if self.gains:
+            for ax, (kx, kv) in sorted(self.gains.items()):
+                wn, zeta = wn_zeta_from_pd(kx, kv)
+                add(f"gain_{ax}", f"wn={wn:.2f} zeta={zeta:.2f}")
+        if self.yaw_tau is not None:
+            add("yaw_tau", f"{self.yaw_tau:.3f}")
+        add("trim", ",".join(f"{t:.2f}" for t in self.a_trim))
+
+        # Where the vehicle is relative to what the session commands: the
+        # numbers a pilot watches while deciding whether to let it continue.
+        if self.odom is not None:
+            err = [self.setpoint[i] - self.odom.pos[i] for i in range(3)]
+            add("pos_err", ",".join(f"{e:.2f}" for e in err))
+            add("altitude", f"{self.odom.pos[2]:.2f}")
+        add("setpoint", ",".join(f"{v:.2f}" for v in self.setpoint))
+        add("results", str(len(self.results)))
+
+        self.health_pub.publish(st)
 
     def _abort(self, reason: str):
         if self.state == State.ABORT:
