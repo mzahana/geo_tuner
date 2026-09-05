@@ -43,6 +43,79 @@ Pack: laptop, RC, batteries, props, USB cables, this checklist.
 
 ---
 
+## 0b. Two machines on one wifi router (drone + laptop)
+
+The Jetson flies the vehicle; the laptop only watches and presses buttons.
+Both must be on the same router and in the same ROS 2 "domain", or the
+laptop sees nothing at all — with no error message, which is the failure
+that wastes a field day.
+
+On **both** machines, in every terminal (put them in `~/.bashrc`):
+
+```bash
+export ROS_DOMAIN_ID=<same number on both, 0-101>
+export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+unset ROS_LOCALHOST_ONLY          # or export ROS_LOCALHOST_ONLY=0
+```
+
+- [ ] Same `ROS_DOMAIN_ID` on both. Different numbers = two separate,
+      silent networks.
+- [ ] Same `RMW_IMPLEMENTATION` on both. FastDDS and Cyclone/zenoh do not
+      talk to each other, and neither reports the mismatch.
+- [ ] `ROS_LOCALHOST_ONLY` unset or 0 (1 confines ROS to each machine).
+- [ ] Router passes **multicast** (default discovery needs it). Many cheap
+      APs and most "guest"/client-isolation modes block it. If discovery
+      fails, either turn client isolation off or use a Fast DDS discovery
+      server / `ROS_STATIC_PEERS`.
+
+Verify from the **laptop**, before anything flies — with the vehicle stack
+running on the Jetson:
+
+```bash
+ros2 node list                                   # the Jetson's nodes appear
+ros2 topic hz /<ns>/mavros/local_position/odom   # ~100 Hz over the link
+ros2 topic hz /<ns>/geo_tuner/health             # 5 Hz once the conductor runs
+```
+
+- [ ] If `ros2 node list` is empty: it is the network, not the software.
+      Check the three exports above, then multicast, then the firewall
+      (`sudo ufw disable` on the laptop for the test).
+- [ ] Rough clock agreement on both machines (RViz plots and TF use
+      timestamps). `date` on each; fix with NTP or `sudo date -s` if they
+      differ by more than a few seconds.
+- [ ] Do not stream camera/image topics over the link while tuning — the
+      panels need only odom, health and setpoints.
+
+### What runs where
+
+**On the drone (Jetson)** — your normal bringup first (PX4, mavros,
+geometric controller), then the two nodes the panels drive:
+
+```bash
+ros2 launch mav_controllers_ros panel_support.launch.py controller_ns:=<ns>
+ros2 launch geo_tuner field_tune.launch.py ns:=<ns> require_enable:=true
+```
+
+`panel_support` runs `gain_saver` (what the panel's Save calls) and
+`trajectory_test_node` (what the Fly tab drives); `field_tune` runs the
+auto-tune conductor. `require_enable:=true` means the session cannot begin
+from a mode switch alone — a human must press START.
+
+**On the laptop** — the panels, which are pure consumers:
+
+```bash
+ros2 launch geo_tuner_rviz_plugins field_monitor.launch.py ns:=<ns>
+```
+
+- [ ] Leave `ns` empty for a bare field stack; use `ns:=interceptor` for
+      the d2dtracker layout. It must match the namespace the controller
+      actually runs in.
+- [ ] The Tuner panel's banner should go from "not running" to a live
+      state within a couple of seconds. If it stays grey, go back to the
+      network checks above.
+
+---
+
 ## 1. Flight 1 — PX4 basics (no geometric controller yet)
 
 Goal: good inner loops and a real thrust number. All in **Position mode**.
@@ -120,13 +193,28 @@ Before arming:
 
 Fly:
 
+Two ways to run the session. **From the panel** (recommended with a
+laptop — see 0b for what to launch where):
+
+- [ ] Conductor already running on the Jetson with `require_enable:=true`,
+      Tuner panel live on the laptop.
+- [ ] Take off in Position mode, climb near the hover point. Stay in
+      Position/LOITER for now.
+- [ ] Press **START** on the Tuner panel *first*. The conductor begins
+      streaming hold setpoints at the current pose — that is what lets PX4
+      accept the switch.
+- [ ] Switch to **OFFBOARD**. The session begins.
+
+**From a terminal** (no laptop panel; the conductor starts as soon as it
+sees OFFBOARD, so launch it after you are already there):
+
 - [ ] Take off in Position mode, climb near the hover point, switch to
       OFFBOARD (controller holds).
-- [ ] Start the tuner:
+- [ ] Start the tuner (the default params file is the installed
+      `tuner_field.yaml`; pass `params:=` only to override it):
 
       ```bash
-      ros2 launch geo_tuner field_tune.launch.py ns:=<ns> \
-          params:=config/tuner_field.yaml
+      ros2 launch geo_tuner field_tune.launch.py ns:=<ns>
       ```
 
 - [ ] The conductor hovers, then steps each axis (z first, then x, y,

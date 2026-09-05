@@ -1,4 +1,8 @@
-/interceptor/tuning_conductor:
+/**:
+  # "/**" so this file applies whatever namespace the conductor is
+  # launched into (ns:=interceptor and a bare field stack alike). A
+  # fixed node path is silently ignored when it does not match, and
+  # the session would then fly on code defaults, not these limits.
   ros__parameters:
     # Matches d2dtracker_sim SITL (sitl_bringup.launch.py, default world,
     # spawn at origin, `commander takeoff` altitude ~2.5 m).

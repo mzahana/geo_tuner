@@ -1,4 +1,8 @@
-/tuning_conductor:
+/**:
+  # "/**" so this file applies whatever namespace the conductor is
+  # launched into (ns:=interceptor and a bare field stack alike). A
+  # fixed node path is silently ignored when it does not match, and
+  # the session would then fly on code defaults, not these limits.
   ros__parameters:
     # Node name of the running geometric controller (must match its launch)
     controller_node: "geometric_controller_node"

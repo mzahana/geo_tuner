@@ -7,6 +7,7 @@ position, with the pilot ready on the RC mode switch.
     ros2 launch geo_tuner field_tune.launch.py
     ros2 launch geo_tuner field_tune.launch.py params:=/path/to/tuner_field.yaml
     ros2 launch geo_tuner field_tune.launch.py ns:=interceptor   # d2dtracker SITL
+    ros2 launch geo_tuner field_tune.launch.py require_enable:=true  # panel START
 """
 
 import os
@@ -25,6 +26,13 @@ def generate_launch_description():
 
     return LaunchDescription([
         DeclareLaunchArgument("params", default_value=default_params),
+        DeclareLaunchArgument(
+            "require_enable", default_value="false",
+            description="Hold at WAIT_ENABLE until the ~/start service is "
+                        "called (the RViz Tuner panel's START button), instead "
+                        "of beginning the moment PX4 enters OFFBOARD. Pass "
+                        "true when driving the session from the panel: the "
+                        "session then cannot begin from a mode switch alone."),
         DeclareLaunchArgument(
             "ns", default_value="",
             description="Namespace of the controller stack (e.g. 'interceptor' "
