@@ -157,7 +157,7 @@ payoff:
 
 | Test | Environment | Result |
 |---|---|---|
-| 24 unit tests (gain math, step fitting, safety logic) | host venv | PASS |
+| 65 unit tests (gain math, step fitting, safety logic, episode schedule) | gtest, docker Humble | PASS |
 | Closed-loop auto-tune: **real controller node** + physics sim + tuner | host, ROS 2 Jazzy | PASS — all axes converge to ωn_eff = 1.60, ζ = 0.95 exactly |
 | Same, 10 % thrust-map error | host | PASS — converges, reports "multiply max_thrust by 0.92" (truth: 0.90) |
 | Same, 30 % thrust-map error | host | PASS — safe abort, gains restored, actionable diagnosis |
@@ -591,15 +591,21 @@ position loop, so the estimator cannot interact with it dynamically
 ```
 ~/src/ihunter_fixes/
 ├── TUNING_PLAN.md                  <- this document
-└── geo_tuner/                      <- ROS 2 package (ament_python)
+└── geo_tuner/                      <- ROS 2 package (ament_cmake, C++)
     ├── README.md                   <- command-level usage
-    ├── geo_tuner/core/             <- pure logic: gain_design, step_fit,
-    │                                  safety, thrust_model (unit-tested)
-    ├── geo_tuner/cli/              <- geo-tuner-hover, geo-tuner-design
-    ├── geo_tuner/tuning_conductor.py   <- in-flight auto-tuner node
-    ├── geo_tuner/quad_sim.py       <- lightweight plant for fast sim tests
+    ├── include/geo_tuner/core/, src/core/
+    │                               <- pure logic: gain_design, step_fit,
+    │                                  first_order_fit, least_squares, safety,
+    │                                  aggregate (unit-tested)
+    ├── src/tuning_conductor.cpp    <- in-flight auto-tuner node
+    ├── src/quad_sim.cpp            <- lightweight plant for fast sim tests
+    ├── src/nodes/design_gains_main.cpp  <- geo-tuner-design CLI
+    ├── scripts/geo-tuner-hover     <- offline ulog analysis (Python/pyulog)
+    ├── include/geo_tuner/rviz/, src/rviz/
+    │                               <- the five RViz field panels
     ├── launch/sim_tune.launch.py   <- Phase 2 (controller+sim+tuner)
     ├── launch/field_tune.launch.py <- Phases 3 & 4 (tuner only)
+    ├── launch/field_monitor.launch.py   <- RViz + panels for a field session
     ├── config/tuner_field.yaml     <- field session configuration
-    └── test/test_core.py           <- 24 unit tests
+    └── test/test_core.cpp, test/test_schedule.cpp   <- 65 unit tests
 ```

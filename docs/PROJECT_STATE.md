@@ -16,12 +16,26 @@ under namespace `/interceptor`.
 
 | Repo | Branch | State |
 |---|---|---|
-| `mzahana/geo_tuner` | `main` (90db467) | tuning toolkit + field checklist (this repo) |
+| `mzahana/geo_tuner` | `cpp-port` | **C++ rewrite** of the whole toolkit + the RViz panels merged in (this repo) |
+| `mzahana/geo_tuner_rviz_plugins` | `main` | **superseded** — its five panels now live in `geo_tuner`; retire once `cpp-port` merges |
 | `mzahana/mav_controllers_ros` | `main` = `ros2_humble` = `production-hardening` (139f3ad) | hardened controller + trajectory test node + hold failsafe |
 | `mzahana/d2dtracker_sim` | `main` | SITL bringup launch + tuned configs |
 
 Local checkouts: `~/src/ihunter_fixes/{geo_tuner, mav_controllers_ros}`;
 sim package at `~/d2dtracker_cuda_shared_volume/ros2_ws/src/d2dtracker_sim`.
+
+### 0. C++ port + single-package merge (branch `cpp-port`)
+The package is now `ament_cmake` C++ throughout: the identification math
+(step / first-order fits on a bounded Levenberg-Marquardt over Eigen, in
+place of `scipy.optimize.least_squares`), the safety monitor, the robust
+aggregation, the gain design, the `tuning_conductor` and `quad_sim` nodes,
+and the `geo-tuner-design` CLI. The five RViz panels moved in from
+`geo_tuner_rviz_plugins`, so the tuner and its ground-station UI are one
+package; their pluginlib class names changed from
+`geo_tuner_rviz_plugins/XPanel` to `geo_tuner/XPanel`. The panels build
+only where `rviz_common` is found, so the vehicle-side build pulls in no Qt.
+Only `scripts/geo-tuner-hover` (offline ulog parsing via pyulog) and
+`scripts/tracking_viz.py` are still Python.
 
 ## What was built
 
@@ -95,7 +109,8 @@ chars, so kill with `pkill -f 'lib/mav_controllers_ros/[t]raj'`, never
   `FIELD_CHECKLIST.md` (printable field-day checklist: bench prep →
   PX4 autotune/hover ulog → controller sanity flight → conductor
   session → circle/lemniscate agility ladder + emergency card).
-- 39 unit tests (`pytest test/test_core.py`, use the repo `.venv`).
+- 65 gtest units (`colcon test --packages-select geo_tuner`, then
+  `colcon test-result --all`).
 
 ### 3. SITL environment
 Container `d2dtracker_cuda` (image mzahana/px4-simulation-cuda12.2.0-
@@ -145,7 +160,10 @@ PX4 + mavros ns `/interceptor`, auto-sets 100 Hz streams for msgs
 
 ## Working constraints (respect these)
 
-- Never install into system Python — use the repo `.venv`.
+- The package is C++ (ament_cmake). The only Python left is
+  `scripts/geo-tuner-hover` (offline ulog parsing) and
+  `scripts/tracking_viz.py`. Never install into system Python — use the
+  repo `.venv` for pyulog/numpy.
 - Edit *source* configs in `shared_volume/ros2_ws/src/...`, then
   `colcon build --symlink-install` — never the install space.
 - Don't kill container processes while the user is working.

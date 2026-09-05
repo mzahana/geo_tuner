@@ -38,14 +38,19 @@ it's inside the shared volume, so it's visible on the host too:
 ls -t ~/shared_volume/PX4-Autopilot/build/px4_sitl_default/rootfs/log/*/  | head
 ```
 
-Analyze it on the host with the geo_tuner venv (pyulog lives there):
+Analyze it with `geo-tuner-hover`. This is the one remaining Python tool
+(it parses the ulog with pyulog), so run it from the package venv:
 
 ```bash
-cd ~/src/ihunter_fixes/geo_tuner
-.venv/bin/python -m geo_tuner.cli.analyze_hover \
+cd <geo_tuner>
+.venv/bin/python scripts/geo-tuner-hover \
     ~/d2dtracker_cuda_shared_volume/PX4-Autopilot/build/px4_sitl_default/rootfs/log/<date>/<file>.ulg \
     --mass 2.0 --design
 ```
+
+With the workspace sourced it is also on the path as
+`ros2 run geo_tuner geo-tuner-hover ...`; `--design` then shells out to the
+compiled `geo-tuner-design`.
 
 (2.0 kg ≈ the sim x500's mass.) It prefers PX4's `hover_thrust_estimate`
 topic — which SITL logs — and prints the hover throttle, the implied

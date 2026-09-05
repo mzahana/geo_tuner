@@ -2,7 +2,8 @@
 
 Systematic gain design and **safe in-flight auto-tuning** for the
 [mav_controllers_ros](https://github.com/mzahana/mav_controllers_ros)
-geometric attitude controller (PX4 offboard, body-rates + thrust via mavros).
+geometric attitude controller (PX4 offboard, body-rates + thrust via mavros) —
+**plus the RViz field panels** that drive and monitor it, in the same package.
 
 **SITL quick start: [docs/SITL_RECIPE.md](docs/SITL_RECIPE.md)** — the full
 tuning cycle in the d2dtracker PX4 SITL, command by command.
@@ -41,11 +42,16 @@ twiddling `kx/kv`. The only vehicle-specific unknowns are:
 ### Step 0 — one-time setup
 
 ```bash
-# offline tools live in an isolated venv (never touches system python)
-cd geo_tuner && python3 -m venv .venv
-.venv/bin/pip install pyulog numpy scipy pyyaml
 # ROS package: drop geo_tuner + mav_controllers_ros in your ws and colcon build
+colcon build --packages-select geo_tuner && source install/setup.bash
+
+# The one remaining offline Python tool (ulog parsing) needs pyulog + numpy.
+# Keep it in an isolated venv — never touch system python:
+cd geo_tuner && python3 -m venv .venv && .venv/bin/pip install pyulog numpy
 ```
+
+Everything else — the tuning conductor, the identification math, the gain
+designer, the simulator and the RViz panels — is C++ and needs no Python.
 
 Run **PX4 Autotune** (rate + attitude loops) in Position mode. Make sure
 mavros streams odometry ≥ 50 Hz to `geometric_controller/odom`.
@@ -56,7 +62,7 @@ Fly a 1–2 min steady hover in **Position mode** (full flight battery), pull
 the `.ulg`, then:
 
 ```bash
-.venv/bin/python -m geo_tuner.cli.analyze_hover flight.ulg --mass 2.5 --design
+ros2 run geo_tuner geo-tuner-hover flight.ulg --mass 2.5 --design
 ```
 
 This prints the measured hover throttle and `max_thrust`, and (with
@@ -65,7 +71,7 @@ This prints the measured hover throttle and `max_thrust`, and (with
 knobs directly:
 
 ```bash
-.venv/bin/python -m geo_tuner.cli.design_gains \
+ros2 run geo_tuner geo-tuner-design \
     --mass 2.5 --hover-throttle 0.45 \
     --attctrl-tau 0.3 --zeta 0.95 --latency 0.08 --out-dir cfg/
 ```
@@ -144,17 +150,38 @@ Note: if the image defaults to the zenoh RMW without a router, run with
 ## Tests
 
 ```bash
-env PYTHONPATH= .venv/bin/python -m pytest test/ -q     # 24 unit tests
-ros2 launch geo_tuner sim_tune.launch.py                # closed-loop e2e
+colcon test --packages-select geo_tuner && colcon test-result --all   # 65 gtest units
+ros2 launch geo_tuner sim_tune.launch.py                              # closed-loop e2e
 ```
 
-Validated on ROS 2 Jazzy (host) and Humble (d2dtracker docker image),
+Validated on ROS 2 Humble (d2dtracker docker image),
 against both upstream `mav_controllers_ros` and its `production-hardening`
 branch (dt-correct integrator, anti-windup, altitude-priority saturation,
 rate feedforward, watchdogs, thrust-scale estimator):
 - perfect model → converges, all axes `wn_effective = target`, ζ = 0.95
 - 10 % thrust-map error → converges + reports "multiply max_thrust by 0.92"
 - 30 % thrust-map error → safe abort, gains restored, actionable diagnosis
+
+## Package layout
+
+One package, three products:
+
+| Path | What |
+| --- | --- |
+| `include/geo_tuner/core/`, `src/core/` | ROS-free identification and design math: step / first-order fits (bounded Levenberg–Marquardt on Eigen), the safety monitor, robust aggregation, pole-placement gain design |
+| `src/tuning_conductor.cpp`, `src/quad_sim.cpp`, `src/nodes/` | the `tuning_conductor` and `quad_sim` nodes and the `geo-tuner-design` CLI |
+| `include/geo_tuner/rviz/`, `src/rviz/` | the five RViz panels (`geo_tuner_panels` plugin library) |
+
+The panels are built **only where RViz is installed** — `find_package(rviz_common
+QUIET)`. A vehicle-side build (Jetson, headless docker) silently skips them and
+pulls in no Qt or OGRE. `mavros_msgs` is likewise optional: without it the panels
+lose the PX4 flight-mode readout and the conductor cannot supervise OFFBOARD.
+
+The RViz panels used to live in a separate `geo_tuner_rviz_plugins` package. They
+were folded in here, which renamed their pluginlib classes from
+`geo_tuner_rviz_plugins/XPanel` to **`geo_tuner/XPanel`**. A hand-saved `.rviz`
+config from before the merge needs that prefix updated (the shipped
+`rviz/geo_field.rviz` already has it).
 
 ## Implementation notes / gotchas found in the controller
 
