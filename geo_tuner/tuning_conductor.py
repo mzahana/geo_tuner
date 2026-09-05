@@ -38,6 +38,7 @@ from rclpy.qos import qos_profile_sensor_data
 # on ROS 2 Humble, the distro on the Jetson/docker image)
 from rcl_interfaces.msg import Parameter as ParameterMsg
 from rcl_interfaces.msg import ParameterType, ParameterValue
+from rcl_interfaces.msg import SetParametersResult
 from rcl_interfaces.srv import GetParameters, SetParameters
 
 import yaml
@@ -105,6 +106,22 @@ class TuningConductor(Node):
         # may include "yaw" for heading-loop identification
         self.declare_parameter("axes", "z,x,y,yaw")  # z first
         self.declare_parameter("yaw_step", 0.5)          # rad
+        # Hard ceiling on any live step-amplitude change. The real limit
+        # is usually safety.max_pos_error (a step commands exactly that
+        # much instantaneous position error, so a step at or above it
+        # aborts the session on the spot) -- validation uses whichever
+        # is smaller. Raise it deliberately, never by accident.
+        self.declare_parameter("max_step_size", 2.0)     # m
+        self.declare_parameter("min_step_size", 0.05)    # m
+        self.declare_parameter("max_yaw_step", 1.0)      # rad
+        # Below this the response is small against odometry noise and the
+        # fit-quality gate (nrmse < 0.15) starts rejecting episodes: the
+        # session still refuses to act on bad fits, it just gets slower
+        # and may end with "keeping gains". Warned about, not blocked.
+        self.declare_parameter("small_step_warn", 0.25)  # m
+        # How long to wait for the controller's parameter service to
+        # answer the baseline gain read before asking again.
+        self.declare_parameter("service_timeout", 5.0)   # s
         self.declare_parameter("yaw_time_constant", 0.35)  # s, target T
         self.declare_parameter("yawctrl_tau_min", 0.15)
         self.declare_parameter("yawctrl_tau_max", 1.2)
@@ -119,6 +136,49 @@ class TuningConductor(Node):
         # when the accepted estimates disagree by more than this factor.
         self.declare_parameter("episodes_per_rung", 3)
         self.declare_parameter("estimate_consistency", 1.35)
+        # --- session-time reduction (see docs/TUNING_GUIDE.md) ---
+        # Sequential stopping: fly at least this many reps, and stop the
+        # bucket early when every flown episode was accepted AND they
+        # agree within early_stop_spread -- a gate STRICTER than
+        # estimate_consistency, so an early stop only happens on evidence
+        # better than what a full bucket is required to produce.
+        self.declare_parameter("min_episodes_per_rung", 2)
+        self.declare_parameter("early_stop_spread", 1.15)
+        # Bidirectional episodes: instead of flying back to the hover
+        # point and throwing that leg away, record it. The setpoint walks
+        # 0 -> +d -> 0 -> -d -> 0 ...; every leg is a clean step of size d
+        # from a settled state, so the episode yield per unit time doubles
+        # and the excursion envelope is unchanged.
+        self.declare_parameter("bidirectional_episodes", True)
+        # Adaptive settle: leave SETTLE as soon as the vehicle is quiet
+        # for settle_quiet_time instead of always burning settle_time
+        # (which stays the hard cap, so this is never slower).
+        self.declare_parameter("min_settle_time", 0.3)
+        self.declare_parameter("settle_quiet_time", 0.4)
+        self.declare_parameter("settle_tol_pos", 0.06)      # m
+        self.declare_parameter("settle_tol_vel", 0.10)      # m/s
+        self.declare_parameter("settle_tol_yaw", 0.05)      # rad
+        # Adaptive episode length: stop recording once the response has
+        # been flat at its steady state for episode_quiet_time, but never
+        # before the transient can have finished (min_episode_time and
+        # episode_settle_periods/(zeta*wn)). episode_time is the cap.
+        self.declare_parameter("adaptive_episode", True)
+        self.declare_parameter("min_episode_time", 2.0)     # s
+        self.declare_parameter("episode_quiet_time", 0.5)   # s
+        self.declare_parameter("episode_settle_band", 0.04)  # of |step|
+        self.declare_parameter("episode_settle_periods", 4.0)
+        # Both quiet gates are also read as a FRACTION of the step being
+        # flown, and the tighter of the two applies. Without this a small
+        # (confined-space) step would be declared settled while the
+        # residual is still a large part of the step itself.
+        self.declare_parameter("settle_tol_frac", 0.15)     # of |step|
+        # ...and the band gets an absolute floor, so a small step does not
+        # ask for a flatness finer than the odometry noise (which would
+        # silently disable the adaptive stop). Axis units: m, or rad.
+        self.declare_parameter("episode_settle_floor", 0.01)
+        # Capture radius for "arrived at the hover point" before settling.
+        self.declare_parameter("hover_capture_radius", 0.3)   # m
+        self.declare_parameter("hover_capture_speed", 0.3)    # m/s
         # Hold at WAIT_ENABLE until the ~/start service is called, rather
         # than starting as soon as the vehicle is in OFFBOARD.
         self.declare_parameter("require_enable", False)
@@ -149,6 +209,11 @@ class TuningConductor(Node):
         self.axes = [a.strip() for a in str(gp("axes")).split(",")
                      if a.strip() in AXES or a.strip() == "yaw"]
         self.yaw_step = float(gp("yaw_step"))
+        self.max_step_size = float(gp("max_step_size"))
+        self.min_step_size = float(gp("min_step_size"))
+        self.max_yaw_step = float(gp("max_yaw_step"))
+        self.small_step_warn = float(gp("small_step_warn"))
+        self.service_timeout = float(gp("service_timeout"))
         self.yaw_T_target = float(gp("yaw_time_constant"))
         self.yaw_tau_min = float(gp("yawctrl_tau_min"))
         self.yaw_tau_max = float(gp("yawctrl_tau_max"))
@@ -156,7 +221,25 @@ class TuningConductor(Node):
         self.zeta_target = float(gp("zeta_target"))
         self.max_change = float(gp("max_gain_change_factor"))
         self.episodes_per_rung = max(1, int(gp("episodes_per_rung")))
+        self.min_episodes = max(1, min(int(gp("min_episodes_per_rung")),
+                                       self.episodes_per_rung))
+        self.early_stop_spread = float(gp("early_stop_spread"))
         self.consistency = float(gp("estimate_consistency"))
+        self.bidirectional = bool(gp("bidirectional_episodes"))
+        self.min_settle_time = float(gp("min_settle_time"))
+        self.settle_quiet_time = float(gp("settle_quiet_time"))
+        self.settle_tol_pos = float(gp("settle_tol_pos"))
+        self.settle_tol_vel = float(gp("settle_tol_vel"))
+        self.settle_tol_yaw = float(gp("settle_tol_yaw"))
+        self.adaptive_episode = bool(gp("adaptive_episode"))
+        self.min_episode_time = float(gp("min_episode_time"))
+        self.episode_quiet_time = float(gp("episode_quiet_time"))
+        self.episode_settle_band = float(gp("episode_settle_band"))
+        self.episode_settle_periods = float(gp("episode_settle_periods"))
+        self.settle_tol_frac = float(gp("settle_tol_frac"))
+        self.episode_settle_floor = float(gp("episode_settle_floor"))
+        self.hover_capture_radius = float(gp("hover_capture_radius"))
+        self.hover_capture_speed = float(gp("hover_capture_speed"))
         self.report_path = str(gp("report_path"))
         # When set, the conductor holds at WAIT_ENABLE until ~/start is
         # called, instead of beginning the moment OFFBOARD is engaged. The
@@ -211,6 +294,13 @@ class TuningConductor(Node):
         self.rep = 0                   # episode repetition within (axis, rung)
         self.bucket = EpisodeBucket()  # accepted estimates for this bucket
         self.step_sign = 1.0
+        # Commanded offset from the hover point on the active axis (m, or
+        # rad for yaw). The bidirectional schedule alternates it between
+        # 0 and +/- the step size; each transition is one episode.
+        self.leg_offset = 0.0
+        self.step_applied = 0.0     # signed step of the episode in flight
+        self._quiet_t0: float | None = None   # SETTLE quiet-window start
+        self._episode_min_time = 0.0          # earliest adaptive stop [s]
         self.recording: list[tuple[float, float]] = []  # (t, pos[axis])
         self.step_t0 = 0.0
         self.pre_step_pos = 0.0
@@ -228,6 +318,9 @@ class TuningConductor(Node):
         self.max_trim = 3.0            # m/s^2 per axis
         self.max_trim_updates = 8
         self._pending_future = None
+        self._request_t0 = 0.0      # when the baseline read was issued
+        self._request_tries = 0
+        self._waiting_logged = False
         self._analysis: dict | None = None
 
         # Session control from the ground. Without these a session could only
@@ -241,11 +334,108 @@ class TuningConductor(Node):
         self.reset_srv = self.create_service(Trigger, "~/reset", self._srv_reset)
 
         self.start_requested = not self.require_enable
+        # Step amplitudes are live-settable (RViz tuner panel / ros2 param
+        # set) so the envelope can be trimmed to the available space
+        # without restarting a session.
+        self.add_on_set_parameters_callback(self._on_set_parameters)
+        for name, val, is_yaw in (("step_size", self.step_size, False),
+                                  ("step_size_z", self.step_size_z, False),
+                                  ("yaw_step", self.yaw_step, True)):
+            ok, why = self._validate_step(name, val, is_yaw)
+            if not ok:
+                self.get_logger().error(f"{name}={val}: {why}")
+            elif why:
+                self.get_logger().warn(f"{name}={val}: {why}")
+        self.get_logger().info(
+            f"Step envelope: +/-{self.step_size:.2f} m lateral, "
+            f"+/-{self.step_size_z:.2f} m vertical, "
+            f"+/-{self.yaw_step:.2f} rad yaw about the hover point "
+            f"(max_pos_error {self.safety.limits.max_pos_error:.2f} m)")
         self.timer = self.create_timer(1.0 / self.rate_hz, self._tick)
         self.health_timer = self.create_timer(0.2, self._publish_health)
         self.get_logger().info(
             f"Tuning conductor up. axes={self.axes} wn_ladder={self.wn_ladder} "
             f"zeta={self.zeta_target} hover={self.hover}")
+
+    # ------------------------------------------------------------------
+    # live step-amplitude configuration
+    def _step_ceiling(self) -> float:
+        """Largest linear step that cannot trip the safety monitor.
+
+        A step commands the setpoint to jump by the full amplitude while
+        the vehicle is still at the old point, so the position error is
+        momentarily equal to the step. At max_pos_error the monitor would
+        abort the session the instant the step is issued; keep a margin.
+        """
+        return min(self.max_step_size,
+                   0.8 * self.safety.limits.max_pos_error)
+
+    def _validate_step(self, name: str, value: float, is_yaw: bool):
+        """(ok, note): note is a rejection reason, or a warning when ok."""
+        if not math.isfinite(value):
+            return False, "not a finite number"
+        if is_yaw:
+            if not (0.05 <= value <= self.max_yaw_step):
+                return False, (f"outside [0.05, {self.max_yaw_step:.2f}] rad "
+                               f"(max_yaw_step)")
+            return True, ""
+        ceiling = self._step_ceiling()
+        if value < self.min_step_size:
+            return False, f"below min_step_size {self.min_step_size:.2f} m"
+        if value > ceiling:
+            return False, (
+                f"above {ceiling:.2f} m, the largest safe step here "
+                f"(min of max_step_size {self.max_step_size:.2f} m and 0.8 x "
+                f"safety.max_pos_error {self.safety.limits.max_pos_error:.2f} m "
+                f"-- a larger step trips the position-error abort the moment "
+                f"it is commanded)")
+        if value < self.small_step_warn:
+            return True, (
+                f"small: the response may not clear odometry noise, so the "
+                f"fit-quality gate (nrmse < 0.15) will reject episodes and "
+                f"the session may end 'keeping gains'. Watch nrmse in the "
+                f"report.")
+        return True, ""
+
+    def _on_set_parameters(self, params):
+        """Live reconfiguration of the step amplitudes.
+
+        Everything else stays launch-time: these three are the knobs a
+        pilot needs to trim the manoeuvre envelope to the space actually
+        available, and they are the ones the RViz tuner panel exposes.
+        A change takes effect at the NEXT episode -- never mid-step -- and
+        the schedule self-corrects, because a leg's step is measured as
+        the difference between the commanded offsets, not assumed.
+        """
+        live = {"step_size": False, "step_size_z": False, "yaw_step": True}
+        for p in params:
+            if p.name not in live:
+                continue
+            try:
+                value = float(p.value)
+            except (TypeError, ValueError):
+                return SetParametersResult(
+                    successful=False,
+                    reason=f"{p.name} must be a number")
+            ok, note = self._validate_step(p.name, value, live[p.name])
+            if not ok:
+                self.get_logger().warn(f"rejected {p.name}={value}: {note}")
+                return SetParametersResult(successful=False,
+                                           reason=f"{p.name}: {note}")
+            if note:
+                self.get_logger().warn(f"{p.name}={value}: {note}")
+        for p in params:
+            if p.name == "step_size":
+                self.step_size = float(p.value)
+            elif p.name == "step_size_z":
+                self.step_size_z = float(p.value)
+            elif p.name == "yaw_step":
+                self.yaw_step = float(p.value)
+            else:
+                continue
+            self._status(f"{p.name} -> {float(p.value):.2f} "
+                         f"(applies from the next episode)")
+        return SetParametersResult(successful=True)
 
     # ------------------------------------------------------------------
     def _now(self) -> float:
@@ -302,12 +492,14 @@ class TuningConductor(Node):
 
     # ------------------------------------------------------------------
     # gain get/set through the controller's parameter interface
-    def _request_gains(self):
+    def _request_gains(self, now: float | None = None):
         req = GetParameters.Request()
         req.names = ["gains.pos.x", "gains.pos.y", "gains.pos.z",
                      "gains.vel.x", "gains.vel.y", "gains.vel.z",
                      "yawctrl_tau", "attctrl_tau"]
         self._pending_future = self.get_param_cli.call_async(req)
+        self._request_t0 = self._now() if now is None else now
+        self._request_tries += 1
 
     def _apply_yaw_tau(self, tau: float):
         req = SetParameters.Request()
@@ -348,6 +540,9 @@ class TuningConductor(Node):
             self._status(f"PX4 left {self.offboard_mode} "
                          f"(now: {self.px4_mode}); pausing tuning")
             self.recording = []
+            self.leg_offset = 0.0
+            self.setpoint_yaw = 0.0
+            self._quiet_t0 = None
             self.safety.reset()
             self._goto(State.WAIT_OFFBOARD)
 
@@ -361,10 +556,22 @@ class TuningConductor(Node):
 
     # ---- states ----
     def _st_wait_odom(self, now):
-        if self.odom is not None:
-            self._status("Odometry received; requesting current gains")
-            self._request_gains()
-            self._goto(State.WAIT_ENABLE)
+        if self.odom is None:
+            return
+        # The controller's parameter service must actually be discovered
+        # before we call it: call_async on an undiscovered service is
+        # simply dropped, and the session would then sit in WAIT_ENABLE
+        # forever with no explanation.
+        if not self.get_param_cli.service_is_ready():
+            if not self._waiting_logged:
+                self._status("Odometry received; waiting for the controller's "
+                             "parameter service "
+                             f"({self.get_param_cli.srv_name})")
+                self._waiting_logged = True
+            return
+        self._status("Odometry received; requesting current gains")
+        self._request_gains(now)
+        self._goto(State.WAIT_ENABLE)
 
     def _st_wait_enable(self, now):
         # Baseline already captured on an earlier tick: we are simply
@@ -377,6 +584,23 @@ class TuningConductor(Node):
                     self._status(f"Start requested; waiting for PX4 mode "
                                  f"{self.offboard_mode}")
                     self._goto(State.WAIT_OFFBOARD)
+            return
+
+        # A dropped or unanswered request must not strand the session:
+        # ask again (and say so) rather than waiting silently forever.
+        if (self._pending_future is not None
+                and not self._pending_future.done()
+                and now - self._request_t0 > self.service_timeout):
+            self._pending_future.cancel()
+            self._pending_future = None
+            self._status(
+                f"controller did not answer the gain read in "
+                f"{self.service_timeout:.0f}s "
+                f"(attempt {self._request_tries}); retrying")
+            return
+        if self._pending_future is None and not getattr(self, "baseline_read", False):
+            if self.get_param_cli.service_is_ready():
+                self._request_gains(now)
             return
 
         # Capture the controller's current gains as the known-safe baseline
@@ -440,14 +664,18 @@ class TuningConductor(Node):
                          f"(rung {self.rung + 1}/{len(self.wn_ladder)}, "
                          f"axis {self.axes[self.axis_idx]})")
             self.setpoint = list(self.hover)
+            self.leg_offset = 0.0
+            self.setpoint_yaw = 0.0
             self._goto(State.GOTO_HOVER)
 
     def _st_goto_hover(self, now):
         if self.odom is None:
             return
         err = math.dist(self.odom.pos, self.setpoint)
-        if err < 0.3 and math.sqrt(sum(v * v for v in self.odom.vel)) < 0.3:
-            self._status(f"At hover point; settling {self.settle_time}s "
+        if (err < self.hover_capture_radius
+                and math.sqrt(sum(v * v for v in self.odom.vel))
+                < self.hover_capture_speed):
+            self._status(f"At hover point; settling (<= {self.settle_time}s) "
                          f"(rung {self.rung + 1}/{len(self.wn_ladder)}, "
                          f"axis {self.axes[self.axis_idx]})")
             self._goto(State.SETTLE)
@@ -498,26 +726,89 @@ class TuningConductor(Node):
                 f"~{alpha:.2f}: multiply max_thrust in geometric_mavros.yaml "
                 f"by {alpha:.2f}")
 
+    def _is_quiet(self, now) -> bool:
+        """Vehicle settled on the current setpoint for settle_quiet_time.
+
+        Tighter than the GOTO_HOVER capture gate: the step must start from
+        a genuinely quiet state or the fit sees a superimposed transient.
+        """
+        if self.odom is None:
+            self._quiet_t0 = None
+            return False
+        mag = self._axis_step_mag()
+        err = max(abs(self.odom.pos[i] - self.setpoint[i]) for i in range(3))
+        speed = math.sqrt(sum(v * v for v in self.odom.vel))
+        tol_pos = min(self.settle_tol_pos, self.settle_tol_frac * mag)
+        ok = err < tol_pos and speed < self.settle_tol_vel
+        if ok and self.axes[self.axis_idx] == "yaw":
+            dyaw = self._yaw_of(self.odom.quat) - self.setpoint_yaw
+            dyaw = math.atan2(math.sin(dyaw), math.cos(dyaw))
+            tol_yaw = min(self.settle_tol_yaw, self.settle_tol_frac * mag)
+            ok = (abs(dyaw) < tol_yaw
+                  and abs(self.odom.body_rates[2]) < 3.0 * tol_yaw)
+        if not ok:
+            self._quiet_t0 = None
+            return False
+        if self._quiet_t0 is None:
+            self._quiet_t0 = now
+        return (now - self._quiet_t0) >= self.settle_quiet_time
+
+    def _axis_step_mag(self) -> float:
+        """Amplitude of the step this axis flies, in the axis's units."""
+        ax = self.axes[self.axis_idx] if self.axes else "x"
+        if ax == "yaw":
+            return self.yaw_step
+        return self.step_size_z if ax == "z" else self.step_size
+
+    def _next_leg(self, mag: float) -> float:
+        """Commanded offset for the next episode.
+
+        Bidirectional: 0 -> +mag -> 0 -> -mag -> 0 ... so the return leg
+        is itself a recorded step instead of dead flight time. Otherwise
+        the classic schedule: always step out from the hover point.
+        """
+        if not self.bidirectional:
+            return mag * self.step_sign
+        return 0.0 if self.leg_offset != 0.0 else mag * self.step_sign
+
     def _st_settle(self, now):
-        if now - self.state_t0 < self.settle_time:
+        elapsed = now - self.state_t0
+        if elapsed < self.min_settle_time:
+            return
+        # settle_time remains the hard cap: with a noisy/windy plant this
+        # degrades exactly to the previous fixed-time behaviour.
+        if elapsed < self.settle_time and not self._is_quiet(now):
             return
         ax = self.axes[self.axis_idx]
         self.recording = []
         self.step_t0 = now
+        self._quiet_t0 = None
         if ax == "yaw":
-            step = self.yaw_step * self.step_sign
+            new_off = self._next_leg(self.yaw_step)
+            step = new_off - self.leg_offset
+            self.leg_offset = new_off
             self.pre_step_yaw = self._yaw_of(self.odom.quat)
             self.setpoint = list(self.hover)
-            self.setpoint_yaw = self.pre_step_yaw + step
+            self.setpoint_yaw = new_off
+            wn_equiv = 1.0 / max(self.yaw_T_target, 1e-3)
             self._status(f"Yaw step {step:+.2f} rad")
         else:
             i = AXES[ax]
-            step = self.step_size_z if ax == "z" else self.step_size
-            step *= self.step_sign
+            mag = self.step_size_z if ax == "z" else self.step_size
+            new_off = self._next_leg(mag)
+            step = new_off - self.leg_offset
+            self.leg_offset = new_off
             self.pre_step_pos = self.odom.pos[i]
             self.setpoint = list(self.hover)
-            self.setpoint[i] += step
+            self.setpoint[i] += new_off
+            wn_equiv = math.sqrt(max(self.gains[ax][0], 1e-3))
             self._status(f"Step {step:+.2f} m on {ax}")
+        self.step_applied = step
+        # Earliest an adaptive episode may end: the transient of the
+        # currently applied loop cannot have finished before this.
+        self._episode_min_time = min(self.episode_time, max(
+            self.min_episode_time,
+            self.episode_settle_periods / max(self.zeta_target * wn_equiv, 1e-3)))
         self._goto(State.STEP)
 
     def _st_step(self, now):
@@ -531,13 +822,39 @@ class TuningConductor(Node):
                 i = AXES[ax]
                 self.recording.append((now - self.step_t0,
                                        self.odom.pos[i] - self.pre_step_pos))
-        if now - self.state_t0 >= self.episode_time:
+        elapsed = now - self.state_t0
+        if elapsed >= self.episode_time:
             self._goto(State.ANALYZE)
+            return
+        if (self.adaptive_episode and elapsed >= self._episode_min_time
+                and self._response_settled(now)):
+            self._goto(State.ANALYZE)
+
+    def _response_settled(self, now) -> bool:
+        """The recorded response has reached and held its steady state.
+
+        Recording past that point adds only flat samples: they carry no
+        information about (wn, zeta, delay) and just cost flight time. The
+        window must sit at the step's steady state (not at the flat piece
+        during the transport delay), hence the amplitude check.
+        """
+        t_end = now - self.step_t0
+        w0 = t_end - self.episode_quiet_time
+        ys = [y for (t, y) in self.recording if t >= w0]
+        if len(ys) < 5:
+            return False
+        step = self.step_applied
+        band = max(self.episode_settle_band * abs(step),
+                   self.episode_settle_floor)
+        if max(ys) - min(ys) > band:
+            return False
+        mean = sum(ys) / len(ys)
+        return mean * step > 0.0 and abs(mean) >= 0.6 * abs(step)
 
     def _analyze_yaw(self, now):
         t = np.array([r[0] for r in self.recording])
         y = np.array([r[1] for r in self.recording])
-        step = self.yaw_step * self.step_sign
+        step = self.step_applied
         rec = {"axis": "yaw", "rung": self.rung, "rep": self.rep,
                "T_target": self.yaw_T_target, "step": round(step, 3),
                "yaw_tau_applied": round(self.yaw_tau, 3)}
@@ -548,14 +865,12 @@ class TuningConductor(Node):
             rec["action"] = f"episode discarded (fit error: {e})"
             self.results.append(rec)
             self._status(f"yaw fit failed ({e}); discarding episode")
-            self.setpoint_yaw = 0.0
             self._episode_finished()
             return
         rec.update({"T_meas": round(fit.T, 3), "delay": round(fit.delay, 3),
                     "nrmse": round(fit.nrmse, 3)})
         self._status(f"yaw: T={fit.T:.2f}s delay={fit.delay * 1e3:.0f}ms "
                      f"nrmse={fit.nrmse:.2f}")
-        self.setpoint_yaw = 0.0  # heading back to nominal after episode
         if not fit.ok:
             rec["action"] = "fit rejected"
             self._status("Yaw fit quality gate failed; episode discarded")
@@ -572,7 +887,7 @@ class TuningConductor(Node):
             self.bucket.alphas, min_count=min(2, self.episodes_per_rung),
             max_spread=self.consistency)
         rec = {"axis": "yaw", "rung": self.rung,
-               "n_episodes": self.episodes_per_rung, "n_used": est.n_used,
+               "n_episodes": self.rep, "n_used": est.n_used,
                "spread": (round(est.spread, 3)
                           if math.isfinite(est.spread) else None)}
         if not est.ok:
@@ -605,7 +920,7 @@ class TuningConductor(Node):
             self._analyze_yaw(now)
             return
         i = AXES[ax]
-        step = (self.step_size_z if ax == "z" else self.step_size) * self.step_sign
+        step = self.step_applied
         t = np.array([r[0] for r in self.recording])
         y = np.array([r[1] for r in self.recording])
         kx_now, kv_now = self.gains[ax]
@@ -669,7 +984,7 @@ class TuningConductor(Node):
             self.bucket.alphas, min_count=min(2, self.episodes_per_rung),
             max_spread=self.consistency)
         rec = {"axis": ax, "rung": self.rung, "wn_target": wn_target,
-               "n_episodes": self.episodes_per_rung, "n_used": est.n_used,
+               "n_episodes": self.rep, "n_used": est.n_used,
                "spread": (round(est.spread, 3)
                           if math.isfinite(est.spread) else None)}
         if not est.ok:
@@ -728,17 +1043,48 @@ class TuningConductor(Node):
             return
         self._advance_axis()
 
+    def _bucket_settled(self) -> bool:
+        """Enough consistent evidence to stop this bucket early.
+
+        Requires (a) the minimum number of reps flown, (b) every one of
+        them accepted — a discard means the identification is already
+        noisy, so fly the full bucket — and (c) agreement tighter than
+        the consistency gate the full bucket would have to pass."""
+        if self.rep < self.min_episodes:
+            return False
+        if self.bucket.count != self.rep:
+            return False
+        vals = self.bucket.alphas
+        if len(vals) < 2:
+            return False
+        return (max(vals) / min(vals)) <= self.early_stop_spread
+
     def _episode_finished(self):
         """One step episode analyzed (accepted or discarded). Fly the
         next repetition of the same (axis, rung), or — when the bucket
-        is full — aggregate and decide on a gain update."""
-        # Alternate step direction to stay centered on the hover point
-        self.step_sign *= -1.0
+        is full (or already consistent enough) — aggregate and decide on
+        a gain update."""
+        # Alternate step direction to stay centered on the hover point.
+        # Bidirectional: flip only after the leg that returns to centre,
+        # giving the 0 -> +d -> 0 -> -d -> 0 sequence.
+        if not self.bidirectional or self.leg_offset == 0.0:
+            self.step_sign *= -1.0
         self.rep += 1
-        if self.rep < self.episodes_per_rung:
-            self.setpoint = list(self.hover)
-            self._goto(State.GOTO_HOVER)
+        if self.rep < self.episodes_per_rung and not self._bucket_settled():
+            if self.bidirectional:
+                # Already settled-ish at the current leg; SETTLE waits for
+                # the quiet window rather than flying a discarded return.
+                self._goto(State.SETTLE)
+            else:
+                self.leg_offset = 0.0
+                self.setpoint = list(self.hover)
+                self.setpoint_yaw = 0.0
+                self._goto(State.GOTO_HOVER)
             return
+        if self.bucket.count == self.rep and self.rep < self.episodes_per_rung:
+            self._status(f"bucket consistent after {self.rep} episodes "
+                         f"(spread <= {self.early_stop_spread:.2f}x); "
+                         "stopping early")
         ax = self.axes[self.axis_idx]
         if ax == "yaw":
             self._finalize_yaw_bucket()
@@ -748,6 +1094,8 @@ class TuningConductor(Node):
     def _advance_axis(self):
         self.rep = 0
         self.bucket = EpisodeBucket()
+        self.leg_offset = 0.0
+        self.setpoint_yaw = 0.0
         self.axis_idx += 1
         if self.axis_idx >= len(self.axes):
             self.axis_idx = 0
@@ -760,6 +1108,8 @@ class TuningConductor(Node):
 
     def _finish(self):
         self.setpoint = list(self.hover)
+        self.setpoint_yaw = 0.0
+        self.leg_offset = 0.0
         self._set_trim_diagnosis()
         self._write_report(status="complete")
         self._status(f"Tuning complete. Report: {self.report_path}")
@@ -852,6 +1202,10 @@ class TuningConductor(Node):
         self.rung = 0
         self.axis_idx = 0
         self.rep = 0
+        self.leg_offset = 0.0
+        self.setpoint_yaw = 0.0
+        self.step_sign = 1.0
+        self._quiet_t0 = None
         self.a_trim = [0.0, 0.0, 0.0]
         self.trim_updates = 0
         self.start_requested = not self.require_enable
@@ -897,6 +1251,13 @@ class TuningConductor(Node):
                          if self.rung < len(self.wn_ladder) else "-")
         add("episode", f"{self.rep + 1}/{self.episodes_per_rung}")
         add("zeta_target", f"{self.zeta_target:.2f}")
+        add("step_size", f"{self.step_size:.2f}")
+        add("step_size_z", f"{self.step_size_z:.2f}")
+        add("yaw_step", f"{self.yaw_step:.2f}")
+        add("step_max", f"{self._step_ceiling():.2f}")
+        add("envelope", f"+/-{self.step_size:.2f} m lat, "
+                        f"+/-{self.step_size_z:.2f} m vert, "
+                        f"+/-{self.yaw_step:.2f} rad yaw")
         add("start_requested", str(bool(self.start_requested)).lower())
         add("require_enable", str(bool(self.require_enable)).lower())
         add("offboard", str(bool(self._in_offboard)).lower())
@@ -936,6 +1297,8 @@ class TuningConductor(Node):
                 "Verify max_thrust in geometric_mavros.yaml — fly a "
                 "Position-mode hover and run geo-tuner-hover on the ulog.")
         self.setpoint = list(self.hover)
+        self.setpoint_yaw = 0.0
+        self.leg_offset = 0.0
         if self.safe_gains is not None and self.gains != self.safe_gains:
             self.gains = dict(self.safe_gains)
             self._apply_gains(self.gains)

@@ -107,8 +107,16 @@ Before arming:
         higher on a later flight.
   - [ ] safety block: `min_altitude`, `max_altitude`, `max_pos_error`
         match your field, not someone else's.
-- [ ] Fresh battery (a full session with `episodes_per_rung: 3` takes
-      most of one).
+  - [ ] `step_size` / `step_size_z` / `yaw_step`: the vehicle stays within
+        +/- these of the hover point for the whole session (defaults
+        0.5 m / 0.4 m / 0.5 rad). Set them to the space you have, plus
+        margin for overshoot and wind. Below ~0.25 m the fit gets noisy —
+        see TUNING_GUIDE A.7b. They can also be changed in flight from the
+        RViz Tuner panel.
+- [ ] Fresh battery. With the default adaptive schedule a full
+      `episodes_per_rung: 3` session is ~1.5-3 min of flight (~3x
+      shorter than the old fixed schedule; see TUNING_GUIDE A.7a) —
+      still budget a battery, since wind lengthens the settle waits.
 
 Fly:
 

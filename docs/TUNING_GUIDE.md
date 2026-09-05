@@ -395,7 +395,50 @@ would bake noise into the gains. The latency gate likewise uses the
 median measured delay. Yaw episodes aggregate the identified time
 constant $\hat T$ the same way. With the median of 3, the standard error
 of the gain update falls by $\approx\sqrt{3}$ *and* single-outlier
-sensitivity drops to zero, at the cost of ~2× session time.
+sensitivity drops to zero.
+
+### A.7a Session time — where it goes, and what is safe to cut
+
+Repetition costs flight time, and a battery is the hard budget. Four
+scheduling changes cut a session by ~3× **without touching a single
+quality gate** (measured closed-loop against `quad_sim`: 259 s → 91 s
+for `wn_ladder: [1.2, 1.6, 2.0]`, `episodes_per_rung: 3`, same
+identified gains):
+
+1. **Bidirectional episodes** (`bidirectional_episodes`, default on).
+   The old schedule stepped out to $+d$, recorded, then flew *back* to
+   the hover point and threw that leg away. The return leg is itself a
+   clean step of size $d$ from a settled state, so it is now recorded:
+   the setpoint walks $0 \to +d \to 0 \to -d \to 0 \dots$ and the
+   episode yield per unit time doubles. The excursion envelope, the step
+   size and the ± alternation are all unchanged.
+2. **Quiet-based settling** (`settle_quiet_time`, `settle_tol_pos/vel`).
+   A step must start from rest, but *rest* is a condition, not a
+   duration: SETTLE now ends once the vehicle holds the setpoint within
+   `settle_tol_pos` / `settle_tol_vel` for `settle_quiet_time`. This
+   gate is *tighter* than the old fixed wait implied (it is checked, not
+   assumed) and `settle_time` remains the hard cap — a noisy or windy
+   plant simply degrades to the old fixed-time behaviour.
+3. **Adaptive episode length** (`adaptive_episode`). Recording stops
+   once the response has held its steady state for `episode_quiet_time`
+   within `episode_settle_band`·|step| — flat tail samples carry no
+   information about $(\omega_n, \zeta, T_d)$. It can never fire before
+   `max(min_episode_time, episode_settle_periods/(\zeta\omega_n))`,
+   i.e. before the transient of the *currently applied* loop could have
+   finished, and `episode_time` is still the cap. The amplitude check
+   ($|\bar y| \ge 0.6|step|$, correct sign) prevents the flat piece
+   during the transport delay from being mistaken for settling.
+4. **Sequential stopping** (`min_episodes_per_rung`, `early_stop_spread`).
+   A bucket ends after `min_episodes_per_rung` reps *only if* every
+   flown episode was accepted (no fit rejections, no implausible α) and
+   they agree within `early_stop_spread` (1.15×) — deliberately stricter
+   than `estimate_consistency` (1.35×), which the full bucket would only
+   have to pass. Stopping early therefore requires *better* evidence
+   than continuing would guarantee; any discard or disagreement flies
+   the full `episodes_per_rung`.
+
+Set `bidirectional_episodes: false` and `adaptive_episode: false` to
+reproduce the original fixed-schedule timing exactly.
 
 **Mode supervision.** Episodes only run while PX4 reports OFFBOARD
 (`mavros/state`): outside OFFBOARD the vehicle ignores the controller's
@@ -404,6 +447,48 @@ streams the current position as setpoint (bumpless engage; the stream is
 also what makes PX4 accept the mode switch); leaving OFFBOARD
 mid-session pauses tuning — episode discarded, gains kept — and it
 resumes from a fresh hover when OFFBOARD returns.
+
+### A.7b The manoeuvre envelope (tuning in confined space)
+
+Identification needs excitation, and excitation needs room. The conductor's
+whole demand on space is one step amplitude either side of the hover point:
+
+| Parameter | Default | Axis |
+|---|---|---|
+| `step_size` | 0.5 m | x, y |
+| `step_size_z` | 0.4 m | z |
+| `yaw_step` | 0.5 rad (29°) | yaw |
+
+The setpoint walks $0 \to +d \to 0 \to -d \to 0 \dots$ **about the hover
+point**, always as `hover + offset` and never as an increment on the current
+position, so the commanded envelope is exactly $\pm d$ per axis for a session
+of any length. Allow a little more for overshoot (a few % at $\zeta$ 0.95) and
+for wind. All three are live-settable — `ros2 param set` or the RViz Tuner
+panel — and take effect at the next episode.
+
+**Upper bound.** A step commands its full amplitude as *instantaneous position
+error*, so a step at `safety.max_pos_error` trips the abort the moment it is
+issued. The accepted ceiling is therefore
+`min(max_step_size, 0.8 × safety.max_pos_error)`, and larger values are
+refused with that arithmetic in the message.
+
+**Lower bound is set by noise, not by the code.** The identification fits
+$(\omega_n, \zeta, T_d)$ to the response, and the quality gate is a
+*relative* one (`nrmse < 0.15`), so what matters is response size against
+odometry noise. Halving the step halves the signal and doubles the relative
+noise. Below `small_step_warn` (0.25 m) the conductor warns; it never silently
+tunes to noise — bad fits are rejected and the session ends "keeping gains"
+instead. Measured in `quad_sim` (3 mm position noise), 0.2 m steps gave 16/16
+accepted episodes at a worst-case nrmse of 0.083 against the 0.15 gate. A real
+EKF is noisier: treat 0.3 m as the practical floor outdoors, check `nrmse` in
+the report, and raise the amplitude if episodes are being discarded.
+
+Two related knobs scale themselves with the amplitude, so a small step is not
+declared settled while the residual is still a large fraction of it:
+`settle_tol_frac` (the quiet gate uses the tighter of the absolute and
+fractional tolerance) and `episode_settle_floor` (an absolute floor under the
+flatness band, so a small step does not demand a flatness finer than the
+odometry noise).
 
 ### A.8 Body-rate feedforward (differential flatness)
 

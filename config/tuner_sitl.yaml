@@ -14,6 +14,24 @@
     episode_time: 6.0
     hover_timeout: 25.0
 
+    # --- manoeuvre envelope ---
+    # The vehicle stays within +/- these of the hover point: steps go out
+    # and come straight back, they never accumulate. Set them to the space
+    # you actually have. Live-settable (RViz Tuner panel / ros2 param set);
+    # a change applies from the next episode.
+    #   max_step_size   hard ceiling on any live change
+    #   the real limit is 0.8 x safety.max_pos_error, since a step commands
+    #   its full amplitude as instantaneous position error
+    #   small_step_warn below this the response may not clear odometry
+    #   noise and the fit-quality gate starts rejecting episodes
+    max_step_size: 1.0
+    min_step_size: 0.05
+    max_yaw_step: 1.0
+    small_step_warn: 0.25
+    hover_capture_radius: 0.3
+    hover_capture_speed: 0.3
+    service_timeout: 5.0
+
     axes: "z,x,y,yaw"
     wn_ladder: [1.2, 1.6, 2.0]
     zeta_target: 0.95
@@ -26,6 +44,26 @@
     estimate_consistency: 1.35
 
     # Written into the shared volume so it is visible on the host too
+    # --- session-time reduction (keeps every quality gate) ---
+    # Fly the return leg as a recorded episode instead of dead time,
+    # leave SETTLE/STEP as soon as the vehicle is demonstrably settled,
+    # and stop a bucket early when the reps already agree more tightly
+    # than the consistency gate demands. settle_time / episode_time stay
+    # the hard caps, so a noisy plant simply degrades to the old timing.
+    bidirectional_episodes: true
+    min_episodes_per_rung: 2
+    early_stop_spread: 1.15
+    adaptive_episode: true
+    min_episode_time: 2.0
+    episode_quiet_time: 0.5
+    episode_settle_band: 0.04
+    episode_settle_periods: 4.0
+    min_settle_time: 0.3
+    settle_quiet_time: 0.4
+    settle_tol_pos: 0.06
+    settle_tol_vel: 0.1
+    settle_tol_yaw: 0.05
+
     report_path: "/home/user/shared_volume/geo_tuner_report.yaml"
 
     safety:

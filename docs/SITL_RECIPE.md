@@ -123,9 +123,10 @@ the host at `~/d2dtracker_cuda_shared_volume/geo_tuner_report.yaml`):
   (1.6–2.0 rad/s, ζ ≈ 0.95). These — not the raw `kx`/`kv` — are the
   run-to-run reproducible quantities: the gains embed the inverse of the
   identified α, so two sessions can legitimately print different gains
-  for the same closed loop. Each step is flown `episodes_per_rung` times
-  (default 3) and gains update from the median α; `spread` in the
-  aggregate records shows how consistent the session's identification
+  for the same closed loop. Each step is flown up to `episodes_per_rung`
+  times (default 3; a bucket stops early only when the reps already
+  agree within `early_stop_spread`) and gains update from the median α;
+  `spread` in the aggregate records shows how consistent the session's identification
   was (a `keeping gains (estimates inconsistent...)` action means the
   environment was too noisy to trust — re-run rather than force it);
 - if `diagnosis` suggests a `max_thrust` correction, apply it to

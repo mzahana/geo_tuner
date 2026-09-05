@@ -13,11 +13,20 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description():
     thrust_scale = LaunchConfiguration("thrust_scale_error")
     report_path = LaunchConfiguration("report_path")
+    # value_type is required: a bare LaunchConfiguration arrives as a
+    # string and the node declares these as doubles.
+    step_size = ParameterValue(LaunchConfiguration("step_size"),
+                               value_type=float)
+    step_size_z = ParameterValue(LaunchConfiguration("step_size_z"),
+                                 value_type=float)
+    yaw_step = ParameterValue(LaunchConfiguration("yaw_step"),
+                              value_type=float)
 
     controller = Node(
         package="mav_controllers_ros",
@@ -60,8 +69,9 @@ def generate_launch_description():
         parameters=[{
             "controller_node": "geometric_controller_node",
             "hover_position": [0.0, 0.0, 3.0],
-            "step_size": 0.5,
-            "step_size_z": 0.4,
+            "step_size": step_size,
+            "step_size_z": step_size_z,
+            "yaw_step": yaw_step,
             "settle_time": 3.0,
             "episode_time": 6.0,
             "axes": "z,x,y,yaw",
@@ -80,5 +90,10 @@ def generate_launch_description():
         DeclareLaunchArgument("thrust_scale_error", default_value="1.0"),
         DeclareLaunchArgument("report_path",
                               default_value="/tmp/geo_tuner_report.yaml"),
+        # Manoeuvre envelope: the vehicle stays within +/- these of the
+        # hover point, so they are what a confined space constrains.
+        DeclareLaunchArgument("step_size", default_value="0.5"),
+        DeclareLaunchArgument("step_size_z", default_value="0.4"),
+        DeclareLaunchArgument("yaw_step", default_value="0.5"),
         controller, sim, conductor,
     ])
