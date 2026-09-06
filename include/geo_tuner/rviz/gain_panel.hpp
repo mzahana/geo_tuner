@@ -18,6 +18,13 @@
 // A parameter write is runtime-only. Persisting it is a separate, explicit
 // act: the Save button calls gain_saver ON THE VEHICLE, which writes the
 // override YAML the launch files read at the next boot.
+//
+// Where it writes is editable here. The box is prefilled from gain_saver's
+// own output_dir parameter, so the path shown is the one the vehicle would
+// use if you touched nothing; typing a different one sets that parameter on
+// the vehicle before the save is asked for. The directory belongs to the
+// vehicle, not to this panel, so it is deliberately NOT stored in the RViz
+// config: it is re-read from the node on every connect.
 
 #ifndef GEO_TUNER__RVIZ__GAIN_PANEL_HPP_
 #define GEO_TUNER__RVIZ__GAIN_PANEL_HPP_
@@ -33,6 +40,7 @@
 #include <QDoubleSpinBox>
 #include <QGridLayout>
 #include <QLabel>
+#include <QLineEdit>
 #include <QPushButton>
 #include <QTextEdit>
 
@@ -86,11 +94,16 @@ private Q_SLOTS:
   void onApply();
   void onRevert();
   void onSaveToVehicle();
+  void onResetSaveDir();
   void onInterlockToggled(bool on);
   void onEditsChanged();
 
 private:
   void connectNode();
+  /// Ask gain_saver where it would write, to prefill the path box.
+  void fetchSaveDir();
+  /// Fire the save service itself, once the directory is settled.
+  void requestSave(bool correct_thrust);
   QString prefix() const;
   void relayout(int columns);
   void applyGains(const GainSet & gains, const QString & what);
@@ -103,6 +116,7 @@ private:
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr tuner_sub_;
   rclcpp::Client<std_srvs::srv::SetBool>::SharedPtr save_client_;
   std::shared_ptr<rclcpp::AsyncParametersClient> param_client_;
+  std::shared_ptr<rclcpp::AsyncParametersClient> saver_param_client_;
 
   std::mutex mutex_;
   bool ctrl_received_{false}, mavros_received_{false};
@@ -110,6 +124,8 @@ private:
   bool tuner_seen_{false};
   std::map<std::string, std::string> ctrl_values_, mavros_values_;
   QString pending_log_;
+  QString pending_dir_;      // output_dir read back from gain_saver
+  bool have_pending_dir_{false};
   bool pending_log_ok_{true};
   bool have_pending_log_{false};
 
@@ -117,6 +133,9 @@ private:
   GainSet baseline_;   // captured when the panel first saw the controller
   GainSet previous_;   // the set in force before the last apply
   bool edits_dirty_{false};
+  QString saver_dir_;        // output_dir gain_saver last reported
+  bool dir_dirty_{false};    // the path box was typed in, do not overwrite it
+  int dir_fetch_ticks_{0};   // slows the retry while gain_saver is not up yet
 
   NamespaceSelector * ns_selector_{nullptr};
   QLabel * banner_{nullptr};
@@ -127,6 +146,8 @@ private:
   QPushButton * revert_button_{nullptr};
   QPushButton * save_button_{nullptr};
   QPushButton * reload_button_{nullptr};
+  QLineEdit * dir_edit_{nullptr};
+  QPushButton * dir_default_button_{nullptr};
   std::array<QDoubleSpinBox *, 3> wn_spin_{{nullptr, nullptr, nullptr}};
   std::array<QDoubleSpinBox *, 3> zeta_spin_{{nullptr, nullptr, nullptr}};
   std::array<QLabel *, 3> live_label_{{nullptr, nullptr, nullptr}};

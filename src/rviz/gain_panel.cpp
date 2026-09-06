@@ -205,6 +205,30 @@ GainPanel::GainPanel(QWidget * parent)
     }
     grid->setColumnStretch(1, 1);
 
+    // Where the override YAML lands. Prefilled from gain_saver's own
+    // output_dir, so what is shown is what the vehicle would use anyway;
+    // typing here retargets the vehicle, not this panel.
+    dir_edit_ = new QLineEdit(box);
+    dir_edit_->setPlaceholderText("(waiting for gain_saver)");
+    dir_edit_->setToolTip(
+      "Directory on the VEHICLE that the override YAML is written to, shown "
+      "as gain_saver currently has it. Changing it sets gain_saver's "
+      "output_dir before the save. The launch files only read the default "
+      "directory, so a custom one needs $MAV_CONTROLLERS_CONFIG_DIR set on "
+      "the vehicle to be loaded at the next boot.");
+    dir_default_button_ = new QPushButton("Default", box);
+    dir_default_button_->setToolTip("Put back the directory the launch files read.");
+    {
+      auto * row = new QHBoxLayout();
+      row->setContentsMargins(0, 0, 0, 0);
+      row->setSpacing(4);
+      row->addWidget(dir_edit_, 1);
+      row->addWidget(dir_default_button_);
+      grid->addWidget(new QLabel("override dir", box), r, 0);
+      grid->addLayout(row, r, 1);
+      ++r;
+    }
+
     thrust_correct_ = new QCheckBox("also save corrected max_thrust", box);
     thrust_correct_->setToolTip(
       "Writes max_thrust x online scale estimate. max_thrust scales every "
@@ -236,6 +260,10 @@ GainPanel::GainPanel(QWidget * parent)
   connect(apply_button_, &QPushButton::clicked, this, &GainPanel::onApply);
   connect(revert_button_, &QPushButton::clicked, this, &GainPanel::onRevert);
   connect(save_button_, &QPushButton::clicked, this, &GainPanel::onSaveToVehicle);
+  connect(dir_default_button_, &QPushButton::clicked, this, &GainPanel::onResetSaveDir);
+  // textEdited, not textChanged: a prefill from the vehicle must not count
+  // as the operator having typed a path.
+  connect(dir_edit_, &QLineEdit::textEdited, this, [this]() { dir_dirty_ = true; });
   connect(reload_button_, &QPushButton::clicked, this, [this]() {
     edits_dirty_ = false;
     log("reloaded editors from the live gains");
@@ -337,6 +365,15 @@ void GainPanel::connectNode()
   param_client_ = std::make_shared<rclcpp::AsyncParametersClient>(
     node_, p + "geometric_controller_node");
   save_client_ = node_->create_client<std_srvs::srv::SetBool>(p + "gain_saver/save");
+  saver_param_client_ = std::make_shared<rclcpp::AsyncParametersClient>(node_, p + "gain_saver");
+
+  // The path box follows the namespace: a different vehicle has a different
+  // filesystem, so a path typed for the previous one must not survive.
+  dir_dirty_ = false;
+  saver_dir_.clear();
+  dir_edit_->clear();
+  dir_fetch_ticks_ = 0;
+  fetchSaveDir();
 
   baseline_ = GainSet();
   previous_ = GainSet();
@@ -362,6 +399,10 @@ void GainPanel::onInterlockToggled(bool on)
   revert_button_->setEnabled(on);
   save_button_->setEnabled(on);
   thrust_correct_->setEnabled(on);
+  // Retargeting the save is a write to the vehicle, so it lives behind the
+  // same interlock as the gains themselves.
+  dir_edit_->setEnabled(on);
+  dir_default_button_->setEnabled(on);
   for(int i = 0; i < 3; ++i)
   {
     wn_spin_[static_cast<size_t>(i)]->setEnabled(on);
@@ -526,28 +567,59 @@ void GainPanel::adoptNamespace(const QString & ns)
   applyNamespace();
 }
 
-void GainPanel::onSaveToVehicle()
+void GainPanel::fetchSaveDir()
 {
-  if(!save_client_)
+  if(!saver_param_client_ || !saver_param_client_->service_is_ready())
     return;
-  if(!save_client_->service_is_ready())
+  saver_param_client_->get_parameters(
+    {"output_dir"},
+    [this](std::shared_future<std::vector<rclcpp::Parameter>> future) {
+      const auto params = future.get();
+      if(params.empty() || params.front().get_type() != rclcpp::ParameterType::PARAMETER_STRING)
+        return;
+      // Executor thread: hand the value to refresh() rather than touching
+      // the widget from here.
+      std::lock_guard<std::mutex> lock(mutex_);
+      pending_dir_ = QString::fromStdString(params.front().as_string());
+      have_pending_dir_ = true;
+    });
+}
+
+void GainPanel::onResetSaveDir()
+{
+  // Empty means "resolve the default" to gain_saver, which then reports the
+  // resolved path back; asking for it again is what refills the box.
+  dir_edit_->clear();
+  dir_dirty_ = false;
+  if(!saver_param_client_ || !saver_param_client_->service_is_ready())
   {
-    log("gain_saver not running on the vehicle (" + prefix() + "gain_saver/save)", false);
+    log("gain_saver not running, cannot reset the override dir", false);
     return;
   }
+  saver_param_client_->set_parameters(
+    {rclcpp::Parameter("output_dir", std::string())},
+    [this](std::shared_future<std::vector<rcl_interfaces::msg::SetParametersResult>> future) {
+      const auto results = future.get();
+      const bool ok = !results.empty() && results.front().successful;
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        have_pending_log_ = true;
+        pending_log_ok_ = ok;
+        pending_log_ = ok ? QString("override dir reset to the vehicle default")
+                          : QString("could not reset override dir: %1")
+                              .arg(QString::fromStdString(results.empty()
+                                                            ? std::string("no result")
+                                                            : results.front().reason));
+      }
+      if(ok)
+        fetchSaveDir();
+    });
+}
 
-  const bool correct = thrust_correct_->isChecked();
-  QString text = "Write the current gains to the vehicle's override YAML?\n\n"
-                 "They will be loaded at the next start, ahead of the shipped config.";
-  if(correct)
-    text += "\n\nmax_thrust will also be corrected by the online scale estimate. "
-            "It scales every position gain, so the vehicle must be disarmed.";
-  if(QMessageBox::question(this, "Save to vehicle", text,
-                           QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes)
-    return;
-
+void GainPanel::requestSave(bool correct_thrust)
+{
   auto request = std::make_shared<std_srvs::srv::SetBool::Request>();
-  request->data = correct;
+  request->data = correct_thrust;
   save_client_->async_send_request(
     request,
     [this](rclcpp::Client<std_srvs::srv::SetBool>::SharedFuture future) {
@@ -559,6 +631,69 @@ void GainPanel::onSaveToVehicle()
     });
 }
 
+void GainPanel::onSaveToVehicle()
+{
+  if(!save_client_)
+    return;
+  if(!save_client_->service_is_ready())
+  {
+    log("gain_saver not running on the vehicle (" + prefix() + "gain_saver/save)", false);
+    return;
+  }
+
+  const bool correct = thrust_correct_->isChecked();
+  const QString wanted = dir_edit_->text().trimmed();
+  const bool retarget = wanted != saver_dir_;
+
+  QString text = "Write the current gains to the vehicle's override YAML?\n\n"
+                 "Directory: " + (wanted.isEmpty() ? QString("(vehicle default)") : wanted) +
+                 "\n\nThey will be loaded at the next start, ahead of the shipped config.";
+  if(retarget)
+    text += "\n\nThis is not where gain_saver is currently pointed, so its output_dir "
+            "will be changed first. Unless MAV_CONTROLLERS_CONFIG_DIR on the vehicle "
+            "points there, the launch files will NOT load the files at the next boot.";
+  if(correct)
+    text += "\n\nmax_thrust will also be corrected by the online scale estimate. "
+            "It scales every position gain, so the vehicle must be disarmed.";
+  if(QMessageBox::question(this, "Save to vehicle", text,
+                           QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes)
+    return;
+
+  if(!retarget)
+  {
+    requestSave(correct);
+    return;
+  }
+
+  if(!saver_param_client_ || !saver_param_client_->service_is_ready())
+  {
+    log("gain_saver parameter service not available, save not sent", false);
+    return;
+  }
+  // Set the directory first and only save if that succeeded -- saving into
+  // the old directory after being asked for a new one would put the file
+  // somewhere nobody goes looking.
+  saver_param_client_->set_parameters(
+    {rclcpp::Parameter("output_dir", wanted.toStdString())},
+    [this, correct](std::shared_future<std::vector<rcl_interfaces::msg::SetParametersResult>>
+                      future) {
+      const auto results = future.get();
+      const bool ok = !results.empty() && results.front().successful;
+      if(!ok)
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        have_pending_log_ = true;
+        pending_log_ok_ = false;
+        pending_log_ = QString("could not set override dir: %1")
+                         .arg(QString::fromStdString(
+                           results.empty() ? std::string("no result") : results.front().reason));
+        return;
+      }
+      fetchSaveDir();
+      requestSave(correct);
+    });
+}
+
 void GainPanel::refresh()
 {
   std::map<std::string, std::string> ctrl, mavros;
@@ -566,6 +701,8 @@ void GainPanel::refresh()
   bool have_log = false;
   QString log_text;
   bool log_ok = true;
+  bool have_dir = false;
+  QString dir_text;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     const auto now = std::chrono::steady_clock::now();
@@ -584,10 +721,35 @@ void GainPanel::refresh()
       log_ok = pending_log_ok_;
       have_pending_log_ = false;
     }
+    if(have_pending_dir_)
+    {
+      have_dir = true;
+      dir_text = pending_dir_;
+      have_pending_dir_ = false;
+    }
   }
 
   if(have_log)
     log(log_text, log_ok);
+
+  if(have_dir)
+  {
+    saver_dir_ = dir_text;
+    // Only refill the box while the operator has not typed in it -- an
+    // answer arriving mid-edit must not overwrite what is being typed.
+    if(!dir_dirty_)
+    {
+      dir_edit_->setText(saver_dir_);
+      dir_edit_->setCursorPosition(0);   // show the head of a long path
+    }
+  }
+  else if(saver_dir_.isEmpty() && saver_param_client_ &&
+          saver_param_client_->service_is_ready() && ++dir_fetch_ticks_ % 10 == 0)
+  {
+    // gain_saver is usually not up yet when the panel connects, so keep
+    // asking -- slowly -- until it answers once.
+    fetchSaveDir();
+  }
 
   const bool armed = mavros_live && mavros.count("armed") && mavros.at("armed") == "true";
 
