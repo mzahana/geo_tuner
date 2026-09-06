@@ -16,7 +16,8 @@
     step_size_z: 0.4
     settle_time: 4.0
     episode_time: 6.0
-    episode_dump_dir: ""    # set to a directory to save raw per-episode CSVs
+    output_dir: ""          # one knob: timestamped report + episode CSVs per session go here
+    episode_dump_dir: ""    # explicit CSV dir when output_dir is unset
     hover_timeout: 25.0
 
     # --- manoeuvre envelope ---

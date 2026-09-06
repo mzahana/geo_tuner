@@ -24,13 +24,26 @@ const char * kStaleStyle = "background-color:#4a4a4a; color:#dddddd; padding:5px
 
 const char * kAxes[4] = {"x", "y", "z", "yaw"};
 
-// "wn=1.06 zeta=0.83" (the conductor's health encoding) -> "1.06 / 0.83".
+// "wn=1.06 zeta=0.83" (the conductor's health encoding) -> a two-line cell:
+// wn/zeta on top, and underneath (grey) the same pair as the yaml carries
+// it, gains.pos / gains.vel -- kx = wn^2, kv = 2*zeta*wn.
 QString gainPair(const std::string & encoded)
 {
   QString s = QString::fromStdString(encoded);
   s.remove("wn=");
   s.replace(" zeta=", " / ");
-  return s.isEmpty() ? QString("-") : s;
+  if(s.isEmpty())
+    return QString("-");
+  const QStringList parts = s.split(" / ");
+  bool ok1 = false, ok2 = false;
+  const double wn = parts.value(0).toDouble(&ok1);
+  const double zeta = parts.value(1).toDouble(&ok2);
+  if(!ok1 || !ok2)
+    return s;
+  return QString("%1<br><span style='color:#909090;'>%2 / %3</span>")
+           .arg(s)
+           .arg(QString::number(wn * wn, 'f', 2))
+           .arg(QString::number(2.0 * zeta * wn, 'f', 2));
 }
 }  // namespace
 
@@ -88,22 +101,24 @@ TunerPanel::TunerPanel(QWidget * parent)
   // Old -> new, filled in as buckets finish; the panel's answer to "what did
   // the session actually do". Hidden until there is something to show.
   {
-    result_box_ = new QGroupBox("Result (old → new)", this);
+    result_box_ = new QGroupBox("Result (old → new · wn/ζ over pos/vel)", this);
     auto * grid = new QGridLayout(result_box_);
     grid->setContentsMargins(6, 3, 6, 3);
     grid->setVerticalSpacing(2);
     grid->addWidget(new QLabel("", result_box_), 0, 0);
-    grid->addWidget(new QLabel("old (wn/ζ)", result_box_), 0, 1);
-    grid->addWidget(new QLabel("new (wn/ζ)", result_box_), 0, 3);
+    grid->addWidget(new QLabel("old", result_box_), 0, 1);
+    grid->addWidget(new QLabel("new", result_box_), 0, 3);
     grid->addWidget(new QLabel("outcome", result_box_), 0, 4);
     for(int i = 0; i < 4; ++i)
     {
       const size_t a = static_cast<size_t>(i);
       grid->addWidget(new QLabel(kAxes[i], result_box_), i + 1, 0);
       result_old_[a] = new QLabel("-", result_box_);
+      result_old_[a]->setTextFormat(Qt::RichText);
       grid->addWidget(result_old_[a], i + 1, 1);
       grid->addWidget(new QLabel("→", result_box_), i + 1, 2);
       result_new_[a] = new QLabel("-", result_box_);
+      result_new_[a]->setTextFormat(Qt::RichText);
       grid->addWidget(result_new_[a], i + 1, 3);
       result_note_[a] = new QLabel("-", result_box_);
       result_note_[a]->setStyleSheet("color:#909090;");

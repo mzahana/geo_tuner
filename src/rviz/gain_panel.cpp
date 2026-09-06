@@ -123,14 +123,14 @@ GainPanel::GainPanel(QWidget * parent)
     grid->setContentsMargins(6, 4, 6, 4);
     grid->setVerticalSpacing(3);
 
-    // Both representations, side by side. wn/zeta is what you reason about;
-    // gains.pos / gains.vel is what is actually in the yaml, and a panel
-    // that shows only the first leaves you unable to match it to the file.
+    // Both representations, one cell. wn/zeta is what you reason about;
+    // gains.pos / gains.vel is what is actually in the yaml. Stacked in a
+    // single two-line label so a narrow dock never clips one behind the
+    // other: bold wn/zeta on top, the yaml pair in grey underneath.
     grid->addWidget(new QLabel("axis", box), 0, 0);
-    grid->addWidget(new QLabel("wn / zeta", box), 0, 1);
-    grid->addWidget(new QLabel("pos / vel", box), 0, 2);
-    grid->addWidget(new QLabel("set wn", box), 0, 3);
-    grid->addWidget(new QLabel("set zeta", box), 0, 4);
+    grid->addWidget(new QLabel("wn / ζ  (pos / vel below)", box), 0, 1);
+    grid->addWidget(new QLabel("set wn", box), 0, 2);
+    grid->addWidget(new QLabel("set zeta", box), 0, 3);
 
     for(int i = 0; i < 3; ++i)
     {
@@ -138,15 +138,10 @@ GainPanel::GainPanel(QWidget * parent)
 
       live_label_[static_cast<size_t>(i)] = new QLabel("-", box);
       live_label_[static_cast<size_t>(i)]->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+      live_label_[static_cast<size_t>(i)]->setTextFormat(Qt::RichText);
       live_label_[static_cast<size_t>(i)]->setSizePolicy(QSizePolicy::Ignored,
                                                          QSizePolicy::Preferred);
       grid->addWidget(live_label_[static_cast<size_t>(i)], i + 1, 1);
-
-      raw_label_[static_cast<size_t>(i)] = new QLabel("-", box);
-      raw_label_[static_cast<size_t>(i)]->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
-      raw_label_[static_cast<size_t>(i)]->setSizePolicy(QSizePolicy::Ignored,
-                                                        QSizePolicy::Preferred);
-      grid->addWidget(raw_label_[static_cast<size_t>(i)], i + 1, 2);
 
       auto * wn = new QDoubleSpinBox(box);
       wn->setRange(0.1, 10.0);
@@ -154,7 +149,7 @@ GainPanel::GainPanel(QWidget * parent)
       wn->setDecimals(2);
       wn->setMinimumWidth(64);
       wn->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
-      grid->addWidget(wn, i + 1, 3);
+      grid->addWidget(wn, i + 1, 2);
       wn_spin_[static_cast<size_t>(i)] = wn;
 
       auto * zeta = new QDoubleSpinBox(box);
@@ -163,14 +158,14 @@ GainPanel::GainPanel(QWidget * parent)
       zeta->setDecimals(2);
       zeta->setMinimumWidth(64);
       zeta->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
-      grid->addWidget(zeta, i + 1, 4);
+      grid->addWidget(zeta, i + 1, 3);
       zeta_spin_[static_cast<size_t>(i)] = zeta;
     }
 
     caps_label_ = new QLabel("-", box);
     caps_label_->setWordWrap(true);
     caps_label_->setStyleSheet("color:#909090;");
-    grid->addWidget(caps_label_, 4, 0, 1, 5);
+    grid->addWidget(caps_label_, 4, 0, 1, 4);
 
     // Restoring a tuning session's gains lives on the Tune tab (Revert);
     // here Revert last only undoes a manual Apply, so the two tabs never
@@ -182,7 +177,7 @@ GainPanel::GainPanel(QWidget * parent)
     buttons->addWidget(apply_button_);
     buttons->addWidget(revert_button_);
     buttons->addWidget(reload_button_);
-    grid->addLayout(buttons, 5, 0, 1, 5);
+    grid->addLayout(buttons, 5, 0, 1, 4);
 
     groups_.push_back(box);
   }
@@ -624,15 +619,15 @@ void GainPanel::refresh()
     if(!live_.valid || !ctrl_live)
     {
       live_label_[a]->setText("-");
-      raw_label_[a]->setText("-");
       continue;
     }
     const double wn = (live_.kx[a] > 0.0) ? std::sqrt(live_.kx[a]) : kNaN;
     const double zeta = (std::isfinite(wn) && wn > 0.0) ? live_.kv[a] / (2.0 * wn) : kNaN;
-    live_label_[a]->setText(QString("%1 / %2").arg(fmt(wn)).arg(fmt(zeta)));
-    // kx = wn^2 and kv = 2*zeta*wn: the same gains the yaml carries as
-    // gains.pos.<axis> and gains.vel.<axis>.
-    raw_label_[a]->setText(QString("%1 / %2").arg(fmt(live_.kx[a])).arg(fmt(live_.kv[a])));
+    // kx = wn^2 and kv = 2*zeta*wn: the grey line is the same pair the yaml
+    // carries as gains.pos.<axis> and gains.vel.<axis>.
+    live_label_[a]->setText(
+      QString("<b>%1 / %2</b><br><span style='color:#909090;'>%3 / %4</span>")
+        .arg(fmt(wn)).arg(fmt(zeta)).arg(fmt(live_.kx[a])).arg(fmt(live_.kv[a])));
 
     // While the user is not mid-edit, the editors track the vehicle, so
     // Apply is always relative to what is actually flying.

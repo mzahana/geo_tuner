@@ -220,6 +220,11 @@ TuningConductor::TuningConductor(const rclcpp::NodeOptions & options)
   offboard_mode_ = declare_parameter<std::string>("offboard_mode", "OFFBOARD");
   report_path_ =
     declare_parameter<std::string>("report_path", "/tmp/geo_tuner_report.yaml");
+  // One knob for a field day: when set, every session writes a timestamped
+  // report AND its raw episode CSVs under this directory, so consecutive
+  // sessions never overwrite each other. Overrides report_path and
+  // episode_dump_dir. Exposed as a launch argument on field_tune.launch.py.
+  output_dir_ = declare_parameter<std::string>("output_dir", "");
   // safety limits
   SafetyLimits limits;
   limits.max_tilt = declare_parameter<double>("safety.max_tilt", 0.6);
@@ -653,6 +658,21 @@ void TuningConductor::st_wait_enable(double now)
     safe_gains_ = gains_;
     baseline_gains_ = gains_;
     session_result_.clear();
+    // A new session gets its own timestamp; with output_dir set that gives
+    // it its own report file and episode folder, so a field day of repeated
+    // sessions leaves one artifact per session instead of the last one.
+    {
+      const std::time_t t = std::time(nullptr);
+      char buf[32];
+      std::strftime(buf, sizeof(buf), "%Y-%m-%d_%H-%M-%S", std::localtime(&t));
+      session_stamp_ = buf;
+      episode_seq_ = 0;
+      if (!output_dir_.empty()) {
+        report_path_ =
+          (std::filesystem::path(output_dir_) /
+          ("geo_tuner_report_" + session_stamp_ + ".yaml")).string();
+      }
+    }
     for (const auto & [ax, kxkv] : *gains_) {
       const auto [wn, zeta] = wn_zeta_from_pd(kxkv.first, kxkv.second);
       status(
@@ -890,13 +910,16 @@ void TuningConductor::dump_episode(
   const std::string & ax, const Eigen::VectorXd & t,
   const Eigen::VectorXd & y, double step)
 {
-  if (episode_dump_dir_.empty()) {return;}
+  const std::string dir = !output_dir_.empty() ?
+    (std::filesystem::path(output_dir_) / ("episodes_" + session_stamp_)).string() :
+    episode_dump_dir_;
+  if (dir.empty()) {return;}
   try {
-    std::filesystem::create_directories(episode_dump_dir_);
+    std::filesystem::create_directories(dir);
     std::ostringstream name;
     name << "ep" << std::setw(3) << std::setfill('0') << episode_seq_++ <<
       "_" << ax << "_rung" << rung_ << "_rep" << sched_.rep << ".csv";
-    std::ofstream f(std::filesystem::path(episode_dump_dir_) / name.str());
+    std::ofstream f(std::filesystem::path(dir) / name.str());
     f << "# axis=" << ax << " step=" << step << " rung=" << rung_ <<
       " rep=" << sched_.rep << "\n";
     f << "t,y\n" << std::setprecision(9);
@@ -1587,6 +1610,9 @@ void TuningConductor::write_report(const std::string & status_text)
   report["final_gains"] = final_gains;
   report["controller_yaml_snippet"] = snippet;
 
+  std::error_code ec;   // best effort; the open below reports real failures
+  const auto parent = std::filesystem::path(report_path_).parent_path();
+  if (!parent.empty()) {std::filesystem::create_directories(parent, ec);}
   std::ofstream f(report_path_);
   if (!f) {
     RCLCPP_ERROR(get_logger(), "could not write report: %s", report_path_.c_str());

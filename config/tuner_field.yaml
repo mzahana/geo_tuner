@@ -17,7 +17,8 @@
     step_size_z: 0.4        # m, vertical test steps
     settle_time: 4.0        # s of quiet hover before each step
     episode_time: 6.0       # s recorded per step
-    episode_dump_dir: ""    # set to a directory to save raw per-episode CSVs
+    output_dir: ""          # one knob: timestamped report + episode CSVs per session go here
+    episode_dump_dir: ""    # explicit CSV dir when output_dir is unset
     hover_timeout: 25.0     # s to reach/keep the hover point
 
     # --- manoeuvre envelope ---

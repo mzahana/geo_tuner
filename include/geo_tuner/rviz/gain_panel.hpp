@@ -130,7 +130,6 @@ private:
   std::array<QDoubleSpinBox *, 3> wn_spin_{{nullptr, nullptr, nullptr}};
   std::array<QDoubleSpinBox *, 3> zeta_spin_{{nullptr, nullptr, nullptr}};
   std::array<QLabel *, 3> live_label_{{nullptr, nullptr, nullptr}};
-  std::array<QLabel *, 3> raw_label_{{nullptr, nullptr, nullptr}};
   std::map<std::string, QLabel *> fields_;
   QTextEdit * log_view_{nullptr};
 

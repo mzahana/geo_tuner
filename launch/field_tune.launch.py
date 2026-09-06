@@ -38,6 +38,13 @@ def generate_launch_description():
             description="Namespace of the controller stack (e.g. 'interceptor' "
                         "in the d2dtracker sim). Topics and the parameter "
                         "client follow it."),
+        DeclareLaunchArgument(
+            "output_dir", default_value="",
+            description="Directory for session data. Every session writes a "
+                        "timestamped report YAML plus a folder of raw "
+                        "per-episode CSVs here, so repeated sessions never "
+                        "overwrite each other. Empty keeps the YAML's "
+                        "report_path / episode_dump_dir behaviour."),
         Node(
             package="geo_tuner",
             executable="tuning_conductor",
@@ -51,7 +58,9 @@ def generate_launch_description():
                 {"controller_node": [LaunchConfiguration("ns"),
                                      "/geometric_controller_node"],
                  "require_enable": ParameterValue(
-                     LaunchConfiguration("require_enable"), value_type=bool)},
+                     LaunchConfiguration("require_enable"), value_type=bool),
+                 "output_dir": ParameterValue(
+                     LaunchConfiguration("output_dir"), value_type=str)},
             ],
         ),
     ])

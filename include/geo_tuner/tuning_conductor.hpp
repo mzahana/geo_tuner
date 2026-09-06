@@ -163,6 +163,11 @@ private:
   double episode_time_{6.0};
   std::string episode_dump_dir_;   // per-episode CSVs for offline analysis; "" = off
   int episode_seq_{0};
+  // Session data directory: when set, the report gets a timestamped name and
+  // the episode CSVs a per-session subdirectory under it, both derived from
+  // session_stamp_ (set when the baseline is captured).
+  std::string output_dir_;
+  std::string session_stamp_;
   double service_timeout_{5.0};
   double yaw_T_target_{0.35};
   double yaw_tau_min_{0.15};
