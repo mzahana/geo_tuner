@@ -49,18 +49,23 @@ RobustEstimate robust_ratio_estimate(
 double median(std::vector<double> vals);
 
 /// Accumulates per-episode estimates for one (axis, rung) pair.
+///
+/// `alphas` holds the quantity the gain update is computed from (the
+/// plant-gain factor on a position axis, the closed-loop time constant on
+/// yaw). `lags` holds the identified in-loop lag, which the bandwidth
+/// ladder uses for its stability margin.
 struct EpisodeBucket
 {
   std::vector<double> alphas;
-  std::vector<double> delays;
+  std::vector<double> lags;
 
-  void add(double alpha, double delay)
+  void add(double alpha, double lag)
   {
     alphas.push_back(alpha);
-    delays.push_back(delay);
+    lags.push_back(lag);
   }
   int count() const {return static_cast<int>(alphas.size());}
-  double median_delay() const {return delays.empty() ? 0.0 : median(delays);}
+  double median_lag() const {return lags.empty() ? 0.0 : median(lags);}
 };
 
 }  // namespace geo_tuner

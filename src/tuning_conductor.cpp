@@ -4,6 +4,7 @@
 #include <cmath>
 #include <ctime>
 #include <fstream>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 
@@ -14,7 +15,7 @@
 #include "geo_tuner/core/aggregate.hpp"
 #include "geo_tuner/core/first_order_fit.hpp"
 #include "geo_tuner/core/gain_design.hpp"
-#include "geo_tuner/core/step_fit.hpp"
+#include "geo_tuner/core/loop_fit.hpp"
 #include "geo_tuner/core/yaml_double.hpp"
 
 using diagnostic_msgs::msg::DiagnosticStatus;
@@ -142,6 +143,10 @@ TuningConductor::TuningConductor(const rclcpp::NodeOptions & options)
   wn_ladder_ = declare_parameter<std::vector<double>>("wn_ladder", {1.2, 1.6, 2.0});
   zeta_target_ = declare_parameter<double>("zeta_target", 0.95);
   max_change_ = declare_parameter<double>("max_gain_change_factor", 1.6);
+  // How far the identified loop must stay clear of the Routh-Hurwitz
+  // stability boundary before the ladder is allowed to climb. 1.0 is the
+  // boundary itself; the default keeps a 4x margin on the Routh product.
+  stability_margin_ = declare_parameter<double>("stability_margin", 4.0);
   // Repeat each step N times per (axis, rung) and update from the MEDIAN
   // identified alpha/T: single-episode fits are noisy (the lateral
   // response is truly higher-order) and that noise maps 1:1 into the
@@ -650,6 +655,10 @@ void TuningConductor::st_wait_enable(double now)
         att_tau = res->values[7].double_value;
       }
     }
+    if (att_tau > 0.0) {
+      // Seeds the in-loop lag prior for the closed-loop identification.
+      attctrl_tau_ = att_tau;
+    }
     if (yaw_tau > 0.0) {
       yaw_tau_ = yaw_tau;
     } else if (att_tau > 0.0) {
@@ -951,7 +960,6 @@ void TuningConductor::st_analyze(double)
   }
   const double kx_now = gains_->at(ax).first;
   const double kv_now = gains_->at(ax).second;
-  const double wn_pred = std::sqrt(kx_now);
   const double wn_target = wn_ladder_[rung_];
   YAML::Node rec;
   rec["axis"] = ax;
@@ -962,56 +970,61 @@ void TuningConductor::st_analyze(double)
   rec["kx_applied"] = yaml_double(round_to(kx_now, 3));
   rec["kv_applied"] = yaml_double(round_to(kv_now, 3));
 
-  StepFitResult fit;
+  LoopFitResult fit;
   try {
-    fit = fit_step_response(
-      t, y, step, wn_pred, zeta_target_,
-      std::make_pair(wn_pred * std::sqrt(kAlphaMin), wn_pred * std::sqrt(kAlphaMax)));
+    // Identify against the loop we actually commanded: kx and kv are
+    // known, so the only dynamic unknowns are the plant-gain factor and
+    // the in-loop lag. attctrl_tau seeds the lag; it does not constrain it.
+    fit = fit_closed_loop(t, y, step, kx_now, kv_now, attctrl_tau_.value_or(0.15));
+    // tau carries the transport delay too; see loop_fit.hpp.
   } catch (const std::exception & e) {
     rec["action"] = std::string("episode discarded (fit error: ") + e.what() + ")";
     results_.push_back(rec);
-    status("step fit failed on " + ax + " (" + e.what() + "); discarding episode");
+    status("closed-loop fit failed on " + ax + " (" + e.what() + "); discarding episode");
     episode_finished();
     return;
   }
 
-  rec["wn_meas"] = yaml_double(round_to(fit.wn, 3));
-  rec["zeta_meas"] = yaml_double(round_to(fit.zeta, 3));
-  rec["delay"] = yaml_double(round_to(fit.delay, 3));
+  const double wn_meas = fit.wn_effective(kx_now);
+  rec["alpha"] = yaml_double(round_to(fit.alpha, 3));
+  rec["tau_lag"] = yaml_double(round_to(fit.tau, 3));
   rec["nrmse"] = yaml_double(round_to(fit.nrmse, 3));
   rec["overshoot"] = yaml_double(round_to(fit.overshoot, 3));
+  rec["wn_meas"] = yaml_double(round_to(wn_meas, 3));
+  rec["zeta_meas"] = yaml_double(round_to(fit.zeta_effective(kx_now, kv_now), 3));
   status(
-    ax + ": wn=" + fmt(fit.wn, 2) + " zeta=" + fmt(fit.zeta, 2) + " delay=" +
-    fmt(fit.delay * 1e3, 0) + "ms nrmse=" + fmt(fit.nrmse, 2) + " os=" +
-    fmt(fit.overshoot * 100.0, 0) + "%");
+    ax + ": alpha=" + fmt(fit.alpha, 2) + " tau=" + fmt(fit.tau * 1e3, 0) +
+    "ms nrmse=" + fmt(fit.nrmse, 3) +
+    " (wn_eff=" + fmt(wn_meas, 2) + ") os=" + fmt(fit.overshoot * 100.0, 0) + "%");
 
   if (!fit.ok()) {
-    rec["action"] = "fit rejected";
+    rec["action"] = fit.ambiguous ?
+      "fit ambiguous (near-equal minima disagree on alpha)" :
+      (fit.at_bounds ? "fit rested on a solver bound" : "fit rejected");
     results_.push_back(rec);
-    status("Fit quality gate failed on " + ax + "; episode discarded");
+    status("Fit quality gate failed on " + ax + " (" +
+      rec["action"].as<std::string>() + "); episode discarded");
     episode_finished();
     return;
   }
 
-  const double alpha_ep = fit.wn * fit.wn / kx_now;
-  // Plausibility gate: a real vehicle's thrust map is not off by more
-  // than ~2.5x. An alpha outside the box means the episode was corrupted
-  // (bias transient, mode change, fit ambiguity) -- discard.
-  if (!(alpha_ep >= kAlphaMin && alpha_ep <= kAlphaMax)) {
-    rec["alpha"] = yaml_double(round_to(alpha_ep, 3));
+  // Plausibility gate. Unlike the old fit, alpha here was estimated
+  // WITHOUT being confined to this range, so a value outside it is real
+  // evidence that the episode was corrupted rather than an artefact of
+  // the estimator being held inside a prior.
+  if (!(fit.alpha >= kAlphaMin && fit.alpha <= kAlphaMax)) {
     rec["action"] = "alpha implausible; episode discarded";
     results_.push_back(rec);
     status(
-      ax + ": alpha=" + fmt(alpha_ep, 2) + " outside [" + fmt(kAlphaMin, 1) + ", " +
+      ax + ": alpha=" + fmt(fit.alpha, 2) + " outside [" + fmt(kAlphaMin, 1) + ", " +
       fmt(kAlphaMax, 1) + "]; discarding episode");
     episode_finished();
     return;
   }
 
-  rec["alpha"] = yaml_double(round_to(alpha_ep, 3));
   rec["action"] = "accepted";
   results_.push_back(rec);
-  sched_.bucket.add(alpha_ep, fit.delay);
+  sched_.bucket.add(fit.alpha, fit.tau);
   episode_finished();
 }
 
@@ -1043,12 +1056,31 @@ void TuningConductor::finalize_pos_bucket(const std::string & ax)
     return;
   }
 
-  // Latency sanity: don't push bandwidth into the delay margin
-  const double delay_med = sched_.bucket.median_delay();
-  if (delay_med > 0.0 && wn_target * delay_med > 0.45) {
+  // Stability margin, from the identified in-loop lag rather than a rule
+  // of thumb. The closed loop is tau*s^3 + s^2 + alpha*kv*s + alpha*kx,
+  // and Routh-Hurwitz puts the instability boundary at kv = tau*kx. With
+  // the design rule kx = wn^2, kv = 2*zeta*wn that is wn = 2*zeta/tau, so
+  // holding the Routh product `stability_margin` times clear of the
+  // boundary caps the ladder at
+  //
+  //     wn_target <= 2*zeta_target / (stability_margin * tau)
+  //
+  // At the default margin of 4 and zeta 0.95 this is wn*tau <= 0.475,
+  // which is deliberately about as conservative as the wn*delay <= 0.45
+  // heuristic it replaces -- but derived from a measured quantity, and it
+  // now scales correctly when zeta_target is changed.
+  const double tau_med = sched_.bucket.median_lag();
+  const double wn_cap = tau_med > 0.0 ?
+    2.0 * zeta_target_ / (stability_margin_ * tau_med) :
+    std::numeric_limits<double>::infinity();
+  rec["tau_median"] = yaml_double(round_to(tau_med, 3));
+  rec["wn_stability_cap"] = yaml_double(round_to(wn_cap, 3));
+  if (wn_target > wn_cap) {
     const std::string action =
-      "wn_target " + fmt(wn_target, 2) + " unsafe with median delay " +
-      fmt(delay_med * 1e3, 0) + " ms; ladder stopped";
+      "wn_target " + fmt(wn_target, 2) + " exceeds the stability cap " +
+      fmt(wn_cap, 2) + " rad/s implied by the measured in-loop lag " +
+      fmt(tau_med * 1e3, 0) + " ms (margin " + fmt(stability_margin_, 1) +
+      "x on the Routh product); ladder stopped";
     rec["action"] = action;
     results_.push_back(rec);
     status(action);

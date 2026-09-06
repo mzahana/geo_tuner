@@ -11,6 +11,7 @@
 #include "geo_tuner/core/gain_design.hpp"
 #include "geo_tuner/core/gain_yaml.hpp"
 #include "geo_tuner/core/safety.hpp"
+#include "geo_tuner/core/loop_fit.hpp"
 #include "geo_tuner/core/step_fit.hpp"
 #include "geo_tuner/core/yaml_double.hpp"
 
@@ -171,7 +172,7 @@ TEST(GainYaml, DoublesEmitAsFloatsNotInts)
   EXPECT_NE(mtext.find("kf: 1.0"), std::string::npos) << mtext;
 }
 
-// ------------------------------------------------------------------ step fit
+// ------------------------------------------------------------------ loop fit
 
 namespace
 {
@@ -181,13 +182,15 @@ struct Sim
   Eigen::VectorXd t, y;
 };
 
-Sim simulate_second_order(
-  double wn, double zeta, double delay, double step,
+/// A step flown by the closed loop the conductor actually commands:
+/// gains kx/kv known, plant-gain factor alpha, in-loop lag tau.
+Sim simulate_loop(
+  double kx, double kv, double alpha, double tau, double step,
   double t_end = 6.0, double dt = 0.01, double noise = 0.0, uint64_t seed = 0)
 {
   Sim s;
   s.t = arange(0.0, t_end, dt);
-  s.y = step * second_order_step((s.t.array() - delay).matrix(), wn, zeta);
+  s.y = step * closed_loop_step(s.t, kx, kv, alpha, tau);
   if (noise > 0.0) {
     std::mt19937_64 rng(seed);
     std::normal_distribution<double> d(0.0, noise);
@@ -196,109 +199,226 @@ Sim simulate_second_order(
   return s;
 }
 
+double kv_for(double kx, double zeta = 0.95) {return 2.0 * zeta * std::sqrt(kx);}
+
+/// The real loop, integrated with an explicit delay buffer: actuation lag
+/// inside the loop, and a sensing delay that is both fed back to the
+/// controller and present on what we record. Deliberately NOT the fitted
+/// model, so this exercises the approximation rather than confirming
+/// algebra.
+Sim simulate_with_transport_delay(
+  double kx, double kv, double alpha, double tau_act, double td, double step,
+  double t_end = 8.0, double dt_rec = 0.01)
+{
+  const double h = 1e-4;
+  const int nd = static_cast<int>(std::llround(td / h));
+  const int n = static_cast<int>(std::llround(t_end / h)) + nd + 10;
+  std::vector<double> ph(n, 0.0), vh(n, 0.0);
+  double p = 0.0, v = 0.0, a_lag = 0.0;
+  const int nrec = static_cast<int>(std::llround(t_end / dt_rec));
+  Sim s;
+  s.t.resize(nrec);
+  s.y.resize(nrec);
+  int rec = 0;
+  for (int i = 0; i < n; ++i) {
+    ph[i] = p;
+    vh[i] = v;
+    const int j = i - nd;
+    const double y_meas = j >= 0 ? ph[j] : 0.0;
+    const double v_meas = j >= 0 ? vh[j] : 0.0;
+    const double a_des = kx * (step - y_meas) - kv * v_meas;
+    if (tau_act > 1e-6) {
+      a_lag += (alpha * a_des - a_lag) * h / tau_act;
+    } else {
+      a_lag = alpha * a_des;
+    }
+    v += a_lag * h;
+    p += v * h;
+    while (rec < nrec && rec * dt_rec <= i * h) {
+      s.t[rec] = rec * dt_rec;
+      s.y[rec] = (i - nd) >= 0 ? ph[i - nd] : 0.0;
+      ++rec;
+    }
+  }
+  return s;
+}
+
 }  // namespace
 
-class StepFitKnownSystem : public ::testing::TestWithParam<std::pair<double, double>> {};
-
-TEST_P(StepFitKnownSystem, RecoversKnownSystem)
+TEST(LoopFit, ZeroLagIsTheDesignSecondOrder)
 {
-  const auto [wn, zeta] = GetParam();
-  const auto s = simulate_second_order(wn, zeta, 0.08, 0.5);
-  const auto r = fit_step_response(s.t, s.y, 0.5);
-  EXPECT_TRUE(r.ok());
-  EXPECT_NEAR(r.wn, wn, 0.05 * wn);
-  EXPECT_NEAR(r.zeta, zeta, 0.10 * zeta);
-  EXPECT_NEAR(r.delay, 0.08, 0.03);
+  // With no in-loop lag the model must collapse onto the second-order
+  // system the gains were designed for.
+  const double kx = 2.0, kv = kv_for(kx), alpha = 1.0;
+  const Eigen::VectorXd t = arange(0.0, 5.0, 0.01);
+  const Eigen::VectorXd a = closed_loop_step(t, kx, kv, alpha, 0.0);
+  const Eigen::VectorXd b =
+    second_order_step(t, std::sqrt(alpha * kx), alpha * kv / (2.0 * std::sqrt(alpha * kx)));
+  EXPECT_LT((a - b).cwiseAbs().maxCoeff(), 1e-9);
+}
+
+TEST(LoopFit, StepResponseStartsAtZeroAndSettlesAtOne)
+{
+  for (double tau : {0.0, 0.05, 0.3, 0.8}) {
+    const Eigen::VectorXd t = arange(0.0, 40.0, 0.01);
+    const Eigen::VectorXd y = closed_loop_step(t, 2.0, kv_for(2.0), 1.0, tau);
+    EXPECT_NEAR(y[0], 0.0, 1e-9) << "tau=" << tau;
+    EXPECT_NEAR(y[y.size() - 1], 1.0, 1e-4) << "tau=" << tau;   // unit DC gain
+  }
+}
+
+class LoopFitKnown
+  : public ::testing::TestWithParam<std::tuple<double, double, double>> {};
+
+TEST_P(LoopFitKnown, RecoversAlphaAndLag)
+{
+  const auto [kx, alpha, tau] = GetParam();
+  const double kv = kv_for(kx);
+  const auto s = simulate_loop(kx, kv, alpha, tau, 0.5, 6.0, 0.01, 0.003, 1);
+  const auto r = fit_closed_loop(s.t, s.y, 0.5, kx, kv, 0.15);
+  EXPECT_TRUE(r.ok()) << "at_bounds=" << r.at_bounds << " ambiguous=" << r.ambiguous;
+  EXPECT_NEAR(r.alpha, alpha, 0.05 * alpha);
+  EXPECT_NEAR(r.tau, tau, 0.25 * tau + 0.01);
 }
 
 INSTANTIATE_TEST_SUITE_P(
-  Cases, StepFitKnownSystem,
-  ::testing::Values(
-    std::make_pair(1.6, 0.95), std::make_pair(2.5, 0.7), std::make_pair(1.0, 1.2)));
+  Cases, LoopFitKnown,
+  ::testing::Combine(
+    ::testing::Values(1.2, 2.0, 3.0),      // kx
+    ::testing::Values(0.75, 1.0, 1.4),     // alpha
+    ::testing::Values(0.05, 0.15, 0.30))); // in-loop lag
 
-TEST(StepFit, RobustToNoise)
+TEST(LoopFit, LagDoesNotBiasAlpha)
 {
-  const auto s = simulate_second_order(1.8, 0.9, 0.06, 0.5, 6.0, 0.01, 0.02, 7);
-  const auto r = fit_step_response(s.t, s.y, 0.5);
-  EXPECT_TRUE(r.ok());
-  EXPECT_NEAR(r.wn, 1.8, 0.10 * 1.8);
+  // The defect that motivated this model: a free second-order fit pays
+  // for an unmodelled in-loop lag by inflating wn, and since alpha was
+  // derived as wn^2/kx the error landed straight in the gain update. Here
+  // alpha must stay put as the lag grows.
+  const double kx = 2.0, kv = kv_for(kx), alpha = 1.0;
+  double worst = 0.0;
+  for (double tau : {0.05, 0.15, 0.30, 0.45}) {
+    const auto s = simulate_loop(kx, kv, alpha, tau, 0.5, 8.0, 0.01, 0.003, 2);
+    const auto r = fit_closed_loop(s.t, s.y, 0.5, kx, kv, 0.15);
+    ASSERT_TRUE(r.ok()) << "tau=" << tau;
+    worst = std::max(worst, std::abs(r.alpha - alpha) / alpha);
+  }
+  EXPECT_LT(worst, 0.08) << "alpha drifts with the in-loop lag";
 }
 
-TEST(StepFit, BadFitFlagged)
+TEST(LoopFit, SurvivesRealTransportDelay)
 {
-  // pure noise, no response
+  // The delay is in the loop, and one first-order lag stands in for the
+  // (actuation lag + delay) cascade. Data here comes from an exact delay
+  // simulation, so this measures that approximation, not the algebra.
+  const double kx = 2.0, kv = kv_for(kx);
+  double worst = 0.0;
+  for (double tau_act : {0.0, 0.06, 0.20}) {
+    for (double td : {0.03, 0.06, 0.12}) {
+      for (double alpha : {0.8, 1.0}) {
+        const auto s =
+          simulate_with_transport_delay(kx, kv, alpha, tau_act, td, 0.5);
+        const auto r = fit_closed_loop(s.t, s.y, 0.5, kx, kv, 0.15);
+        ASSERT_TRUE(r.ok()) << "tau_act=" << tau_act << " td=" << td;
+        // The lag must account for the delay, not ignore it: that is what
+        // makes the ladder's stability margin see it.
+        EXPECT_GT(r.tau, 0.5 * td) << "tau_act=" << tau_act << " td=" << td;
+        worst = std::max(worst, std::abs(r.alpha - alpha) / alpha);
+      }
+    }
+  }
+  EXPECT_LT(worst, 0.20) << "worst alpha error across the delay sweep";
+}
+
+TEST(LoopFit, FittingTheDelayOutsideTheLoopIsWorse)
+{
+  // Why `model_output_delay` defaults to false. Giving the fit a free
+  // output shift lets it park phase outside the loop that physically sits
+  // inside it, and alpha pays for it.
+  const double kx = 2.0, kv = kv_for(kx);
+  double in_loop = 0.0, outside = 0.0;
+  int n = 0;
+  for (double tau_act : {0.0, 0.06, 0.20}) {
+    for (double td : {0.06, 0.12}) {
+      const double alpha = 1.0;
+      const auto s = simulate_with_transport_delay(kx, kv, alpha, tau_act, td, 0.5);
+      in_loop += std::abs(fit_closed_loop(s.t, s.y, 0.5, kx, kv, 0.15, false).alpha - alpha);
+      outside += std::abs(fit_closed_loop(s.t, s.y, 0.5, kx, kv, 0.15, true).alpha - alpha);
+      ++n;
+    }
+  }
+  EXPECT_LT(in_loop / n, outside / n)
+    << "folding the delay into the in-loop lag should beat a free output shift";
+}
+
+TEST(LoopFit, GarbageRejected)
+{
   const Eigen::VectorXd t = arange(0.0, 5.0, 0.01);
   Eigen::VectorXd y(t.size());
   std::mt19937_64 rng(1);
   std::normal_distribution<double> d(0.0, 0.5);
   for (Eigen::Index i = 0; i < y.size(); ++i) {y[i] = d(rng);}
-  const auto r = fit_step_response(t, y, 0.5);
-  EXPECT_FALSE(r.ok());
+  EXPECT_FALSE(fit_closed_loop(t, y, 0.5, 2.0, kv_for(2.0)).ok());
 }
 
-TEST(StepFit, UnderdampedOvershootMeasured)
+TEST(LoopFit, RampRejected)
 {
-  const auto s = simulate_second_order(2.0, 0.4, 0.0, 1.0);
-  const auto r = fit_step_response(s.t, s.y, 1.0);
-  // zeta=0.4 -> ~25% overshoot
-  EXPECT_GT(r.overshoot, 0.15);
-  EXPECT_LT(r.overshoot, 0.35);
+  // A pure integrator response cannot be explained by the closed loop at
+  // any (alpha, tau); the fit must not be trusted.
+  const Eigen::VectorXd t = arange(0.0, 6.0, 0.01);
+  const Eigen::VectorXd y = 0.02 * t;
+  EXPECT_FALSE(fit_closed_loop(t, y, 0.5, 2.0, kv_for(2.0)).ok());
 }
 
-TEST(StepFit, RejectsShortData)
+TEST(LoopFit, RejectsShortAndDegenerateInput)
 {
   EXPECT_THROW(
-    fit_step_response(arange(0.0, 5.0, 1.0), Eigen::VectorXd::Zero(5), 0.5),
+    fit_closed_loop(arange(0.0, 5.0, 1.0), Eigen::VectorXd::Zero(5), 0.5, 2.0, 2.7),
     std::invalid_argument);
+  const auto s = simulate_loop(2.0, kv_for(2.0), 1.0, 0.15, 0.5);
+  EXPECT_THROW(fit_closed_loop(s.t, s.y, 0.0, 2.0, 2.7), std::invalid_argument);
+  EXPECT_THROW(fit_closed_loop(s.t, s.y, 0.5, 0.0, 2.7), std::invalid_argument);
 }
 
-TEST(StepFit, BoundPinnedFitRejected)
+TEST(LoopFit, EffectiveDampingScalesAsSqrtAlpha)
 {
-  // A ramp (pure integrator response) cannot be explained by the
-  // 2nd-order model inside the bounds; params pin and ok must be false
-  const Eigen::VectorXd t = arange(0.0, 6.0, 0.01);
-  const Eigen::VectorXd y = 0.02 * t;  // slow ramp, never settles
-  const auto r = fit_step_response(t, y, 0.5);
-  EXPECT_FALSE(r.ok());
-}
-
-TEST(StepFit, AmbiguousHigherOrderResponsePrefersPrior)
-{
-  // True plant: 2nd order (wn=1.41, zeta=0.95) cascaded with an
-  // inner-loop lag (tau=0.15 s) -- the case where a naive fit locks onto
-  // "high wn, overdamped, huge delay" (alpha ~ 3.7). The multi-start
-  // fitter must return wn near the truth instead.
-  const double wn = 1.41, zeta = 0.95, tau = 0.15;
-  const Eigen::VectorXd t = arange(0.0, 6.0, 0.01);
-  // Integrate x'' + 2*zeta*wn*x' + wn^2*x = wn^2*u, u the lag output of a
-  // unit step through 1/(tau*s + 1). RK-free explicit steps at 1 kHz,
-  // sampled onto t.
-  const double h = 1e-4;
-  double u = 0.0, x = 0.0, xd = 0.0, time = 0.0;
-  Eigen::VectorXd y(t.size());
-  for (Eigen::Index i = 0; i < t.size(); ++i) {
-    while (time < t[i] - 1e-12) {
-      const double xdd = wn * wn * u - 2.0 * zeta * wn * xd - wn * wn * x;
-      x += xd * h;
-      xd += xdd * h;
-      u += (1.0 - u) * h / tau;
-      time += h;
-    }
-    y[i] = x;
+  // Worth stating explicitly, because it is the opposite of the intuition
+  // that "stiffer plant = more overshoot": alpha multiplies kx and kv
+  // together, so wn_eff = sqrt(alpha*kx) but zeta_eff = sqrt(alpha)*zeta.
+  // A plant that is stronger than modelled is therefore MORE damped, and
+  // it is a weak plant (alpha < 1) that rings.
+  const double kx = 2.0, kv = kv_for(kx, 0.95);
+  for (double alpha : {0.4, 1.0, 2.2}) {
+    LoopFitResult r;
+    r.alpha = alpha;
+    EXPECT_NEAR(r.zeta_effective(kx, kv), 0.95 * std::sqrt(alpha), 1e-12);
   }
-  const auto r = fit_step_response(t, 0.5 * y, 0.5, wn, zeta);
-  const double alpha = r.wn * r.wn / (wn * wn);
-  EXPECT_GE(alpha, 0.4) << "alpha=" << alpha << " (wn=" << r.wn << ")";
-  EXPECT_LE(alpha, 2.5) << "alpha=" << alpha << " (wn=" << r.wn << ")";
 }
 
-TEST(StepFit, ZeroDelayIsLegitimate)
+TEST(LoopFit, OvershootMeasuredFromData)
 {
-  // delay pinned at its LOWER bound (0) must not reject the fit
-  const auto s = simulate_second_order(1.8, 0.9, 0.0, 0.5);
-  const auto r = fit_step_response(s.t, s.y, 0.5);
-  EXPECT_FALSE(r.at_bounds);
-  EXPECT_TRUE(r.ok());
+  // alpha = 0.4 gives zeta_eff = 0.95*sqrt(0.4) = 0.60, so the response
+  // overshoots by roughly 9%.
+  const double kx = 2.0, kv = kv_for(kx);
+  const auto s = simulate_loop(kx, kv, 0.4, 0.02, 1.0, 10.0);
+  const auto r = fit_closed_loop(s.t, s.y, 1.0, kx, kv);
+  ASSERT_TRUE(r.ok());
+  EXPECT_NEAR(r.alpha, 0.4, 0.05 * 0.4);
+  EXPECT_GT(r.overshoot, 0.04);
+  EXPECT_LT(r.overshoot, 0.20);
+}
+
+TEST(LoopFit, StabilityCapMatchesRouthBoundary)
+{
+  // The ladder cap wn <= 2*zeta/(margin*tau) is the Routh-Hurwitz
+  // condition kv > tau*kx for tau*s^3 + s^2 + alpha*kv*s + alpha*kx.
+  // At margin 1 the capped design must sit exactly on the boundary.
+  const double zeta = 0.95, tau = 0.25;
+  const double wn = 2.0 * zeta / (1.0 * tau);          // margin = 1
+  const double kx = wn * wn, kv = 2.0 * zeta * wn;
+  EXPECT_NEAR(kv / (tau * kx), 1.0, 1e-9);
+  // ...and the default 4x margin is close to the wn*delay <= 0.45 rule
+  // it replaced.
+  EXPECT_NEAR((2.0 * zeta / (4.0 * tau)) * tau, 0.475, 1e-9);
 }
 
 // ----------------------------------------------------------- first order fit
@@ -423,7 +543,7 @@ TEST(Aggregate, BucketMedianDelay)
   b.add(1.1, 0.30);
   b.add(0.9, 0.08);
   EXPECT_EQ(b.count(), 3);
-  EXPECT_NEAR(b.median_delay(), 0.08, 1e-12);
+  EXPECT_NEAR(b.median_lag(), 0.08, 1e-12);
 }
 
 // --------------------------------------------------------------------- safety

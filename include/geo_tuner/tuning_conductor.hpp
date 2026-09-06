@@ -164,6 +164,7 @@ private:
   std::vector<double> wn_ladder_{1.2, 1.6, 2.0};
   double zeta_target_{0.95};
   double max_change_{1.6};
+  double stability_margin_{4.0};
   double consistency_{1.35};
   double min_settle_time_{0.3};
   bool adaptive_episode_{true};
@@ -183,6 +184,7 @@ private:
   double state_t0_{0.0};
   std::optional<std::string> px4_mode_;
   std::optional<double> yaw_tau_;   // effective yaw time-constant param
+  std::optional<double> attctrl_tau_;  // seeds the in-loop lag prior
   double pre_step_yaw_{0.0};
   double pre_step_pos_{0.0};
   size_t rung_{0};                  // index into wn_ladder_

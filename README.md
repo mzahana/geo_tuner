@@ -102,11 +102,12 @@ the tuning conductor, end to end. Expect `status: complete` in
 The conductor then, fully automatically:
 
 - reads the controller's current gains as the safe baseline;
-- injects small alternating steps (z first, then x, y), fits a
-  second-order-plus-delay model to each response;
-- computes the plant-gain factor α (lumping thrust-map error and inner-loop
-  lag) and re-places the closed-loop poles at the target `(wn, ζ)` via a
-  **live parameter update** — no landing, no restart;
+- injects small alternating steps (z first, then x, y) and identifies each
+  response against the closed loop it actually commanded — `kx`/`kv` are
+  known, so the only unknowns are the plant-gain factor α (thrust-map
+  error, inner-loop droop) and the in-loop lag τ;
+- re-places the closed-loop poles at the target `(wn, ζ)` via a **live
+  parameter update** — no landing, no restart;
 - walks `wn` up the configured ladder, re-identifying at each rung;
 - trims steady-state offsets through the setpoint acceleration feedforward
   (bounded, ±3 m/s²) and converts any persistent z-trim into a
@@ -118,8 +119,10 @@ altitude floor/ceiling, odometry staleness, and roll/pitch-rate oscillation
 energy. Any violation → gains restored to the last known-safe set, hover hold,
 session aborted with a diagnosis in the report. Fit-quality gates reject bad
 identifications; per-episode gain changes are rate-limited
-(`max_gain_change_factor`); the ladder refuses to push bandwidth into the
-measured delay margin (`wn·delay ≤ 0.45`).
+(`max_gain_change_factor`); and the ladder refuses to climb past the
+Routh–Hurwitz stability margin implied by the measured in-loop lag
+(`wn ≤ 2ζ/(stability_margin·τ̂)`), so the bandwidth limit is derived from
+what the vehicle actually did rather than assumed.
 
 ### Step 4 — after the session
 

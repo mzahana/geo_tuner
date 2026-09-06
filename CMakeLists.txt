@@ -36,6 +36,7 @@ add_library(geo_tuner_core SHARED
   src/core/yaml_double.cpp
   src/core/least_squares.cpp
   src/core/step_fit.cpp
+  src/core/loop_fit.cpp
   src/core/first_order_fit.cpp
   src/core/safety.cpp
   src/core/aggregate.cpp

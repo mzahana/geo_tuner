@@ -24,6 +24,42 @@ under namespace `/interceptor`.
 Local checkouts: `~/src/ihunter_fixes/{geo_tuner, mav_controllers_ros}`;
 sim package at `~/d2dtracker_cuda_shared_volume/ros2_ws/src/d2dtracker_sim`.
 
+### 0a. Closed-loop identification rewritten (branch `cpp-port`)
+The conductor used to fit a *free* second-order system
+$(\omega_n,\zeta,T_d)$ to each step and derive
+$\alpha=\omega_n^2/k_x$. That model is wrong whenever the in-loop lag is
+not small against the position loop, and the error went straight into the
+gains: measured against known truth, **49.7% mean error in alpha, with
+every wrong fit passing the quality gate**. The bias was contained by
+confining $\omega_n$ to a prior box, which made pinning routine — and a
+pinned $\omega_n$ gives $\alpha$ *exactly* `ALPHA_MAX`, which passes the
+inclusive plausibility test and makes two pinned episodes agree to the
+digit, so the consistency gate reads spread 1.00x and lets them through.
+The SITL session of 2026-09-05 updated the y gains from two such episodes.
+
+`core/loop_fit` now identifies against the loop the conductor actually
+commanded. `kx`/`kv` are known, so the closed loop is
+`alpha*kx / (tau*s^3 + s^2 + alpha*kv*s + alpha*kx)` and only **alpha**
+(plant gain) and **tau** (in-loop lag, transport delay included) are
+unknown. Solver bounds are numerical sanity only, so plausibility is
+judged on an unconstrained estimate and a bound-rest means the fit
+failed again. Multi-start now *detects* degeneracy (near-equal minima
+disagreeing on alpha => episode refused) instead of resolving it by
+preferring the prior.
+
+Results: **1.0% mean alpha error** on synthetic truth, **2.9%** through an
+exact delay-buffer simulation. In closed-loop sim with
+`thrust_scale_error:=1.0` (truth alpha = 1.00) every episode on every axis
+reads 0.95-1.04, and tau splits physically -- z 55-78 ms (direct thrust),
+x/y 146-174 ms (attitude loop in the path). All three axes converge; before
+this, x and y never updated at all.
+
+The `wn*delay <= 0.45` heuristic is replaced by the Routh-Hurwitz margin
+on the identified lag (A.5a): the cubic is unstable at `kv = tau*kx`, so
+the ladder cap is `wn <= 2*zeta/(stability_margin*tau)`, default margin 4,
+which reproduces the old rule's conservatism but is derived from a
+measured quantity and scales correctly with zeta.
+
 ### 0. C++ port + single-package merge (branch `cpp-port`)
 The package is now `ament_cmake` C++ throughout: the identification math
 (step / first-order fits on a bounded Levenberg-Marquardt over Eigen, in
@@ -109,7 +145,7 @@ chars, so kill with `pkill -f 'lib/mav_controllers_ros/[t]raj'`, never
   `FIELD_CHECKLIST.md` (printable field-day checklist: bench prep →
   PX4 autotune/hover ulog → controller sanity flight → conductor
   session → circle/lemniscate agility ladder + emergency card).
-- 65 gtest units (`colcon test --packages-select geo_tuner`, then
+- 94 gtest units (`colcon test --packages-select geo_tuner`, then
   `colcon test-result --all`).
 
 ### 3. SITL environment
