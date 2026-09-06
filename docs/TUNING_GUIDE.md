@@ -149,7 +149,7 @@ payoff:
 | PX4 | geofence + return altitude + battery failsafe |
 | Controller | `max_tilt_angle`, `max_accel` clamps, `se3_cmd_timeout` |
 | Tuner | independent monitor: tilt / pos-error / speed / altitude / odom-stale / oscillation → abort + gain restore |
-| Tuner | fit-quality gates, per-episode gain-change limit (×1.6), ladder refuses ωn·delay > 0.45, steps only between settles |
+| Tuner | fit-quality gates (incl. ambiguity + bound-rest rejection), per-episode gain-change limit (×1.6), ladder refuses ωn > 2ζ/(m·τ̂) from the identified in-loop lag, steps only between settles |
 
 ---
 
@@ -157,7 +157,7 @@ payoff:
 
 | Test | Environment | Result |
 |---|---|---|
-| 24 unit tests (gain math, step fitting, safety logic) | host venv | PASS |
+| 65 unit tests (gain math, step fitting, safety logic, episode schedule) | gtest, docker Humble | PASS |
 | Closed-loop auto-tune: **real controller node** + physics sim + tuner | host, ROS 2 Jazzy | PASS — all axes converge to ωn_eff = 1.60, ζ = 0.95 exactly |
 | Same, 10 % thrust-map error | host | PASS — converges, reports "multiply max_thrust by 0.92" (truth: 0.90) |
 | Same, 30 % thrust-map error | host | PASS — safe abort, gains restored, actionable diagnosis |
@@ -294,11 +294,43 @@ on delay:
 $$\omega_c T_d \le 0.35\ldots0.45 \;\Rightarrow\;
 \boxed{\;\omega_n \le \frac{0.35}{T_d}\;}$$
 
-(design cap; the in-flight tuner enforces the run-time version
-$\omega_{target} \cdot \hat T_d \le 0.45$ with the *measured* delay
-$\hat T_d$ from the step fit). With $T_d\approx 80$ ms this caps
+(design cap, used offline by `geo-tuner-design`. The in-flight tuner no
+longer uses a delay proxy at all — it enforces the Routh-Hurwitz margin
+of A.5a on the lag it actually identifies.) With $T_d\approx 80$ ms this caps
 $\omega_n$ at $\sim$4.4 rad/s — above the separation cap, so separation
 usually binds; on a congested link ($T_d>120$ ms) latency binds instead.
+
+### A.5a Run-time stability cap from the identified lag
+
+The design cap above is a phase-margin rule of thumb applied to a delay
+you have to guess before flying. In the air the conductor has something
+better: $\hat\tau$, identified per bucket from $(\ast)$. Its
+characteristic polynomial is
+
+$$\tau s^3 + s^2 + \alpha k_v s + \alpha k_x,$$
+
+and Routh-Hurwitz for a cubic $a_3s^3+a_2s^2+a_1s+a_0$ requires
+$a_2 a_1 > a_3 a_0$, i.e.
+
+$$\alpha k_v > \tau\,\alpha k_x \;\Longleftrightarrow\;
+\boxed{\;k_v > \tau k_x\;}$$
+
+— note $\alpha$ cancels, so the boundary depends only on the gains and
+the lag. Substituting the design rule $k_x=\omega_n^2,\;
+k_v=2\zeta\omega_n$ and keeping the Routh product a factor $m$ clear of
+the boundary gives the ladder cap the tuner enforces:
+
+$$\omega_{target} \;\le\; \frac{2\zeta^\star}{m\,\hat\tau},
+\qquad m = \texttt{stability\_margin} \;(\text{default } 4).$$
+
+At $m=4,\ \zeta^\star=0.95$ this is
+$\omega_{target}\hat\tau \le 0.475$ — deliberately about as
+conservative as the $\omega_{target}\hat T_d \le 0.45$ heuristic it
+replaces, so field behaviour is unchanged in magnitude. What changes is
+that the number is *derived* from a measured, physically meaningful
+quantity instead of assumed, it scales correctly when $\zeta^\star$ is
+changed (the old rule did not), and $m=1$ is the true instability
+boundary rather than an arbitrary reference.
 
 ### A.6 Thrust map: why max_thrust scales every gain
 
@@ -327,26 +359,47 @@ Consequences, all used by the tooling:
 ### A.7 In-flight identification and the gain correction
 
 During a step episode the conductor commands a reference step $r$ with
-zero velocity/acceleration feedforward, so the closed loop from $r$ to
-position is exactly
+zero velocity/acceleration feedforward, so the controller is running
 
-$$\frac{X(s)}{R(s)} = e^{-sT_d}\,
-\frac{\omega_n^2}{s^2 + 2\zeta\omega_n s + \omega_n^2}$$
+$$a_{des} = k_x (r - x) - k_v \dot x$$
 
-with the delay $e^{-sT_d}$ lumping transport delay and the residual
-inner-loop lag (a first-order lag at $\omega_{att}\gg\omega_n$ is
-well-approximated by dead time $1/\omega_{att}$ at outer-loop
-frequencies). The fitter estimates
-$(\hat\omega_n,\hat\zeta,\hat T_d, A)$ by nonlinear least squares on the
-time-domain step response (closed forms for under-, critically- and
-over-damped cases).
+with $k_x, k_v$ **known** — the conductor applied them. The vehicle
+delivers a fraction $\alpha$ of that command through an inner loop of
+effective lag $\tau$ (attitude tracking on $x,y$; thrust response on
+$z$), and integrates it twice, so the closed loop is exactly
 
-Given applied $k_x^{app}$ and measured $\hat\omega_n$, the lumped plant
-gain is identified as
+$$\frac{X(s)}{R(s)} =
+\frac{\alpha k_x}{\tau s^3 + s^2 + \alpha k_v s + \alpha k_x}
+\qquad (\ast)$$
 
-$$\hat\alpha = \hat\omega_n^2 / k_x^{app},$$
+with unit DC gain. **Only two dynamic quantities are unknown**: the
+plant-gain factor $\alpha$ (thrust-map error, inner-loop droop — the
+number the gain update needs) and the in-loop lag $\tau$ (the number the
+bandwidth ladder needs). The fitter estimates
+$(\hat\alpha, \hat\tau, A)$ by nonlinear least squares on
+the step response of $(\ast)$, evaluated in closed form from the
+residues of its three poles; $A$ absorbs steady-state offset.
 
-and the gains that place the *effective* poles at the target
+**Where the transport delay goes.** Into $\tau$. The sensing delay is not
+a harmless shift of the recorded curve — the controller feeds back that
+same delayed odometry, so it sits *inside* the loop and costs phase
+exactly where stability is decided. Below the outer-loop bandwidth a
+delay and a lag are interchangeable to first order
+($e^{-T_ds}\approx 1/(1+T_ds)$ for $T_d\omega\ll1$), so one effective
+in-loop lag carries both, and the A.5a margin then sees the delay it
+ought to see. Fitting a separate output shift as well was measured to be
+*worse*: on responses from an exact delay-buffer simulation a free output
+shift roughly doubled the error in $\hat\alpha$ (5.9% against 2.9%),
+because it gives the optimizer somewhere to park phase that belongs
+inside the loop. Since $\alpha$ is estimated *directly*,
+$\hat\omega_n = \sqrt{\hat\alpha k_x}$ and
+$\hat\zeta = \hat\alpha k_v / (2\sqrt{\hat\alpha k_x})$ are reported
+as derived diagnostics rather than fitted quantities. Note the
+consequence, which is the opposite of the usual intuition:
+$\hat\zeta = \sqrt{\hat\alpha}\,\zeta_{design}$, so a plant *stronger*
+than modelled is more damped, and it is a weak plant that rings.
+
+Given applied $k_x^{app}$ and identified $\hat\alpha$, the gains that place the *effective* poles at the target
 $(\omega_n^\star, \zeta^\star)$ follow from A.6:
 
 $$k_x^{new} = \frac{(\omega_n^\star)^2}{\hat\alpha}, \qquad
@@ -360,26 +413,50 @@ clamped to a factor 1.6, ladder monotonic in $\omega_n^\star$, and each
 new gain set starts from a configuration that just flew safely — so the
 iteration is confined to a box around a known-stable point.
 
-**Identifiability.** For near-critically-damped responses the triple
-$(\hat\omega_n, \hat\zeta, \hat T_d)$ is weakly identifiable: because the
-true response is higher-order (inner-loop lag stacks on the position
-loop), "high $\omega_n$, overdamped, large delay" explains the data as
-well as — sometimes better than — the physically correct description.
-Left alone, this produces absurd $\hat\alpha$ (7× observed in SITL). The
-fitter therefore (i) runs multi-start optimization, and (ii) constrains
-$\hat\omega_n$ to the *physically possible* interval implied by the
-applied gains, $\hat\omega_n \in \sqrt{k_x^{app}} \cdot
-[\sqrt{\alpha_{min}}, \sqrt{\alpha_{max}}]$ with
-$[\alpha_{min},\alpha_{max}] = [0.4, 2.5]$ (a real thrust map is not off
-by more than 2.5×). Within that box, $\hat\zeta$ and $\hat T_d$ absorb
-the unmodeled lag. Fits with $\hat\zeta$ pinned at its optimizer bounds
-are rejected outright, and a resulting $\hat\alpha$ outside the box
-discards the episode instead of updating gains.
+**Why not fit a free second order?** Until 2026-09-06 the fitter
+estimated $(\hat\omega_n, \hat\zeta, \hat T_d, A)$ — a free
+second-order system — and *derived*
+$\hat\alpha = \hat\omega_n^2 / k_x^{app}$. That model is wrong whenever
+$\tau$ is not small against the position loop, and it is wrong in a way
+that goes straight into the gains: three free dynamic parameters can
+trade against each other, so the optimizer buys fit quality by raising
+$\hat\omega_n$, over-damping, and pushing dead time. Measured on step
+responses synthesised from $(\ast)$ with known $\alpha$, the mean error
+in $\hat\alpha$ was **49.7%**, growing systematically with $\tau$ — and
+every one of those fits passed the quality gate. The same experiment on
+the present model gives **1.0%**.
+
+That bias had to be contained somehow, and it was: $\hat\omega_n$ was
+confined to $\sqrt{k_x^{app}}\cdot[\sqrt{\alpha_{min}},
+\sqrt{\alpha_{max}}]$ so the estimate stayed physical. The containment
+had a sharp edge. Pinning at that prior was a routine outcome, and a
+pinned $\hat\omega_n$ yields $\hat\alpha$ *exactly* $\alpha_{max}$;
+the plausibility test is inclusive, so it passes, and two pinned episodes
+agree to the digit, so the consistency gate — the defence that exists
+precisely to catch failed identification — reads spread $1.00\times$ and
+waves them through. A SITL session on 2026-09-05 updated the $y$ gains
+from two such episodes.
+
+$(\ast)$ removes the failure at its source rather than bounding it.
+$\alpha$ and $\tau$ are separately identifiable because they enter
+differently: $\alpha$ scales the loop gain, moving the poles along the
+locus set by $k_x, k_v$, while $\tau$ contributes the third pole,
+changing overshoot and ringing without touching the DC gain. Three
+denominator coefficients are determined by two unknowns, so the fit is
+over-determined. Consequently the solver bounds are now **numerical
+sanity only** ($\hat\alpha\in[0.05,10]$), wide enough that
+$[\alpha_{min},\alpha_{max}]=[0.4,2.5]$ is applied afterwards as a
+judgement on an *unconstrained* estimate — which restores the meaning of
+both gates: a parameter resting on a bound once again means the fit
+failed, and an implausible $\hat\alpha$ is evidence about the episode
+rather than an artefact of the prior. Multi-start is retained, but to
+*detect* degeneracy rather than resolve it by preference: if two starts
+reach near-equal residuals while disagreeing about $\hat\alpha$ by more
+than 20%, the episode is refused as ambiguous.
 
 **Repetition and robust aggregation (median-of-N).** A single 6-second
 step fit is a *noisy estimator* of $\alpha$: process noise and the
-structural 2nd-order approximation of a truly higher-order lateral
-response give it episode-to-episode variance, and because the applied
+finite excitation of a small step give it episode-to-episode variance, and because the applied
 gain is $k_x = (\omega_n^\star)^2/\hat\alpha$, that variance maps 1:1
 (inverted) into the gains — which is why two sessions can end with
 visibly different gain sets that describe the same closed loop (the
@@ -391,8 +468,8 @@ episode. A consistency gate refuses *any* update when the accepted
 estimates disagree by more than `estimate_consistency` (default 1.35×,
 i.e. worst pair within 35%): inconsistent estimates mean the
 identification, not the plant, is the problem, and applying any of them
-would bake noise into the gains. The latency gate likewise uses the
-median measured delay. Yaw episodes aggregate the identified time
+would bake noise into the gains. The stability gate below likewise uses
+the median identified $\hat\tau$. Yaw episodes aggregate the identified time
 constant $\hat T$ the same way. With the median of 3, the standard error
 of the gain update falls by $\approx\sqrt{3}$ *and* single-outlier
 sensitivity drops to zero.
@@ -591,15 +668,21 @@ position loop, so the estimator cannot interact with it dynamically
 ```
 ~/src/ihunter_fixes/
 ├── TUNING_PLAN.md                  <- this document
-└── geo_tuner/                      <- ROS 2 package (ament_python)
+└── geo_tuner/                      <- ROS 2 package (ament_cmake, C++)
     ├── README.md                   <- command-level usage
-    ├── geo_tuner/core/             <- pure logic: gain_design, step_fit,
-    │                                  safety, thrust_model (unit-tested)
-    ├── geo_tuner/cli/              <- geo-tuner-hover, geo-tuner-design
-    ├── geo_tuner/tuning_conductor.py   <- in-flight auto-tuner node
-    ├── geo_tuner/quad_sim.py       <- lightweight plant for fast sim tests
+    ├── include/geo_tuner/core/, src/core/
+    │                               <- pure logic: gain_design, step_fit,
+    │                                  first_order_fit, least_squares, safety,
+    │                                  aggregate (unit-tested)
+    ├── src/tuning_conductor.cpp    <- in-flight auto-tuner node
+    ├── src/quad_sim.cpp            <- lightweight plant for fast sim tests
+    ├── src/nodes/design_gains_main.cpp  <- geo-tuner-design CLI
+    ├── scripts/geo-tuner-hover     <- offline ulog analysis (Python/pyulog)
+    ├── include/geo_tuner/rviz/, src/rviz/
+    │                               <- the five RViz field panels
     ├── launch/sim_tune.launch.py   <- Phase 2 (controller+sim+tuner)
     ├── launch/field_tune.launch.py <- Phases 3 & 4 (tuner only)
+    ├── launch/field_monitor.launch.py   <- RViz + panels for a field session
     ├── config/tuner_field.yaml     <- field session configuration
-    └── test/test_core.py           <- 24 unit tests
+    └── test/test_core.cpp, test/test_schedule.cpp   <- 65 unit tests
 ```

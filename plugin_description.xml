@@ -1,0 +1,48 @@
+<library path="geo_tuner_panels">
+  <class name="geo_tuner/ControllerHealthPanel"
+         type="geo_tuner::panels::ControllerHealthPanel"
+         base_class_type="rviz_common::Panel">
+    <description>
+      Geometric controller health at a glance: stream rates and staleness,
+      hold/timeout failsafes, tracking errors, throttle and thrust-map
+      health, and the active gains as wn/zeta. Read-only.
+    </description>
+  </class>
+  <class name="geo_tuner/TrajectoryTestPanel"
+         type="geo_tuner::panels::TrajectoryTestPanel"
+         base_class_type="rviz_common::Panel">
+    <description>
+      Remote control for trajectory_test_node: pick setpoint / circle /
+      lemniscate, set speed, start and stop. All safety gating stays in the
+      node.
+    </description>
+  </class>
+  <class name="geo_tuner/GainPanel"
+         type="geo_tuner::panels::GainPanel"
+         base_class_type="rviz_common::Panel">
+    <description>
+      Read and change the geometric controller gains as wn/zeta, behind an
+      interlock, with design caps, a bounded step size, revert/restore, and a
+      Save-to-vehicle button that persists them via gain_saver.
+    </description>
+  </class>
+  <class name="geo_tuner/TunerPanel"
+         type="geo_tuner::panels::TunerPanel"
+         base_class_type="rviz_common::Panel">
+    <description>
+      Run a geo_tuner auto-tuning session: start, watch the ladder progress,
+      accept the result, abort. Sets the step envelope (lateral, vertical
+      and yaw amplitudes) in flight, so the manoeuvre can be trimmed to the
+      space available. All tuning logic, and all validation of those
+      amplitudes, stays in the conductor.
+    </description>
+  </class>
+  <class name="geo_tuner/GeoFieldPanel"
+         type="geo_tuner::panels::GeoFieldPanel"
+         base_class_type="rviz_common::Panel">
+    <description>
+      All four field panels as tabs in one dock: Tuner, Health, Gains, Fly.
+      Use this one unless you specifically want them docked separately.
+    </description>
+  </class>
+</library>

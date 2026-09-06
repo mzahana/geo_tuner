@@ -40,6 +40,13 @@
     wn_ladder: [1.2, 1.6, 2.0]
     zeta_target: 0.95
     max_gain_change_factor: 1.6
+    # How far the identified loop must stay clear of the Routh-Hurwitz
+    # stability boundary before the ladder climbs a rung. The closed loop
+    # is tau*s^3 + s^2 + alpha*kv*s + alpha*kx, unstable at kv = tau*kx, so
+    # the cap is wn <= 2*zeta / (stability_margin * tau_measured). 1.0 is
+    # the boundary itself; 4 keeps a 4x margin on the Routh product and is
+    # about as conservative as the old wn*delay <= 0.45 rule.
+    stability_margin: 4.0
     # Repeat each step this many times per (axis, rung); gains update
     # from the MEDIAN identified alpha. 3 gives reproducible gains at
     # ~2x session length; the consistency gate blocks updates when the

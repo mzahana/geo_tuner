@@ -104,7 +104,7 @@ from a mode switch alone — a human must press START.
 **On the laptop** — the panels, which are pure consumers:
 
 ```bash
-ros2 launch geo_tuner_rviz_plugins field_monitor.launch.py ns:=<ns>
+ros2 launch geo_tuner field_monitor.launch.py ns:=<ns>
 ```
 
 - [ ] Leave `ns` empty for a bare field stack; use `ns:=interceptor` for
