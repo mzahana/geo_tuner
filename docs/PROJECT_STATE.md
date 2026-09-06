@@ -16,8 +16,8 @@ under namespace `/interceptor`.
 
 | Repo | Branch | State |
 |---|---|---|
-| `mzahana/geo_tuner` | `cpp-port` | **C++ rewrite** of the whole toolkit + the RViz panels merged in (this repo) |
-| `mzahana/geo_tuner_rviz_plugins` | `main` | **superseded** — its five panels now live in `geo_tuner`; retire once `cpp-port` merges |
+| `mzahana/geo_tuner` | `main` | **C++ rewrite** of the whole toolkit + the RViz panels merged in (this repo); `cpp-port` merged 2026-09-06 |
+| `mzahana/geo_tuner_rviz_plugins` | `main` | **retired** (2026-09-06) — its five panels live in `geo_tuner`; checkout moved out of the workspace, repo can be archived |
 | `mzahana/mav_controllers_ros` | `main` = `ros2_humble` = `production-hardening` (139f3ad) | hardened controller + trajectory test node + hold failsafe |
 | `mzahana/d2dtracker_sim` | `main` | SITL bringup launch + tuned configs |
 
