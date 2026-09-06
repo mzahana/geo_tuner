@@ -24,6 +24,7 @@
 #ifndef GEO_TUNER__TUNING_CONDUCTOR_HPP_
 #define GEO_TUNER__TUNING_CONDUCTOR_HPP_
 
+#include <Eigen/Core>
 #include <yaml-cpp/yaml.h>
 
 #include <map>
@@ -118,6 +119,9 @@ private:
   void st_update_gains(double now);
 
   void analyze_yaw();
+  void dump_episode(
+    const std::string & ax, const Eigen::VectorXd & t,
+    const Eigen::VectorXd & y, double step);
   void finalize_yaw_bucket();
   void finalize_pos_bucket(const std::string & ax);
   void episode_finished();
@@ -157,6 +161,8 @@ private:
   double settle_time_{4.0};
   double hover_timeout_{20.0};
   double episode_time_{6.0};
+  std::string episode_dump_dir_;   // per-episode CSVs for offline analysis; "" = off
+  int episode_seq_{0};
   double service_timeout_{5.0};
   double yaw_T_target_{0.35};
   double yaw_tau_min_{0.15};

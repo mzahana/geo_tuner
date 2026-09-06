@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <cmath>
 #include <ctime>
+#include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
@@ -116,6 +118,10 @@ TuningConductor::TuningConductor(const rclcpp::NodeOptions & options)
   settle_time_ = declare_parameter<double>("settle_time", 4.0);          // s before each step
   hover_timeout_ = declare_parameter<double>("hover_timeout", 20.0);     // s to reach hover point
   episode_time_ = declare_parameter<double>("episode_time", 6.0);        // s of recording
+  // Directory for raw per-episode CSVs (t,y per odometry sample). Empty
+  // disables. The report records only the fits; these are the data behind
+  // them, for offline analysis of sessions whose estimates disagree.
+  episode_dump_dir_ = declare_parameter<std::string>("episode_dump_dir", "");
   // comma-separated to dodge YAML 1.1 parsing of bare "y" as a bool;
   // may include "yaw" for heading-loop identification
   sched_.axes = split_axes(declare_parameter<std::string>("axes", "z,x,y,yaw"));  // z first
@@ -418,6 +424,15 @@ void TuningConductor::odom_cb(const nav_msgs::msg::Odometry::SharedPtr msg)
 {
   OdomSample s;
   s.t = now_s();
+  // The episode time axis must live in the sensor's clock, not this node's:
+  // under a simulator running slower than real time (or a delayed odometry
+  // pipeline) wall-clock arrival times stretch the apparent response and
+  // bias the identified dynamics. Staleness detection stays on the receiver
+  // clock (s.t) — the two clocks may hold a constant offset that would look
+  // like staleness. Fall back to arrival time for unstamped publishers.
+  const double stamp = static_cast<double>(msg->header.stamp.sec) +
+    1e-9 * static_cast<double>(msg->header.stamp.nanosec);
+  s.t_stamp = stamp > 0.0 ? stamp : s.t;
   s.pos = {msg->pose.pose.position.x, msg->pose.pose.position.y,
     msg->pose.pose.position.z};
   s.vel = {msg->twist.twist.linear.x, msg->twist.twist.linear.y,
@@ -800,7 +815,8 @@ void TuningConductor::st_settle(double now)
   if (elapsed < settle_time_ && !sched_.is_quiet(now)) {return;}
   const std::string ax = sched_.axes[sched_.axis_idx];
   sched_.recording.clear();
-  sched_.step_t0 = now;
+  // Same clock as the samples that will be recorded against it.
+  sched_.step_t0 = sched_.odom ? sched_.odom->t_stamp : now;
   sched_.reset_quiet();
   double wn_equiv = 0.0;
   double step = 0.0;
@@ -840,14 +856,19 @@ void TuningConductor::st_step(double now)
 {
   const std::string ax = sched_.axes[sched_.axis_idx];
   if (sched_.odom) {
-    if (ax == "yaw") {
-      double dyaw = TuningSchedule::yaw_of(sched_.odom->quat) - pre_step_yaw_;
-      dyaw = std::atan2(std::sin(dyaw), std::cos(dyaw));   // unwrap
-      sched_.recording.emplace_back(now - sched_.step_t0, dyaw);
-    } else {
-      const int i = axis_index(ax);
-      sched_.recording.emplace_back(
-        now - sched_.step_t0, sched_.odom->pos[i] - pre_step_pos_);
+    // One recording entry per odometry sample, on the sample's own clock;
+    // the tick timer merely polls, so a tick without fresh odometry must
+    // not duplicate the previous point.
+    const double ts = sched_.odom->t_stamp - sched_.step_t0;
+    if (sched_.recording.empty() || ts > sched_.recording.back().first) {
+      if (ax == "yaw") {
+        double dyaw = TuningSchedule::yaw_of(sched_.odom->quat) - pre_step_yaw_;
+        dyaw = std::atan2(std::sin(dyaw), std::cos(dyaw));   // unwrap
+        sched_.recording.emplace_back(ts, dyaw);
+      } else {
+        const int i = axis_index(ax);
+        sched_.recording.emplace_back(ts, sched_.odom->pos[i] - pre_step_pos_);
+      }
     }
   }
   const double elapsed = now - state_t0_;
@@ -855,8 +876,32 @@ void TuningConductor::st_step(double now)
     goto_state(TunerState::ANALYZE);
     return;
   }
-  if (adaptive_episode_ && elapsed >= episode_min_time_ && sched_.response_settled(now)) {
+  if (adaptive_episode_ && elapsed >= episode_min_time_ && sched_.odom &&
+    sched_.response_settled(sched_.odom->t_stamp))
+  {
     goto_state(TunerState::ANALYZE);
+  }
+}
+
+void TuningConductor::dump_episode(
+  const std::string & ax, const Eigen::VectorXd & t,
+  const Eigen::VectorXd & y, double step)
+{
+  if (episode_dump_dir_.empty()) {return;}
+  try {
+    std::filesystem::create_directories(episode_dump_dir_);
+    std::ostringstream name;
+    name << "ep" << std::setw(3) << std::setfill('0') << episode_seq_++ <<
+      "_" << ax << "_rung" << rung_ << "_rep" << sched_.rep << ".csv";
+    std::ofstream f(std::filesystem::path(episode_dump_dir_) / name.str());
+    f << "# axis=" << ax << " step=" << step << " rung=" << rung_ <<
+      " rep=" << sched_.rep << "\n";
+    f << "t,y\n" << std::setprecision(9);
+    for (Eigen::Index i = 0; i < t.size(); ++i) {
+      f << t[i] << "," << y[i] << "\n";
+    }
+  } catch (const std::exception & e) {
+    RCLCPP_WARN(get_logger(), "episode dump failed: %s", e.what());
   }
 }
 
@@ -868,6 +913,7 @@ void TuningConductor::analyze_yaw()
     y[static_cast<Eigen::Index>(i)] = sched_.recording[i].second;
   }
   const double step = sched_.step_applied;
+  dump_episode("yaw", t, y, step);
   YAML::Node rec;
   rec["axis"] = "yaw";
   rec["rung"] = static_cast<int>(rung_);
@@ -958,6 +1004,7 @@ void TuningConductor::st_analyze(double)
     t[static_cast<Eigen::Index>(i)] = sched_.recording[i].first;
     y[static_cast<Eigen::Index>(i)] = sched_.recording[i].second;
   }
+  dump_episode(ax, t, y, step);
   const double kx_now = gains_->at(ax).first;
   const double kv_now = gains_->at(ax).second;
   const double wn_target = wn_ladder_[rung_];

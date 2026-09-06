@@ -46,7 +46,8 @@ struct SafetyLimits
 
 struct OdomSample
 {
-  double t{};                              // s
+  double t{};                              // s, receiver clock (staleness checks)
+  double t_stamp{};                        // s, sensor clock (episode time axis)
   std::array<double, 3> pos{};             // (x, y, z) m
   std::array<double, 3> vel{};             // (vx, vy, vz) m/s
   std::array<double, 4> quat{1, 0, 0, 0};  // (w, x, y, z)
