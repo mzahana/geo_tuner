@@ -93,7 +93,10 @@ test passed ("Ready for takeoff"). The tuning-session flight itself (steps
    `geo_tuner/config/tuner_field.yaml` (≥ 10 m AGL, clear ground, geofence on,
    pilot's thumb on the mode switch — RC override always wins; the tuner
    never arms/disarms or changes modes).
-3. `ros2 launch geo_tuner field_tune.launch.py`. The conductor automatically:
+3. `ros2 launch geo_tuner field_tune.launch.py output_dir:=~/tuning_logs`
+   (`output_dir`: timestamped report + raw episode CSVs per session, nothing
+   overwritten — bring that folder home for analysis). The conductor
+   automatically:
    - reads current gains as the safe baseline;
    - injects small alternating steps (z first, then x, y; ±0.4–0.5 m);
    - fits a 2nd-order + delay model per response; rejects bad fits;
@@ -105,7 +108,8 @@ test passed ("Ready for takeoff"). The tuning-session flight itself (steps
    - on ANY safety violation (tilt, pos error, speed, altitude, stale odom,
      rate oscillation): restores last-safe gains, holds hover, writes a
      diagnosis, stops.
-4. Land. Copy `final_gains` from `/tmp/geo_tuner_report.yaml` into
+4. Land. Copy `final_gains` from the session's report (under `output_dir`,
+   or `/tmp/geo_tuner_report.yaml` when unset) into
    `geometric_controller.yaml`; apply any suggested `max_thrust` correction.
 
 ### Phase 5 — Agility pass (optional, chase performance)

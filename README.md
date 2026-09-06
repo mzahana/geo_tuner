@@ -97,7 +97,12 @@ the tuning conductor, end to end. Expect `status: complete` in
    configured `hover_position` (edit `config/tuner_field.yaml`).
 2. Pilot thumb on the RC mode switch — **switching out of OFFBOARD always
    overrides everything**. The conductor never arms/disarms or changes modes.
-3. `ros2 launch geo_tuner field_tune.launch.py`
+3. `ros2 launch geo_tuner field_tune.launch.py output_dir:=~/tuning_logs`
+   — `output_dir` is the one knob for session data: every session writes a
+   timestamped `geo_tuner_report_<stamp>.yaml` plus an `episodes_<stamp>/`
+   folder of raw per-episode CSVs (t, y per odometry sample) under it, so a
+   day of repeated sessions never overwrites anything. Leave it unset to
+   fall back to the yaml's `report_path` (single, overwritten file).
 
 The conductor then, fully automatically:
 
@@ -126,6 +131,10 @@ what the vehicle actually did rather than assumed.
 
 ### Step 4 — after the session
 
+Collect the `output_dir` folder — the reports carry every episode's fit
+(α, τ, NRMSE, overshoot, action) and every bucket's verdict; the episode
+CSVs are the raw responses behind them, for offline analysis of any
+session whose estimates disagreed.
 Copy `final_gains` from the report into `geometric_controller.yaml`. If the
 report suggests a `max_thrust` correction, apply it to
 `geometric_mavros.yaml` — that fix benefits everything, not just tuning.
