@@ -71,6 +71,12 @@ public:
   void load(const rviz_common::Config & config) override;
   void save(rviz_common::Config config) const override;
 
+  /// Embedded inside another panel (the Geo Field Tune tab): hide this
+  /// panel's own namespace row -- the host's selector drives it instead.
+  void setEmbedded(bool embedded);
+  /// Take over the namespace from the host panel's selector.
+  void adoptNamespace(const QString & ns);
+
 protected:
   void resizeEvent(QResizeEvent * event) override;
 
@@ -79,7 +85,6 @@ private Q_SLOTS:
   void refresh();
   void onApply();
   void onRevert();
-  void onRestoreBaseline();
   void onSaveToVehicle();
   void onInterlockToggled(bool on);
   void onEditsChanged();
@@ -120,7 +125,6 @@ private:
   QCheckBox * thrust_correct_{nullptr};
   QPushButton * apply_button_{nullptr};
   QPushButton * revert_button_{nullptr};
-  QPushButton * baseline_button_{nullptr};
   QPushButton * save_button_{nullptr};
   QPushButton * reload_button_{nullptr};
   std::array<QDoubleSpinBox *, 3> wn_spin_{{nullptr, nullptr, nullptr}};

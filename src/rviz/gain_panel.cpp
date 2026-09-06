@@ -172,18 +172,17 @@ GainPanel::GainPanel(QWidget * parent)
     caps_label_->setStyleSheet("color:#909090;");
     grid->addWidget(caps_label_, 4, 0, 1, 5);
 
+    // Restoring a tuning session's gains lives on the Tune tab (Revert);
+    // here Revert last only undoes a manual Apply, so the two tabs never
+    // offer the same-looking action with different meanings.
     auto * buttons = new QHBoxLayout();
     apply_button_ = new QPushButton("Apply", box);
     revert_button_ = new QPushButton("Revert last", box);
-    baseline_button_ = new QPushButton("Restore baseline", box);
     reload_button_ = new QPushButton("Reload from vehicle", box);
     buttons->addWidget(apply_button_);
     buttons->addWidget(revert_button_);
+    buttons->addWidget(reload_button_);
     grid->addLayout(buttons, 5, 0, 1, 5);
-    auto * buttons2 = new QHBoxLayout();
-    buttons2->addWidget(baseline_button_);
-    buttons2->addWidget(reload_button_);
-    grid->addLayout(buttons2, 6, 0, 1, 5);
 
     groups_.push_back(box);
   }
@@ -241,7 +240,6 @@ GainPanel::GainPanel(QWidget * parent)
   connect(interlock_, &QCheckBox::toggled, this, &GainPanel::onInterlockToggled);
   connect(apply_button_, &QPushButton::clicked, this, &GainPanel::onApply);
   connect(revert_button_, &QPushButton::clicked, this, &GainPanel::onRevert);
-  connect(baseline_button_, &QPushButton::clicked, this, &GainPanel::onRestoreBaseline);
   connect(save_button_, &QPushButton::clicked, this, &GainPanel::onSaveToVehicle);
   connect(reload_button_, &QPushButton::clicked, this, [this]() {
     edits_dirty_ = false;
@@ -367,7 +365,6 @@ void GainPanel::onInterlockToggled(bool on)
 {
   apply_button_->setEnabled(on);
   revert_button_->setEnabled(on);
-  baseline_button_->setEnabled(on);
   save_button_->setEnabled(on);
   thrust_correct_->setEnabled(on);
   for(int i = 0; i < 3; ++i)
@@ -523,14 +520,15 @@ void GainPanel::onRevert()
   applyGains(previous_, "reverted to the previous gains");
 }
 
-void GainPanel::onRestoreBaseline()
+void GainPanel::setEmbedded(bool embedded)
 {
-  if(!baseline_.valid)
-  {
-    log("no baseline captured yet", false);
-    return;
-  }
-  applyGains(baseline_, "restored the baseline gains");
+  ns_selector_->setVisible(!embedded);
+}
+
+void GainPanel::adoptNamespace(const QString & ns)
+{
+  ns_selector_->setNs(ns);
+  applyNamespace();
 }
 
 void GainPanel::onSaveToVehicle()

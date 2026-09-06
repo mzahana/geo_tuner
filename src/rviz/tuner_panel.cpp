@@ -5,14 +5,11 @@
 
 #include <QDateTime>
 #include <QFont>
-#include <QGroupBox>
+#include <QGridLayout>
 #include <QHBoxLayout>
 #include <QMessageBox>
-#include <QResizeEvent>
 #include <QTimer>
 #include <QVBoxLayout>
-
-#include <limits>
 
 namespace geo_tuner::panels
 {
@@ -24,21 +21,28 @@ const char * kOkStyle = "background-color:#1f7a34; color:white; padding:5px; bor
 const char * kWarnStyle = "background-color:#b37400; color:white; padding:5px; border-radius:3px;";
 const char * kErrStyle = "background-color:#a11d1d; color:white; padding:5px; border-radius:3px;";
 const char * kStaleStyle = "background-color:#4a4a4a; color:#dddddd; padding:5px; border-radius:3px;";
+
+const char * kAxes[4] = {"x", "y", "z", "yaw"};
+
+// "wn=1.06 zeta=0.83" (the conductor's health encoding) -> "1.06 / 0.83".
+QString gainPair(const std::string & encoded)
+{
+  QString s = QString::fromStdString(encoded);
+  s.remove("wn=");
+  s.replace(" zeta=", " / ");
+  return s.isEmpty() ? QString("-") : s;
+}
 }  // namespace
 
 TunerPanel::TunerPanel(QWidget * parent)
 : rviz_common::Panel(parent)
 {
-  auto * root = new QGridLayout(this);
-  grid_ = root;
+  auto * root = new QVBoxLayout(this);
   root->setContentsMargins(4, 4, 4, 4);
   root->setSpacing(3);
-  root->setColumnStretch(0, 1);
-  root->setColumnStretch(1, 1);
-  int grid_row = 0;
 
   ns_selector_ = new NamespaceSelector(this);
-  root->addWidget(ns_selector_, grid_row++, 0, 1, 2);
+  root->addWidget(ns_selector_);
 
   banner_ = new QLabel("waiting for geo_tuner", this);
   QFont bf = banner_->font();
@@ -48,31 +52,94 @@ TunerPanel::TunerPanel(QWidget * parent)
   banner_->setAlignment(Qt::AlignCenter);
   banner_->setStyleSheet(kStaleStyle);
   banner_->setWordWrap(true);
-  root->addWidget(banner_, grid_row++, 0, 1, 2);
+  root->addWidget(banner_);
 
   // Controls sit directly under the banner: an abort you have to scroll to
   // is not an abort.
   {
     auto * row = new QHBoxLayout();
     start_button_ = new QPushButton("START", this);
-    start_button_->setStyleSheet("background-color:#1f7a34; color:white; font-weight:bold; padding:7px;");
+    start_button_->setStyleSheet(
+      "background-color:#1f7a34; color:white; font-weight:bold; padding:7px;");
     abort_button_ = new QPushButton("ABORT", this);
-    abort_button_->setStyleSheet("background-color:#a11d1d; color:white; font-weight:bold; padding:7px;");
+    abort_button_->setStyleSheet(
+      "background-color:#a11d1d; color:white; font-weight:bold; padding:7px;");
     row->addWidget(start_button_, 1);
     row->addWidget(abort_button_, 1);
-    root->addLayout(row, grid_row++, 0, 1, 2);
-
-    auto * row2 = new QHBoxLayout();
-    accept_button_ = new QPushButton("Accept result", this);
-    restore_button_ = new QPushButton("Restore safe gains", this);
-    // Without this, recovering from an abort meant restarting the node --
-    // an SSH session, in flight, to undo something the tuner did on purpose.
-    reset_button_ = new QPushButton("Reset session", this);
-    row2->addWidget(accept_button_, 1);
-    row2->addWidget(restore_button_, 1);
-    row2->addWidget(reset_button_, 1);
-    root->addLayout(row2, grid_row++, 0, 1, 2);
+    root->addLayout(row);
   }
+
+  // The glance lines: is it progressing, and is the vehicle where it should
+  // be. One line each -- the details live in the health topic, not here.
+  progress_line_ = new QLabel("-", this);
+  progress_line_->setAlignment(Qt::AlignCenter);
+  root->addWidget(progress_line_);
+  vehicle_line_ = new QLabel("-", this);
+  vehicle_line_->setAlignment(Qt::AlignCenter);
+  vehicle_line_->setStyleSheet("color:#909090;");
+  root->addWidget(vehicle_line_);
+  waiting_line_ = new QLabel(this);
+  waiting_line_->setAlignment(Qt::AlignCenter);
+  waiting_line_->setWordWrap(true);
+  waiting_line_->setStyleSheet("color:#b37400; font-weight:bold;");
+  waiting_line_->hide();
+  root->addWidget(waiting_line_);
+
+  // Old -> new, filled in as buckets finish; the panel's answer to "what did
+  // the session actually do". Hidden until there is something to show.
+  {
+    result_box_ = new QGroupBox("Result (old → new)", this);
+    auto * grid = new QGridLayout(result_box_);
+    grid->setContentsMargins(6, 3, 6, 3);
+    grid->setVerticalSpacing(2);
+    grid->addWidget(new QLabel("", result_box_), 0, 0);
+    grid->addWidget(new QLabel("old (wn/ζ)", result_box_), 0, 1);
+    grid->addWidget(new QLabel("new (wn/ζ)", result_box_), 0, 3);
+    grid->addWidget(new QLabel("outcome", result_box_), 0, 4);
+    for(int i = 0; i < 4; ++i)
+    {
+      const size_t a = static_cast<size_t>(i);
+      grid->addWidget(new QLabel(kAxes[i], result_box_), i + 1, 0);
+      result_old_[a] = new QLabel("-", result_box_);
+      grid->addWidget(result_old_[a], i + 1, 1);
+      grid->addWidget(new QLabel("→", result_box_), i + 1, 2);
+      result_new_[a] = new QLabel("-", result_box_);
+      grid->addWidget(result_new_[a], i + 1, 3);
+      result_note_[a] = new QLabel("-", result_box_);
+      result_note_[a]->setStyleSheet("color:#909090;");
+      result_note_[a]->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+      grid->addWidget(result_note_[a], i + 1, 4);
+    }
+    grid->setColumnStretch(4, 1);
+
+    auto * row = new QHBoxLayout();
+    keep_button_ = new QPushButton("Keep && save", result_box_);
+    keep_button_->setToolTip(
+      "Accept the gains in force as the safe set and ask gain_saver on the "
+      "vehicle to write them to the override YAML, so they survive a restart.");
+    revert_button_ = new QPushButton("Revert", result_box_);
+    revert_button_->setToolTip("Restore the last known-safe gains on the controller.");
+    row->addWidget(keep_button_, 1);
+    row->addWidget(revert_button_, 1);
+    grid->addLayout(row, 5, 0, 1, 5);
+
+    result_box_->hide();
+    root->addWidget(result_box_);
+  }
+
+  // Everything an operator touches rarely: the step envelope and the log.
+  advanced_toggle_ = new QToolButton(this);
+  advanced_toggle_->setText("Advanced");
+  advanced_toggle_->setCheckable(true);
+  advanced_toggle_->setArrowType(Qt::RightArrow);
+  advanced_toggle_->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+  advanced_toggle_->setAutoRaise(true);
+  root->addWidget(advanced_toggle_);
+
+  advanced_box_ = new QWidget(this);
+  auto * adv = new QVBoxLayout(advanced_box_);
+  adv->setContentsMargins(0, 0, 0, 0);
+  adv->setSpacing(3);
 
   // Manoeuvre envelope. The conductor steps the setpoint by these amounts
   // about the hover point and comes straight back, so the vehicle stays
@@ -80,7 +147,7 @@ TunerPanel::TunerPanel(QWidget * parent)
   // actually constrains. Editable in flight; the node validates and
   // applies from the next episode.
   {
-    auto * box = new QGroupBox("Step envelope (about the hover point)", this);
+    auto * box = new QGroupBox("Step envelope (about the hover point)", advanced_box_);
     auto * grid = new QGridLayout(box);
     grid->setContentsMargins(6, 3, 6, 3);
     grid->setVerticalSpacing(2);
@@ -117,84 +184,34 @@ TunerPanel::TunerPanel(QWidget * parent)
     envelope_label_->setWordWrap(true);
     envelope_label_->setStyleSheet("color:#aaaaaa;");
     grid->addWidget(envelope_label_, 4, 0, 1, 2);
-
     grid->setColumnStretch(1, 1);
-    groups_.push_back(box);
+    adv->addWidget(box);
   }
 
-  auto make_group = [&](const char * title,
-                        const std::vector<std::pair<const char *, const char *>> & rows) {
-    auto * box = new QGroupBox(title, this);
-    auto * grid = new QGridLayout(box);
-    grid->setContentsMargins(6, 3, 6, 3);
-    grid->setVerticalSpacing(1);
-    int r = 0;
-    for(const auto & kv : rows)
-    {
-      auto * value = new QLabel("-", box);
-      value->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
-      value->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
-      grid->addWidget(new QLabel(kv.second, box), r, 0);
-      grid->addWidget(value, r, 1);
-      fields_[kv.first] = value;
-      ++r;
-    }
-    grid->setColumnStretch(1, 1);
-    return box;
-  };
-
-  // Only what tells you whether to let the session continue.
-  groups_.push_back(make_group("Session", {
-    {"progress", "axis / rung"},
-    {"target", "wn target"},
-    {"episode", "episode"},
-    {"blocked", "waiting on"},
-  }));
-
-  groups_.push_back(make_group("Vehicle", {
-    {"gains", "gains (wn/zeta)"},
-    {"pos_err", "position error"},
-    {"altitude", "altitude"},
-  }));
-
-  log_view_ = new QTextEdit(this);
+  log_view_ = new QTextEdit(advanced_box_);
   log_view_->setReadOnly(true);
   log_view_->setMinimumHeight(60);
   log_view_->setMaximumHeight(110);
-  groups_.push_back(log_view_);
+  adv->addWidget(log_view_);
 
-  group_row0_ = grid_row;
-  relayout(2);
+  advanced_box_->hide();
+  root->addWidget(advanced_box_);
+  root->addStretch(1);
+
+  connect(advanced_toggle_, &QToolButton::toggled, this, [this](bool on) {
+    advanced_toggle_->setArrowType(on ? Qt::DownArrow : Qt::RightArrow);
+    advanced_box_->setVisible(on);
+  });
 
   connect(ns_selector_, &NamespaceSelector::applied, this, &TunerPanel::applyNamespace);
-  connect(start_button_, &QPushButton::clicked, this, [this]() {
-    callService("start", start_client_,
-                "Start an auto-tuning session?\n\nPress START FIRST, while still "
-                "in LOITER or POSCTL: the conductor then streams hold setpoints "
-                "at the current pose, which is what lets PX4 accept the switch "
-                "to OFFBOARD. Switch to OFFBOARD after this, and the session "
-                "begins.\n\nIt will fly step inputs and change gains in flight. "
-                "Leaving OFFBOARD pauses it; ABORT restores the safe gains.");
-  });
+  connect(start_button_, &QPushButton::clicked, this, &TunerPanel::onStart);
   connect(abort_button_, &QPushButton::clicked, this, [this]() {
     callService("abort", abort_client_, QString());  // never confirmed
   });
-  connect(accept_button_, &QPushButton::clicked, this, [this]() {
-    callService("accept", accept_client_,
-                "Accept the current gains as the safe set?\n\nThey stay live on "
-                "the controller. Use Save on the Gains tab to keep them past a "
-                "restart.");
-  });
-  connect(restore_button_, &QPushButton::clicked, this, [this]() {
+  connect(keep_button_, &QPushButton::clicked, this, &TunerPanel::onKeepAndSave);
+  connect(revert_button_, &QPushButton::clicked, this, [this]() {
     callService("restore_safe", restore_client_, QString());
   });
-  connect(reset_button_, &QPushButton::clicked, this, [this]() {
-    callService("reset", reset_client_,
-                "Arm another session?\n\nThis only clears the aborted state. "
-                "Fix what caused the abort first -- the gains in force are "
-                "left exactly as they are.");
-  });
-
   connect(apply_steps_button_, &QPushButton::clicked, this, &TunerPanel::applySteps);
 
   timer_ = new QTimer(this);
@@ -203,33 +220,6 @@ TunerPanel::TunerPanel(QWidget * parent)
 }
 
 TunerPanel::~TunerPanel() = default;
-
-void TunerPanel::relayout(int columns)
-{
-  if(columns == columns_ || !grid_)
-    return;
-  columns_ = columns;
-  for(auto * w : groups_)
-    grid_->removeWidget(w);
-  int i = 0;
-  for(auto * w : groups_)
-  {
-    grid_->addWidget(w, group_row0_ + i / columns, i % columns, 1, (columns == 1) ? 2 : 1);
-    ++i;
-  }
-  grid_->setColumnStretch(1, (columns == 1) ? 0 : 1);
-  grid_->setRowStretch(group_row0_ + (static_cast<int>(groups_.size()) + columns - 1) / columns, 1);
-}
-
-void TunerPanel::resizeEvent(QResizeEvent * event)
-{
-  rviz_common::Panel::resizeEvent(event);
-  const int w = width();
-  if(columns_ == 2 && w < 400)
-    relayout(1);
-  else if(columns_ != 2 && w > 440)
-    relayout(2);
-}
 
 void TunerPanel::onInitialize()
 {
@@ -240,6 +230,11 @@ void TunerPanel::onInitialize()
 QString TunerPanel::prefix() const
 {
   return ns_selector_->prefix(node_);
+}
+
+QString TunerPanel::currentNamespace() const
+{
+  return ns_selector_->ns();
 }
 
 void TunerPanel::connectNode()
@@ -274,9 +269,113 @@ void TunerPanel::connectNode()
   accept_client_ = node_->create_client<std_srvs::srv::Trigger>(p + "tuning_conductor/accept");
   restore_client_ = node_->create_client<std_srvs::srv::Trigger>(p + "tuning_conductor/restore_safe");
   reset_client_ = node_->create_client<std_srvs::srv::Trigger>(p + "tuning_conductor/reset");
+  save_client_ = node_->create_client<std_srvs::srv::SetBool>(p + "gain_saver/save");
   param_client_ = std::make_shared<rclcpp::AsyncParametersClient>(
     node_, p + "tuning_conductor");
   steps_dirty_ = false;
+}
+
+void TunerPanel::onStart()
+{
+  const QString confirm =
+    "Start an auto-tuning session?\n\nPress START FIRST, while still "
+    "in LOITER or POSCTL: the conductor then streams hold setpoints "
+    "at the current pose, which is what lets PX4 accept the switch "
+    "to OFFBOARD. Switch to OFFBOARD after this, and the session "
+    "begins.\n\nIt will fly step inputs and change gains in flight. "
+    "Leaving OFFBOARD pauses it; ABORT restores the safe gains.";
+  std::string state;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    state = last_state_;
+  }
+  if(state != "ABORT" && state != "DONE")
+  {
+    callService("start", start_client_, confirm);
+    return;
+  }
+  // A finished (or aborted) conductor must be reset before another session.
+  // That is one gesture for the operator, not two buttons: confirm once,
+  // then chain reset -> start. After an abort the confirm carries the
+  // reminder that the cause needs fixing first.
+  QString text = confirm;
+  if(state == "ABORT")
+    text += "\n\nThe last session ABORTED. Starting again only makes sense "
+            "after the cause is fixed -- the gains in force are unchanged.";
+  if(!reset_client_ || !reset_client_->service_is_ready())
+  {
+    log("start: tuning_conductor not running at " + prefix(), false);
+    return;
+  }
+  if(QMessageBox::question(this, "start", text,
+                           QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes)
+    return;
+  reset_client_->async_send_request(
+    std::make_shared<std_srvs::srv::Trigger::Request>(),
+    [this](rclcpp::Client<std_srvs::srv::Trigger>::SharedFuture future) {
+      const auto res = future.get();
+      if(!res->success)
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        have_pending_log_ = true;
+        pending_log_ok_ = false;
+        pending_log_ = QString::fromStdString(res->message);
+        return;
+      }
+      if(start_client_)
+        start_client_->async_send_request(
+          std::make_shared<std_srvs::srv::Trigger::Request>(),
+          [this](rclcpp::Client<std_srvs::srv::Trigger>::SharedFuture f2) {
+            const auto r2 = f2.get();
+            std::lock_guard<std::mutex> lock(mutex_);
+            have_pending_log_ = true;
+            pending_log_ok_ = r2->success;
+            pending_log_ = QString::fromStdString(r2->message);
+          });
+    });
+}
+
+void TunerPanel::onKeepAndSave()
+{
+  if(!accept_client_ || !accept_client_->service_is_ready())
+  {
+    log("keep: tuning_conductor not running at " + prefix(), false);
+    return;
+  }
+  const bool saver = save_client_ && save_client_->service_is_ready();
+  QString text = "Keep the gains in force?\n\nThey become the conductor's safe set";
+  text += saver
+            ? ", and gain_saver writes them to the vehicle's override YAML so "
+              "they survive a restart."
+            : ".\n\ngain_saver is NOT running, so they stay runtime-only and "
+              "are lost at the next restart.";
+  if(QMessageBox::question(this, "Keep & save", text,
+                           QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes)
+    return;
+  accept_client_->async_send_request(
+    std::make_shared<std_srvs::srv::Trigger::Request>(),
+    [this, saver](rclcpp::Client<std_srvs::srv::Trigger>::SharedFuture future) {
+      const auto res = future.get();
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        have_pending_log_ = true;
+        pending_log_ok_ = res->success;
+        pending_log_ = QString::fromStdString(res->message);
+      }
+      if(!res->success || !saver || !save_client_)
+        return;
+      auto req = std::make_shared<std_srvs::srv::SetBool::Request>();
+      req->data = false;   // never touch max_thrust from here
+      save_client_->async_send_request(
+        req,
+        [this](rclcpp::Client<std_srvs::srv::SetBool>::SharedFuture f2) {
+          const auto r2 = f2.get();
+          std::lock_guard<std::mutex> lock(mutex_);
+          have_pending_log_ = true;
+          pending_log_ok_ = r2->success;
+          pending_log_ = QString::fromStdString(r2->message);
+        });
+    });
 }
 
 void TunerPanel::applySteps()
@@ -324,6 +423,7 @@ void TunerPanel::applyNamespace()
     values_.clear();
   }
   connectNode();
+  Q_EMIT namespaceApplied(ns_selector_->ns());
   Q_EMIT configChanged();
 }
 
@@ -395,28 +495,28 @@ void TunerPanel::refresh()
     const auto it = values.find(key);
     return (it == values.end() || it->second.empty()) ? std::string(fallback) : it->second;
   };
-  auto set = [this](const char * key, const QString & text) {
-    const auto it = fields_.find(key);
-    if(it != fields_.end())
-      it->second->setText(text);
-  };
 
   if(!live)
   {
     banner_->setStyleSheet(kStaleStyle);
     banner_->setText(received_ ? "NO DATA - tuning_conductor stopped"
                                : "tuning_conductor not running");
-    for(auto & kv : fields_)
-      kv.second->setText("-");
+    progress_line_->setText("-");
+    vehicle_line_->setText("-");
+    waiting_line_->hide();
+    result_box_->hide();
     start_button_->setEnabled(false);
-    accept_button_->setEnabled(false);
-    restore_button_->setEnabled(false);
-    reset_button_->setEnabled(false);
     // Abort stays live: a conductor whose health topic died is exactly when
     // you want to be able to stop it.
     abort_button_->setEnabled(true);
+    keep_button_->setEnabled(false);
+    revert_button_->setEnabled(false);
     apply_steps_button_->setEnabled(false);
     envelope_label_->setText("-");
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      last_state_.clear();
+    }
     return;
   }
 
@@ -426,21 +526,29 @@ void TunerPanel::refresh()
                                                                                  : kOkStyle);
 
   const std::string state = str("state");
-  set("progress", QString("%1  %2 / rung %3")
-        .arg(str("axis").c_str()).arg(str("axis_index").c_str()).arg(str("rung").c_str()));
-  set("target", QString("wn %1, zeta %2")
-        .arg(str("wn_target").c_str()).arg(str("zeta_target").c_str()));
-  set("episode", str("episode").c_str());
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    last_state_ = state;
+  }
+
+  progress_line_->setText(
+    QString("%1 %2 · rung %3 · ep %4 · wn %5 ζ %6")
+      .arg(str("axis").c_str()).arg(str("axis_index").c_str()).arg(str("rung").c_str())
+      .arg(str("episode").c_str()).arg(str("wn_target").c_str())
+      .arg(str("zeta_target").c_str()));
+  vehicle_line_->setText(
+    QString("alt %1 m · err %2")
+      .arg(str("altitude").c_str()).arg(str("pos_err").c_str()));
 
   // One line for why it is not progressing -- the question you actually ask
-  // while watching a session sit still.
-  QString blocked = "-";
+  // while watching a session sit still. Hidden while nothing blocks.
+  QString blocked;
   if(state == "WAIT_ODOM")
-    blocked = "odometry";
+    blocked = "waiting on odometry";
   else if(state == "WAIT_ENABLE")
     blocked = (str("start_requested") == "true")
-                ? "baseline gains"
-                : "START (press it before switching to OFFBOARD)";
+                ? "waiting on baseline gains"
+                : "press START before switching to OFFBOARD";
   else if(state == "WAIT_OFFBOARD")
     blocked = QString("switch to OFFBOARD now - setpoints are streaming (mode: %1)")
                 .arg(str("px4_mode").c_str());
@@ -450,17 +558,46 @@ void TunerPanel::refresh()
     // the reason alone only says what tripped.
     const std::string diagnosis = str("diagnosis", "");
     blocked = QString::fromStdString(diagnosis.empty() ? str("abort_reason") : diagnosis);
-    fields_["blocked"]->setToolTip(QString::fromStdString(str("abort_reason")));
+    waiting_line_->setToolTip(QString::fromStdString(str("abort_reason")));
   }
-  set("blocked", blocked);
+  waiting_line_->setText(blocked);
+  waiting_line_->setVisible(!blocked.isEmpty());
 
-  QStringList gains;
-  for(const char * ax : {"gain_x", "gain_y", "gain_z"})
-    if(values.count(ax))
-      gains << QString::fromStdString(values.at(ax)).remove("wn=").remove("zeta=");
-  set("gains", gains.isEmpty() ? "-" : gains.join("  "));
-  set("pos_err", str("pos_err").c_str());
-  set("altitude", QString("%1 m").arg(str("altitude").c_str()));
+  // Old -> new result rows, appearing as buckets finish. An axis whose
+  // gains match the baseline and carries no outcome yet shows a dash.
+  {
+    bool any = false;
+    for(int i = 0; i < 4; ++i)
+    {
+      const size_t a = static_cast<size_t>(i);
+      const std::string ax = kAxes[i];
+      QString oldv = "-", newv = "-";
+      if(ax == "yaw")
+      {
+        oldv = QString::fromStdString(str("baseline_yaw_tau"));
+        newv = QString::fromStdString(str("yaw_tau"));
+        if(oldv != "-")
+          oldv = "tau " + oldv;
+        if(newv != "-")
+          newv = "tau " + newv;
+      }
+      else
+      {
+        oldv = gainPair(str(("baseline_" + ax).c_str(), ""));
+        newv = gainPair(str(("gain_" + ax).c_str(), ""));
+      }
+      const QString note = QString::fromStdString(str(("result_" + ax).c_str(), "-"));
+      result_old_[a]->setText(oldv);
+      result_new_[a]->setText(newv);
+      result_note_[a]->setText(note);
+      result_note_[a]->setToolTip(note);
+      const bool changed = oldv != newv && oldv != "-" && newv != "-";
+      result_new_[a]->setStyleSheet(changed ? "font-weight:bold;" : "");
+      if(note != "-")
+        any = true;
+    }
+    result_box_->setVisible(any || state == "DONE");
+  }
 
   // The conductor is the authority on both the current amplitudes and the
   // largest one it will accept; mirror them, but never stomp on an edit
@@ -498,17 +635,18 @@ void TunerPanel::refresh()
   {
     banner_->setStyleSheet(kErrStyle);
     banner_->setText("TRAJECTORY TEST IS STREAMING SETPOINTS - STOP IT BEFORE TUNING");
-    set("blocked", "trajectory_test_node running");
+    waiting_line_->setText("trajectory_test_node running");
+    waiting_line_->show();
   }
 
   const bool finished = (state == "ABORT" || state == "DONE");
   const bool running = !finished && state != "WAIT_ODOM" && state != "WAIT_ENABLE" &&
                        state != "WAIT_OFFBOARD";
-  start_button_->setEnabled(!finished && !running && !traj_live);
+  start_button_->setText(finished ? "START (new session)" : "START");
+  start_button_->setEnabled(!running && !traj_live);
   abort_button_->setEnabled(true);
-  reset_button_->setEnabled(finished);
-  accept_button_->setEnabled(!values.count("gain_x") ? false : true);
-  restore_button_->setEnabled(true);
+  keep_button_->setEnabled(values.count("gain_x") > 0);
+  revert_button_->setEnabled(true);
   // Amplitudes may be retuned at any time: the change lands at the next
   // episode boundary, never mid-step.
   apply_steps_button_->setEnabled(true);

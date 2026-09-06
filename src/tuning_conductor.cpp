@@ -651,6 +651,8 @@ void TuningConductor::st_wait_enable(double now)
       {"y", {vals[1], vals[4]}},
       {"z", {vals[2], vals[5]}}};
     safe_gains_ = gains_;
+    baseline_gains_ = gains_;
+    session_result_.clear();
     for (const auto & [ax, kxkv] : *gains_) {
       const auto [wn, zeta] = wn_zeta_from_pd(kxkv.first, kxkv.second);
       status(
@@ -679,6 +681,7 @@ void TuningConductor::st_wait_enable(double now)
     } else if (att_tau > 0.0) {
       yaw_tau_ = att_tau;
     }
+    baseline_yaw_tau_ = yaw_tau_;
     const bool wants_yaw =
       std::find(sched_.axes.begin(), sched_.axes.end(), "yaw") != sched_.axes.end();
     if (wants_yaw) {
@@ -968,6 +971,7 @@ void TuningConductor::finalize_yaw_bucket()
   if (!est.ok) {
     rec["action"] = "keeping yawctrl_tau (" + est.reason + ")";
     results_.push_back(rec);
+    session_result_["yaw"] = "kept: " + est.reason;
     status("yaw: " + est.reason + "; keeping tau");
     advance_axis();
     return;
@@ -982,6 +986,9 @@ void TuningConductor::finalize_yaw_bucket()
   rec["yaw_tau_new"] = yaml_double(round_to(tau_new, 3));
   rec["action"] = "tau updated (median)";
   results_.push_back(rec);
+  session_result_["yaw"] =
+    "T " + fmt(T_med, 2) + "s (n=" + std::to_string(est.n_used) + ", spread " +
+    fmt(est.spread, 2) + "x)";
   status(
     "yaw: median T=" + fmt(T_med, 2) + "s (n=" + std::to_string(est.n_used) +
     ", spread " + fmt(est.spread, 2) + "x) -> tau " + fmt(*yaw_tau_, 3) + " -> " +
@@ -1098,6 +1105,7 @@ void TuningConductor::finalize_pos_bucket(const std::string & ax)
   if (!est.ok) {
     rec["action"] = "keeping gains (" + est.reason + ")";
     results_.push_back(rec);
+    session_result_[ax] = "kept: " + est.reason;
     status(ax + ": " + est.reason + "; keeping gains");
     advance_axis();
     return;
@@ -1130,6 +1138,8 @@ void TuningConductor::finalize_pos_bucket(const std::string & ax)
       "x on the Routh product); ladder stopped";
     rec["action"] = action;
     results_.push_back(rec);
+    session_result_[ax] = "kept: stability cap " + fmt(wn_cap, 2) + " rad/s (lag " +
+      fmt(tau_med * 1e3, 0) + " ms)";
     status(action);
     finish();
     return;
@@ -1150,6 +1160,9 @@ void TuningConductor::finalize_pos_bucket(const std::string & ax)
   results_.push_back(rec);
 
   safe_gains_ = gains_;   // current set flew safely
+  session_result_[ax] =
+    "alpha " + fmt(alpha, 2) + " (n=" + std::to_string(est.n_used) + ", spread " +
+    fmt(est.spread, 2) + "x)";
   (*gains_)[ax] = {kx_new, kv_new};
   apply_gains(Gains{{ax, gains_->at(ax)}});
   status(
@@ -1431,6 +1444,20 @@ void TuningConductor::publish_health()
   }
   if (yaw_tau_) {
     add("yaw_tau", fmt(*yaw_tau_, 3));
+  }
+  // Old vs new: the session baseline and per-axis outcomes the result view
+  // needs. baseline_* stays fixed for the whole session, unlike safe gains.
+  if (baseline_gains_) {
+    for (const auto & [ax, kxkv] : *baseline_gains_) {
+      const auto [wn, zeta] = wn_zeta_from_pd(kxkv.first, kxkv.second);
+      add("baseline_" + ax, "wn=" + fmt(wn, 2) + " zeta=" + fmt(zeta, 2));
+    }
+  }
+  if (baseline_yaw_tau_) {
+    add("baseline_yaw_tau", fmt(*baseline_yaw_tau_, 3));
+  }
+  for (const auto & [ax, note] : session_result_) {
+    add("result_" + ax, note);
   }
   add(
     "trim", fmt(a_trim_[0], 2) + "," + fmt(a_trim_[1], 2) + "," + fmt(a_trim_[2], 2));

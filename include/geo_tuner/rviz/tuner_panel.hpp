@@ -7,6 +7,12 @@
 // safety monitor. This panel starts it, watches it, and stops it. It holds no
 // tuning logic of its own: every decision, and every abort, stays in the node
 // that is actually flying.
+//
+// The field workflow is start -> watch -> decide, and the layout follows it:
+// banner, START/ABORT, one status line, then (once buckets finish) an
+// old -> new result table with exactly two decisions -- Keep & save, or
+// Revert. Everything an operator touches rarely (step envelope, the session
+// log) lives behind an Advanced disclosure.
 
 #ifndef GEO_TUNER__RVIZ__TUNER_PANEL_HPP_
 #define GEO_TUNER__RVIZ__TUNER_PANEL_HPP_
@@ -17,19 +23,21 @@
 #include <rclcpp/parameter_client.hpp>
 #include <diagnostic_msgs/msg/diagnostic_status.hpp>
 #include <rcl_interfaces/msg/set_parameters_result.hpp>
+#include <std_srvs/srv/set_bool.hpp>
 #include <std_srvs/srv/trigger.hpp>
 
 #include <QDoubleSpinBox>
-#include <QGridLayout>
+#include <QGroupBox>
 #include <QLabel>
 #include <QPushButton>
 #include <QTextEdit>
+#include <QToolButton>
 
+#include <array>
 #include <chrono>
 #include <map>
 #include <mutex>
 #include <string>
-#include <vector>
 
 class QTimer;
 
@@ -50,8 +58,12 @@ public:
   void load(const rviz_common::Config & config) override;
   void save(rviz_common::Config config) const override;
 
-protected:
-  void resizeEvent(QResizeEvent * event) override;
+  QString currentNamespace() const;
+
+Q_SIGNALS:
+  /// The operator applied a new namespace; an embedding panel can forward it
+  /// to sibling panels so one box drives them all.
+  void namespaceApplied(const QString & ns);
 
 private Q_SLOTS:
   void applyNamespace();
@@ -62,11 +74,12 @@ private Q_SLOTS:
 private:
   void connectNode();
   QString prefix() const;
-  void relayout(int columns);
   /// Call one of the conductor's Trigger services, with an optional confirm.
   void callService(const QString & name,
                    rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr client,
                    const QString & confirm);
+  void onStart();
+  void onKeepAndSave();
   void log(const QString & text, bool ok = true);
 
   rclcpp::Node::SharedPtr node_;
@@ -78,6 +91,9 @@ private:
   rclcpp::Subscription<diagnostic_msgs::msg::DiagnosticStatus>::SharedPtr traj_sub_;
   rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr start_client_, abort_client_,
     accept_client_, restore_client_, reset_client_;
+  /// gain_saver on the vehicle: Keep & save persists the accepted gains to
+  /// the override YAML in the same request flow the Gains tab uses.
+  rclcpp::Client<std_srvs::srv::SetBool>::SharedPtr save_client_;
   // Step amplitudes are the one thing this panel changes on the conductor.
   // Every value is validated by the node (against safety.max_pos_error and
   // max_step_size) and may be refused -- the panel reports, never overrides.
@@ -94,29 +110,38 @@ private:
   QString pending_log_;
   bool pending_log_ok_{true};
   bool have_pending_log_{false};
+  /// Last state string seen in health; START after ABORT/DONE chains a
+  /// reset first, so the operator never needs a separate Reset button.
+  std::string last_state_;
 
   NamespaceSelector * ns_selector_{nullptr};
   QLabel * banner_{nullptr};
   QPushButton * start_button_{nullptr};
   QPushButton * abort_button_{nullptr};
-  QPushButton * accept_button_{nullptr};
-  QPushButton * restore_button_{nullptr};
-  QPushButton * reset_button_{nullptr};
+  QLabel * progress_line_{nullptr};
+  QLabel * vehicle_line_{nullptr};
+  QLabel * waiting_line_{nullptr};
+
+  QGroupBox * result_box_{nullptr};
+  // Rows x, y, z, yaw: old | -> | new | outcome.
+  std::array<QLabel *, 4> result_old_{};
+  std::array<QLabel *, 4> result_new_{};
+  std::array<QLabel *, 4> result_note_{};
+  QPushButton * keep_button_{nullptr};
+  QPushButton * revert_button_{nullptr};
+
+  QToolButton * advanced_toggle_{nullptr};
+  QWidget * advanced_box_{nullptr};
   QDoubleSpinBox * step_xy_spin_{nullptr};
   QDoubleSpinBox * step_z_spin_{nullptr};
   QDoubleSpinBox * step_yaw_spin_{nullptr};
   QPushButton * apply_steps_button_{nullptr};
   QLabel * envelope_label_{nullptr};
+  QTextEdit * log_view_{nullptr};
   /// True while the operator has typed values not yet applied: the live
   /// values from the conductor must not overwrite an edit in progress.
   bool steps_dirty_{false};
-  std::map<std::string, QLabel *> fields_;
-  QTextEdit * log_view_{nullptr};
 
-  std::vector<QWidget *> groups_;
-  QGridLayout * grid_{nullptr};
-  int group_row0_{0};
-  int columns_{0};
   QTimer * timer_{nullptr};
 };
 

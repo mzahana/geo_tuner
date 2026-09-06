@@ -48,6 +48,14 @@ GeoFieldPanel::GeoFieldPanel(QWidget * parent)
   tune_layout->addWidget(gains);
   tune_layout->addStretch(1);
 
+  // One namespace box for the shared tab: the tuner's selector drives the
+  // gain panel too, so the operator never sees two boxes asking the same
+  // question with room to disagree.
+  gains->setEmbedded(true);
+  tuner_ = tuner;
+  gains_ = gains;
+  connect(tuner, &TunerPanel::namespaceApplied, gains, &GainPanel::adoptNamespace);
+
   // The combined tab is taller than a short dock, and a control you cannot
   // scroll to is a control you do not have.
   auto * scroll = new QScrollArea(this);
@@ -83,6 +91,11 @@ void GeoFieldPanel::load(const rviz_common::Config & config)
   int index = 0;
   if(config.mapGetInt("Tab", &index) && index >= 0 && index < tabs_->count())
     tabs_->setCurrentIndex(index);
+
+  // A config saved before the namespace rows were unified may carry two
+  // different namespaces; the tuner's wins, visibly.
+  if(tuner_ && gains_)
+    gains_->adoptNamespace(tuner_->currentNamespace());
 }
 
 void GeoFieldPanel::save(rviz_common::Config config) const

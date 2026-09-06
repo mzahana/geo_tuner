@@ -23,6 +23,9 @@
 namespace geo_tuner::panels
 {
 
+class TunerPanel;
+class GainPanel;
+
 class GeoFieldPanel : public rviz_common::Panel
 {
   Q_OBJECT
@@ -38,6 +41,8 @@ public:
 private:
   QTabWidget * tabs_{nullptr};
   std::vector<std::pair<QString, rviz_common::Panel *>> children_;
+  TunerPanel * tuner_{nullptr};
+  GainPanel * gains_{nullptr};
 };
 
 }  // namespace geo_tuner::panels

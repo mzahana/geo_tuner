@@ -197,6 +197,13 @@ private:
   double episode_min_time_{0.0};    // earliest adaptive stop [s]
   std::optional<Gains> gains_;
   std::optional<Gains> safe_gains_;
+  // Frozen at baseline capture; the "old" column of the panel's result view.
+  // safe_gains_ won't do: it is promoted after every validated bucket.
+  std::optional<Gains> baseline_gains_;
+  std::optional<double> baseline_yaw_tau_;
+  // Per-axis one-line outcome of the last finished bucket ("alpha 1.18" or
+  // "kept: ..."), published in health for the panel's result view.
+  std::map<std::string, std::string> session_result_;
   std::vector<YAML::Node> results_;
   std::string abort_reason_;
   std::string diagnosis_;
