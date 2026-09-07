@@ -673,7 +673,11 @@ position loop, so the estimator cannot interact with it dynamically
 ~/src/ihunter_fixes/
 ├── TUNING_PLAN.md                  <- this document
 └── geo_tuner/                      <- ROS 2 package (ament_cmake, C++)
-    ├── README.md                   <- command-level usage
+    ├── README.md                   <- quick start (build, sim check, the
+    │                                  four steps of a campaign)
+    ├── docs/ARCHITECTURE.md        <- package layout, nodes, launch args,
+    │                                  parameters, ROS interface, outputs
+    ├── docs/CONTROLLER_NOTES.md    <- mav_controllers_ros quirks
     ├── include/geo_tuner/core/, src/core/
     │                               <- pure logic: gain_design, step_fit,
     │                                  first_order_fit, least_squares, safety,
