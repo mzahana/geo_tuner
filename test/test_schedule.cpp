@@ -126,12 +126,65 @@ TEST(LegSchedule, AxisChangeRecentres)
   c.setpoint_yaw = 0.5;
   c.axes = {"x", "y"};
   const std::array<double, 3> hover{0.0, 0.0, 3.0};
-  EXPECT_FALSE(c.advance_axis(hover));   // x -> y, no wrap
+  // Recentring returns to the hover point AND the heading the session was
+  // handed over at -- not to yaw 0, which would snap the vehicle to north.
+  const double hover_yaw = 1.3;
+  EXPECT_FALSE(c.advance_axis(hover, hover_yaw));   // x -> y, no wrap
   EXPECT_EQ(c.leg_offset, 0.0);
-  EXPECT_EQ(c.setpoint_yaw, 0.0);
+  EXPECT_EQ(c.setpoint_yaw, hover_yaw);
   EXPECT_EQ(c.setpoint, hover);
-  EXPECT_TRUE(c.advance_axis(hover));    // y -> wrap back to x
+  EXPECT_TRUE(c.advance_axis(hover, hover_yaw));    // y -> wrap back to x
   EXPECT_EQ(c.axis_idx, 0u);
+}
+
+TEST(ZLegClearance, UpLegAlwaysClears)
+{
+  // The guard is about flying at the ground; upward legs never do, whatever
+  // the altitude.
+  EXPECT_TRUE(z_leg_clears_floor(1.0, 0.4, 0.4, 0.5, 2.0));
+  EXPECT_TRUE(z_leg_clears_floor(1.0, 0.0, 0.4, 0.5, 2.0));
+}
+
+TEST(ZLegClearance, DownLegCountsTheStepAndItsOvershoot)
+{
+  // 5 m AGL, 0.4 m step, 50% overshoot allowance -> bottom of the manoeuvre
+  // is 5 - 0.4 - 0.2 = 4.4 m. (Tested either side of the boundary, not on
+  // it: 5.0 - 0.4 - 0.2 is 4.3999999999999995 in binary floating point.)
+  EXPECT_TRUE(z_leg_clears_floor(5.0, -0.4, 0.4, 0.5, 4.39));
+  EXPECT_FALSE(z_leg_clears_floor(5.0, -0.4, 0.4, 0.5, 4.41));
+  // The same altitude and floor, but a bigger vertical step (a live
+  // parameter), no longer clears: 5 - 1.0 - 0.5 = 3.5.
+  EXPECT_TRUE(z_leg_clears_floor(5.0, -1.0, 1.0, 0.5, 3.49));
+  EXPECT_FALSE(z_leg_clears_floor(5.0, -1.0, 1.0, 0.5, 3.51));
+  // The field case that started this: judged on odometry z (-3.8) rather
+  // than AGL (2.8), every one of these answers is wrong.
+  EXPECT_TRUE(z_leg_clears_floor(2.8, -0.4, 0.4, 0.5, 2.0));
+  EXPECT_FALSE(z_leg_clears_floor(-3.8, -0.4, 0.4, 0.5, 2.0));
+}
+
+TEST(Ramp, NeverOvershootsAndStopsExactly)
+{
+  EXPECT_DOUBLE_EQ(ramp_toward(0.0, 10.0, 0.1), 0.1);
+  EXPECT_DOUBLE_EQ(ramp_toward(0.0, -10.0, 0.1), -0.1);
+  // Inside one step, land exactly on the target (no limit cycle).
+  EXPECT_DOUBLE_EQ(ramp_toward(9.95, 10.0, 0.1), 10.0);
+  // A zero rate means "no ramp": jump. Callers opt in deliberately.
+  EXPECT_DOUBLE_EQ(ramp_toward(0.0, 10.0, 0.0), 10.0);
+}
+
+TEST(Ramp, VectorMovesAlongTheLineOfTravel)
+{
+  const std::array<double, 3> from{0.0, 0.0, 0.0};
+  const std::array<double, 3> to{3.0, 4.0, 0.0};   // 5 m away
+  const auto next = ramp_toward(from, to, 1.0);
+  EXPECT_NEAR(next[0], 0.6, 1e-9);
+  EXPECT_NEAR(next[1], 0.8, 1e-9);
+  EXPECT_NEAR(next[2], 0.0, 1e-9);
+  // ...and 5 such steps arrive, without overshoot
+  auto p = from;
+  for (int i = 0; i < 5; ++i) {p = ramp_toward(p, to, 1.0);}
+  EXPECT_NEAR(p[0], to[0], 1e-9);
+  EXPECT_NEAR(p[1], to[1], 1e-9);
 }
 
 TEST(LegSchedule, ClassicScheduleAlwaysStepsOut)

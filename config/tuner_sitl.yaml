@@ -10,7 +10,13 @@
     setpoint_topic: "geometric_controller/multi_dof_setpoint"
     odom_topic: "geometric_controller/odom"
 
+    # SITL flies with a pilot in the loop (px4 takeoff + OFFBOARD), so the
+    # hover point is captured at handover like the field. hover_position is
+    # read only in "fixed" mode.
+    hover_mode: "capture"
     hover_position: [0.0, 0.0, 2.5]
+    min_tuning_altitude: 3.0    # m AGL
+    agl_topic: "mavros/global_position/rel_alt"
 
     step_size: 0.5
     step_size_z: 0.4
@@ -83,7 +89,7 @@
       max_tilt: 0.6
       max_pos_error: 2.5
       max_velocity: 4.0
-      min_altitude: 0.8
+      min_altitude: 1.0     # m AGL
       max_altitude: 20.0
       odom_timeout: 0.4
       osc_rate_rms: 1.2

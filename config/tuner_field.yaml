@@ -9,9 +9,40 @@
     setpoint_topic: "geometric_controller/multi_dof_setpoint"
     odom_topic: "geometric_controller/odom"
 
-    # Where to hover while tuning (odom/local frame!). Pick >= 10 m AGL
-    # over clear ground and inside your geofence.
-    hover_position: [0.0, 0.0, 10.0]
+    # Where the session hovers while it tunes.
+    #
+    # "capture": the point the PILOT hands the vehicle over at, taken the
+    # instant OFFBOARD engages. The setpoint never jumps, the vehicle is
+    # never commanded to fly anywhere to start, and you choose the spot by
+    # flying to it. hover_position is NOT read in this mode.
+    #
+    # "fixed" (simulators only): fly to hover_position first, ramped at
+    # hover_approach_speed. On a real aircraft this commands a manoeuvre
+    # the pilot did not ask for.
+    hover_mode: "capture"
+    hover_position: [0.0, 0.0, 10.0]   # fixed mode only; ignored here
+    hover_approach_speed: 0.7   # m/s, fixed mode's ramp -- never a jump
+    hover_approach_yaw_rate: 0.5  # rad/s
+
+    # Altitude gate: the session refuses to start below this height above
+    # ground and holds position instead. It NEVER climbs to reach it --
+    # hand the vehicle over above it. Live-settable from the RViz Tuner
+    # panel ("Working altitude"), which confirms before it applies.
+    #
+    # The effective gate is this or (safety.min_altitude + the room a
+    # downward z step needs), whichever is higher; the node logs both.
+    min_tuning_altitude: 6.0    # m AGL
+    # A z step overshoots its commanded amplitude; the clearance a down
+    # leg needs above the floor is step_size_z * (1 + this).
+    z_step_margin: 0.5
+
+    # Height above ground comes from this topic, NOT from odometry z: PX4's
+    # local frame origin sat 6.6 m below the ground in the first field
+    # session, which put every altitude limit 6.6 m out. Empty falls back
+    # to (odom z - ground_z).
+    agl_topic: "mavros/global_position/rel_alt"
+    agl_timeout: 2.0            # s before that topic counts as gone
+    ground_z: 0.0               # m, odom-frame z of the ground (fallback only)
 
     step_size: 0.5          # m, lateral test steps
     step_size_z: 0.4        # m, vertical test steps
@@ -85,7 +116,9 @@
       max_tilt: 0.6         # rad; RC takeover threshold is the pilot
       max_pos_error: 2.0    # m from active setpoint
       max_velocity: 4.0     # m/s
-      min_altitude: 5.0     # m — well above ground for field tuning
+      min_altitude: 2.0     # m AGL — hard floor; the working altitude is
+                            # min_tuning_altitude above, and the gate keeps
+                            # a down z step clear of this
       max_altitude: 40.0
       odom_timeout: 0.4     # s without odometry -> abort
       osc_rate_rms: 1.2     # rad/s roll/pitch rate RMS -> abort

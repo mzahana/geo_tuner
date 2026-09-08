@@ -40,6 +40,7 @@
 #include <nav_msgs/msg/odometry.hpp>
 #include <rcl_interfaces/srv/get_parameters.hpp>
 #include <rcl_interfaces/srv/set_parameters.hpp>
+#include <std_msgs/msg/float64.hpp>
 #include <std_msgs/msg/string.hpp>
 #include <std_srvs/srv/trigger.hpp>
 #include <trajectory_msgs/msg/multi_dof_joint_trajectory.hpp>
@@ -59,6 +60,7 @@ enum class TunerState
   WAIT_ODOM,
   WAIT_ENABLE,
   WAIT_OFFBOARD,
+  TOO_LOW,
   GOTO_HOVER,
   SETTLE,
   STEP,
@@ -112,6 +114,7 @@ private:
   void st_wait_odom(double now);
   void st_wait_enable(double now);
   void st_wait_offboard(double now);
+  void st_too_low(double now);
   void st_goto_hover(double now);
   void st_settle(double now);
   void st_step(double now);
@@ -130,6 +133,45 @@ private:
   void set_trim_diagnosis();
   void abort(const std::string & reason);
 
+  // ---- hover point and altitude ----
+
+  /// Fix the point this session will tune about: in "capture" mode the
+  /// vehicle's own position and heading at the moment it starts flying
+  /// (so the handover is bumpless and the pilot chooses the spot), in
+  /// "fixed" mode the hover_position/hover_yaw parameters.
+  void capture_hover();
+
+  /// Freeze the commanded setpoint where the vehicle is now. The only
+  /// safe thing to command when something has gone wrong: it holds, and
+  /// it can never be a large step.
+  void hold_here();
+
+  /// Height above ground [m], from the AGL topic when it is fresh, else
+  /// odometry z minus the surveyed ground_z. Nullopt without odometry.
+  std::optional<double> agl_now() const;
+
+  /// Which of those two the number came from, for health/logs.
+  const char * agl_source() const;
+
+  /// AGL the vehicle would tune at: the hover point's height, obtained by
+  /// shifting the current AGL by the hover point's offset in odometry z.
+  std::optional<double> hover_agl() const;
+
+  /// Height the vehicle must clear the safety floor by to fly a downward
+  /// z step: the step itself plus the transient that undershoots past it.
+  double z_step_clearance() const;
+
+  /// Lowest AGL a session may tune at: the operator's min_tuning_altitude,
+  /// or the floor plus the room a downward z step needs, whichever binds.
+  double min_start_altitude() const;
+
+  /// (ok, reason): may this session start tuning at the hover point?
+  std::pair<bool, std::string> altitude_gate() const;
+
+  /// Common entry into the flying phase from WAIT_ODOM / WAIT_OFFBOARD:
+  /// captures the hover point and applies the altitude gate.
+  void begin_flying();
+
   // ---- ground-station control ----
   void srv_start(Trigger::Request::SharedPtr, Trigger::Response::SharedPtr res);
   void srv_abort(Trigger::Request::SharedPtr, Trigger::Response::SharedPtr res);
@@ -145,6 +187,7 @@ private:
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_pub_;
   rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticStatus>::SharedPtr health_pub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
+  rclcpp::Subscription<std_msgs::msg::Float64>::SharedPtr agl_sub_;
 #ifdef GEO_TUNER_HAVE_MAVROS_MSGS
   rclcpp::Subscription<mavros_msgs::msg::State>::SharedPtr state_sub_;
 #endif
@@ -157,7 +200,28 @@ private:
 
   // ---- configuration ----
   double rate_hz_{50.0};
+  // "capture" (default): tune about wherever the pilot hands the vehicle
+  // over. "fixed": fly to hover_position first -- for simulators, which
+  // have no pilot. hover_position/hover_yaw are read only in fixed mode.
+  std::string hover_mode_{"capture"};
   std::vector<double> hover_{0.0, 0.0, 3.0};
+  double hover_yaw_param_{0.0};
+  // Speed the setpoint is allowed to travel at when it has to move to a
+  // distant point. The controller sees a position error, not a
+  // trajectory: a setpoint that teleports is a step command, and a large
+  // one saturates the vehicle at max_accel until it arrives.
+  double hover_speed_{0.7};        // m/s
+  double hover_yaw_rate_{0.5};     // rad/s
+  // The session refuses to start below this height above ground, and says
+  // so instead of flying anywhere. Live-settable (RViz tuner panel).
+  double min_tuning_altitude_{5.0};   // m AGL
+  // Fallback AGL when no AGL topic is arriving: odometry z minus this.
+  double ground_z_{0.0};
+  double agl_timeout_{2.0};        // s before the AGL topic counts as gone
+  // A z step does not stop at its commanded amplitude: the response
+  // overshoots it. The clearance a downward leg needs above the safety
+  // floor is the step times (1 + this).
+  double z_step_margin_{0.5};
   double settle_time_{4.0};
   double hover_timeout_{20.0};
   double episode_time_{6.0};
@@ -189,6 +253,19 @@ private:
   std::string offboard_mode_{"OFFBOARD"};
 
   // ---- state ----
+  /// The point this session tunes about, and the heading it holds there.
+  /// Steps are offsets from these; nothing else is ever commanded.
+  std::array<double, 3> hover_pt_{0.0, 0.0, 3.0};
+  double hover_yaw_{0.0};
+  bool hover_captured_{false};
+  // GOTO_HOVER: the ramp's own travel time, added to hover_timeout so a
+  // long (fixed-mode) approach is not reported as a failure to arrive.
+  double goto_t0_{-1.0};
+  double goto_eta_{0.0};
+  std::optional<double> agl_msg_;
+  double agl_msg_t_{0.0};
+  bool agl_fresh_{false};
+  double too_low_log_t_{0.0};
   TuningSchedule sched_;
   SafetyMonitor safety_;
   TunerState state_{TunerState::WAIT_ODOM};

@@ -83,6 +83,7 @@ const char * to_string(TunerState s)
     case TunerState::WAIT_ODOM: return "WAIT_ODOM";
     case TunerState::WAIT_ENABLE: return "WAIT_ENABLE";
     case TunerState::WAIT_OFFBOARD: return "WAIT_OFFBOARD";
+    case TunerState::TOO_LOW: return "TOO_LOW";
     case TunerState::GOTO_HOVER: return "GOTO_HOVER";
     case TunerState::SETTLE: return "SETTLE";
     case TunerState::STEP: return "STEP";
@@ -96,7 +97,8 @@ const char * to_string(TunerState s)
 
 bool is_active_state(TunerState s)
 {
-  return s == TunerState::GOTO_HOVER || s == TunerState::SETTLE ||
+  return s == TunerState::TOO_LOW || s == TunerState::GOTO_HOVER ||
+         s == TunerState::SETTLE ||
          s == TunerState::STEP || s == TunerState::ANALYZE ||
          s == TunerState::UPDATE_GAINS;
 }
@@ -112,7 +114,37 @@ TuningConductor::TuningConductor(const rclcpp::NodeOptions & options)
   const auto odom_topic =
     declare_parameter<std::string>("odom_topic", "geometric_controller/odom");
   rate_hz_ = declare_parameter<double>("rate_hz", 50.0);
+  // Where the session hovers while it tunes.
+  //
+  // "capture" is the field default and the reason this node no longer
+  // commands a climb: the hover point IS the point the pilot hands the
+  // vehicle over at, captured the instant the session starts flying, so
+  // the setpoint never jumps. "fixed" keeps the old behaviour for
+  // simulators, which have no pilot to hand anything over -- and even
+  // there the setpoint now ramps to the point instead of stepping to it.
+  hover_mode_ = declare_parameter<std::string>("hover_mode", "capture");
+  if (hover_mode_ != "capture" && hover_mode_ != "fixed") {
+    RCLCPP_ERROR(
+      get_logger(), "hover_mode must be \"capture\" or \"fixed\", got \"%s\"; using capture",
+      hover_mode_.c_str());
+    hover_mode_ = "capture";
+  }
   hover_ = declare_parameter<std::vector<double>>("hover_position", {0.0, 0.0, 3.0});
+  hover_yaw_param_ = declare_parameter<double>("hover_yaw", 0.0);          // rad, fixed mode
+  hover_speed_ = declare_parameter<double>("hover_approach_speed", 0.7);   // m/s
+  hover_yaw_rate_ = declare_parameter<double>("hover_approach_yaw_rate", 0.5);  // rad/s
+  // Altitude gate. The session refuses to start below this height above
+  // ground and holds position instead -- it never climbs to reach it.
+  min_tuning_altitude_ = declare_parameter<double>("min_tuning_altitude", 5.0);  // m AGL
+  z_step_margin_ = declare_parameter<double>("z_step_margin", 0.5);
+  // AGL source. Odometry z is NOT height above ground: PX4's local frame
+  // origin sat 6.6 m below the ground in the first field session, which
+  // put every altitude limit 6.6 m out. rel_alt is height above the home
+  // point; ground_z is the fallback offset when no such topic exists.
+  const auto agl_topic =
+    declare_parameter<std::string>("agl_topic", "mavros/global_position/rel_alt");
+  agl_timeout_ = declare_parameter<double>("agl_timeout", 2.0);            // s
+  ground_z_ = declare_parameter<double>("ground_z", 0.0);                  // m, odom frame
   sched_.step_size = declare_parameter<double>("step_size", 0.5);        // m
   sched_.step_size_z = declare_parameter<double>("step_size_z", 0.4);    // m
   settle_time_ = declare_parameter<double>("settle_time", 4.0);          // s before each step
@@ -266,6 +298,14 @@ TuningConductor::TuningConductor(const rclcpp::NodeOptions & options)
   odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
     odom_topic, rclcpp::SensorDataQoS(),
     std::bind(&TuningConductor::odom_cb, this, std::placeholders::_1));
+  if (!agl_topic.empty()) {
+    agl_sub_ = create_subscription<std_msgs::msg::Float64>(
+      agl_topic, rclcpp::SensorDataQoS(),
+      [this](const std_msgs::msg::Float64::SharedPtr msg) {
+        agl_msg_ = msg->data;
+        agl_msg_t_ = now_s();
+      });
+  }
 #ifdef GEO_TUNER_HAVE_MAVROS_MSGS
   if (require_offboard_) {
     state_sub_ = create_subscription<mavros_msgs::msg::State>(
@@ -291,7 +331,10 @@ TuningConductor::TuningConductor(const rclcpp::NodeOptions & options)
 
   // ---- state ----
   state_t0_ = now_s();
-  std::copy_n(hover_.begin(), 3, sched_.setpoint.begin());
+  std::copy_n(hover_.begin(), 3, hover_pt_.begin());
+  hover_yaw_ = hover_yaw_param_;
+  sched_.setpoint = hover_pt_;
+  sched_.setpoint_yaw = hover_yaw_;
 
   // Session control from the ground. Without these a session could only be
   // started by launching the node and stopped by killing it -- over a
@@ -341,14 +384,25 @@ TuningConductor::TuningConductor(const rclcpp::NodeOptions & options)
     std::chrono::milliseconds(200), std::bind(&TuningConductor::publish_health, this));
 
   std::ostringstream hov;
-  hov << "[" << fmt(hover_[0], 2) << ", " << fmt(hover_[1], 2) << ", "
-      << fmt(hover_[2], 2) << "]";
+  if (hover_mode_ == "fixed") {
+    hov << "fixed [" << fmt(hover_[0], 2) << ", " << fmt(hover_[1], 2) << ", "
+        << fmt(hover_[2], 2) << "] (ramped at " << fmt(hover_speed_, 2) << " m/s)";
+  } else {
+    hov << "captured where " << offboard_mode_ << " is engaged";
+  }
   std::vector<std::string> ladder;
   for (double w : wn_ladder_) {ladder.push_back(fmt(w, 2));}
   RCLCPP_INFO(
     get_logger(), "Tuning conductor up. axes=[%s] wn_ladder=[%s] zeta=%s hover=%s",
     join(sched_.axes, ", ").c_str(), join(ladder, ", ").c_str(),
     fmt(zeta_target_, 2).c_str(), hov.str().c_str());
+  RCLCPP_INFO(
+    get_logger(),
+    "Altitude gate: start at >= %s m AGL (min_tuning_altitude %s, safety floor %s "
+    "+ %s for a %s m down step)",
+    fmt(min_start_altitude(), 2).c_str(), fmt(min_tuning_altitude_, 2).c_str(),
+    fmt(safety_.limits().min_altitude, 2).c_str(), fmt(z_step_clearance(), 2).c_str(),
+    fmt(sched_.step_size_z, 2).c_str());
 }
 
 // ---------------------------------------------------------------------
@@ -370,6 +424,39 @@ rcl_interfaces::msg::SetParametersResult TuningConductor::on_set_parameters(
   const std::map<std::string, bool> live{
     {"step_size", false}, {"step_size_z", false}, {"yaw_step", true}};
 
+  // The working altitude is the other live knob: the panel sets it, and it
+  // is refused rather than silently clipped when it leaves no room for a
+  // downward z step above the safety floor.
+  for (const auto & p : params) {
+    if (p.get_name() != "min_tuning_altitude") {continue;}
+    if (p.get_type() != rclcpp::ParameterType::PARAMETER_DOUBLE &&
+      p.get_type() != rclcpp::ParameterType::PARAMETER_INTEGER)
+    {
+      result.successful = false;
+      result.reason = "min_tuning_altitude must be a number";
+      return result;
+    }
+    const double value = p.as_double();
+    const double need = safety_.limits().min_altitude + z_step_clearance();
+    if (value < need) {
+      result.successful = false;
+      result.reason =
+        "min_tuning_altitude " + fmt(value, 2) + " m leaves no room for a " +
+        fmt(sched_.step_size_z, 2) + " m down step above the " +
+        fmt(safety_.limits().min_altitude, 2) + " m safety floor; need >= " +
+        fmt(need, 2) + " m";
+      RCLCPP_WARN(get_logger(), "rejected %s", result.reason.c_str());
+      return result;
+    }
+    if (value > safety_.limits().max_altitude) {
+      result.successful = false;
+      result.reason =
+        "min_tuning_altitude " + fmt(value, 2) + " m is above safety.max_altitude " +
+        fmt(safety_.limits().max_altitude, 2) + " m";
+      return result;
+    }
+  }
+
   for (const auto & p : params) {
     const auto it = live.find(p.get_name());
     if (it == live.end()) {continue;}
@@ -381,6 +468,22 @@ rcl_interfaces::msg::SetParametersResult TuningConductor::on_set_parameters(
       return result;
     }
     const double value = p.as_double();
+    // A bigger vertical step lowers the bottom of the manoeuvre. Refuse
+    // one that would fly the current hover point into the floor rather
+    // than discovering it one down-leg later.
+    if (p.get_name() == "step_size_z" && is_active_state(state_)) {
+      const auto agl = hover_agl();
+      const double bottom = value * (1.0 + std::max(0.0, z_step_margin_));
+      if (agl && *agl - bottom < safety_.limits().min_altitude) {
+        result.successful = false;
+        result.reason =
+          "step_size_z " + fmt(value, 2) + " m would take the vehicle to " +
+          fmt(*agl - bottom, 2) + " m AGL, below the " +
+          fmt(safety_.limits().min_altitude, 2) + " m floor; climb or use a smaller step";
+        RCLCPP_WARN(get_logger(), "rejected %s", result.reason.c_str());
+        return result;
+      }
+    }
     const auto [ok, note] =
       sched_.validate_step(value, it->second, safety_.limits().max_pos_error);
     if (!ok) {
@@ -405,6 +508,12 @@ rcl_interfaces::msg::SetParametersResult TuningConductor::on_set_parameters(
       sched_.step_size_z = p.as_double();
     } else if (n == "yaw_step") {
       sched_.yaw_step = p.as_double();
+    } else if (n == "min_tuning_altitude") {
+      min_tuning_altitude_ = p.as_double();
+      status(
+        "min_tuning_altitude -> " + fmt(min_tuning_altitude_, 2) +
+        " m AGL (start gate " + fmt(min_start_altitude(), 2) + " m)");
+      continue;
     } else {
       continue;
     }
@@ -446,7 +555,108 @@ void TuningConductor::odom_cb(const nav_msgs::msg::Odometry::SharedPtr msg)
     msg->pose.pose.orientation.y, msg->pose.pose.orientation.z};
   s.body_rates = {msg->twist.twist.angular.x, msg->twist.twist.angular.y,
     msg->twist.twist.angular.z};
+  // Altitude limits are judged on height above ground, not odometry z.
+  agl_fresh_ = agl_msg_ && (now_s() - agl_msg_t_) < agl_timeout_;
+  s.agl = agl_fresh_ ? *agl_msg_ : s.pos[2] - ground_z_;
   sched_.odom = s;
+}
+
+std::optional<double> TuningConductor::agl_now() const
+{
+  if (!sched_.odom) {return std::nullopt;}
+  return sched_.odom->agl;
+}
+
+const char * TuningConductor::agl_source() const
+{
+  return agl_fresh_ ? "agl_topic" : "odom_z-ground_z";
+}
+
+std::optional<double> TuningConductor::hover_agl() const
+{
+  const auto agl = agl_now();
+  if (!agl || !sched_.odom) {return std::nullopt;}
+  // The hover point is expressed in the odometry frame; shift the measured
+  // AGL by how far above the vehicle that point sits.
+  return *agl + (hover_pt_[2] - sched_.odom->pos[2]);
+}
+
+double TuningConductor::z_step_clearance() const
+{
+  // A downward z leg commands the setpoint step_size_z below the hover
+  // point, and the response undershoots that by a fraction of the step
+  // before it settles. Both scale with the step amplitude, which is a live
+  // parameter -- so this moves whenever the operator changes it.
+  return sched_.step_size_z * (1.0 + std::max(0.0, z_step_margin_));
+}
+
+double TuningConductor::min_start_altitude() const
+{
+  // Two independent requirements, whichever binds: the operator's chosen
+  // working altitude, and the room a downward z step needs above the
+  // safety floor. Tuning at the floor with a 0.4 m step means flying into
+  // it.
+  return std::max(
+    min_tuning_altitude_, safety_.limits().min_altitude + z_step_clearance());
+}
+
+std::pair<bool, std::string> TuningConductor::altitude_gate() const
+{
+  const auto agl = hover_agl();
+  if (!agl) {return {false, "no altitude yet"};}
+  const double need = min_start_altitude();
+  if (*agl >= need) {return {true, ""};}
+  const double floor_need = safety_.limits().min_altitude + z_step_clearance();
+  std::string why = "too low to tune: " + fmt(*agl, 1) + " m AGL, need " +
+    fmt(need, 1) + " m";
+  why += need > min_tuning_altitude_ ?
+    " (safety floor " + fmt(safety_.limits().min_altitude, 1) + " m + " +
+    fmt(z_step_clearance(), 1) + " m for a " + fmt(sched_.step_size_z, 2) +
+    " m down step)" :
+    " (min_tuning_altitude; the z step needs " + fmt(floor_need, 1) + " m)";
+  return {false, why};
+}
+
+void TuningConductor::capture_hover()
+{
+  if (hover_mode_ == "fixed") {
+    std::copy_n(hover_.begin(), 3, hover_pt_.begin());
+    hover_yaw_ = hover_yaw_param_;
+  } else if (sched_.odom) {
+    hover_pt_ = sched_.odom->pos;
+    hover_yaw_ = TuningSchedule::yaw_of(sched_.odom->quat);
+  }
+  hover_captured_ = true;
+  sched_.leg_offset = 0.0;
+}
+
+void TuningConductor::hold_here()
+{
+  if (!sched_.odom) {return;}
+  sched_.setpoint = sched_.odom->pos;
+  sched_.setpoint_yaw = TuningSchedule::yaw_of(sched_.odom->quat);
+  sched_.leg_offset = 0.0;
+}
+
+void TuningConductor::begin_flying()
+{
+  capture_hover();
+  const auto [ok, why] = altitude_gate();
+  if (!ok) {
+    // Refuse, and hold exactly where the vehicle is. The vehicle is in
+    // OFFBOARD under our setpoints now, so "refuse" cannot mean "stop
+    // publishing"; it means "command the point it is already at".
+    hold_here();
+    too_low_log_t_ = now_s();
+    status(
+      why + ". Take manual control, climb, then re-engage " + offboard_mode_ +
+      " -- or lower min_tuning_altitude from the ground station.");
+    goto_state(TunerState::TOO_LOW);
+    return;
+  }
+  // In capture mode the setpoint is already the hover point; in fixed mode
+  // GOTO_HOVER ramps to it.
+  goto_state(TunerState::GOTO_HOVER);
 }
 
 void TuningConductor::publish_setpoint()
@@ -542,7 +752,12 @@ void TuningConductor::tick()
   // deliberately does NOT run in WAIT_OFFBOARD: there the pilot / another
   // mode is in command and e.g. tilt limits don't apply.
   if (sched_.odom && is_active_state(state_)) {
-    auto violations = safety_.check(*sched_.odom, sched_.setpoint);
+    // TOO_LOW is the one state that is knowingly under the floor: it is
+    // holding position because it refused to start there. Every other
+    // limit still applies, and the floor applies again the moment it
+    // starts flying episodes.
+    auto violations = safety_.check(
+      *sched_.odom, sched_.setpoint, /*check_min_altitude=*/state_ != TunerState::TOO_LOW);
     const auto stale = safety_.check_stale(now);
     violations.insert(violations.end(), stale.begin(), stale.end());
     if (!violations.empty()) {
@@ -576,6 +791,7 @@ void TuningConductor::tick()
     case TunerState::WAIT_ODOM: st_wait_odom(now); break;
     case TunerState::WAIT_ENABLE: st_wait_enable(now); break;
     case TunerState::WAIT_OFFBOARD: st_wait_offboard(now); break;
+    case TunerState::TOO_LOW: st_too_low(now); break;
     case TunerState::GOTO_HOVER: st_goto_hover(now); break;
     case TunerState::SETTLE: st_settle(now); break;
     case TunerState::STEP: st_step(now); break;
@@ -616,7 +832,7 @@ void TuningConductor::st_wait_enable(double now)
   if (baseline_read_) {
     if (start_requested_) {
       if (in_offboard()) {
-        goto_state(TunerState::GOTO_HOVER);
+        begin_flying();
       } else {
         status("Start requested; waiting for PX4 mode " + offboard_mode_);
         goto_state(TunerState::WAIT_OFFBOARD);
@@ -717,7 +933,6 @@ void TuningConductor::st_wait_enable(double now)
           fmt(yaw_T_target_, 2) + "s)");
       }
     }
-    std::copy_n(hover_.begin(), 3, sched_.setpoint.begin());
     baseline_read_ = true;
     if (require_enable_ && !start_requested_) {
       status("Gains read. Waiting for the ~/start service (require_enable is set)");
@@ -729,32 +944,76 @@ void TuningConductor::st_wait_enable(double now)
         " (setpoint stream active; switch modes to start)");
       goto_state(TunerState::WAIT_OFFBOARD);
     } else {
-      goto_state(TunerState::GOTO_HOVER);
+      begin_flying();
     }
   }
 }
 
 void TuningConductor::st_wait_offboard(double)
 {
-  // Track the current position so the eventual OFFBOARD engage is
-  // bumpless; the session then proceeds via GOTO_HOVER.
+  // Track the vehicle's current pose -- position AND heading -- so that
+  // the setpoint the controller picks up the instant OFFBOARD engages is
+  // the one it is already holding. Tracking position but not yaw still
+  // commands a snap to north on handover.
   if (sched_.odom) {
     sched_.setpoint = sched_.odom->pos;
+    sched_.setpoint_yaw = TuningSchedule::yaw_of(sched_.odom->quat);
   }
   if (in_offboard()) {
     status(
       offboard_mode_ + " engaged; resuming (rung " + std::to_string(rung_ + 1) + "/" +
       std::to_string(wn_ladder_.size()) + ", axis " + sched_.axes[sched_.axis_idx] + ")");
-    std::copy_n(hover_.begin(), 3, sched_.setpoint.begin());
-    sched_.leg_offset = 0.0;
-    sched_.setpoint_yaw = 0.0;
+    begin_flying();
+  }
+}
+
+void TuningConductor::st_too_low(double now)
+{
+  // Holding where the pilot handed over, because that was below the
+  // working altitude. Nothing is commanded to move: the way out is the
+  // pilot climbing (which needs manual control, so the mode change back
+  // to OFFBOARD re-enters here) or the operator lowering the gate.
+  const auto [ok, why] = altitude_gate();
+  if (ok) {
+    capture_hover();
+    status(
+      "Altitude gate satisfied (" + fmt(hover_agl().value_or(0.0), 1) +
+      " m AGL); starting");
     goto_state(TunerState::GOTO_HOVER);
+    return;
+  }
+  if (now - too_low_log_t_ > 5.0) {
+    too_low_log_t_ = now;
+    status(why, false);
   }
 }
 
 void TuningConductor::st_goto_hover(double now)
 {
   if (!sched_.odom) {return;}
+  // Walk the setpoint to the hover point at a bounded speed. In capture
+  // mode it is already there and this does nothing; in fixed mode it is
+  // the difference between a commanded flight and a step the size of the
+  // whole distance, which saturates the controller at max_accel.
+  const double dt = 1.0 / std::max(rate_hz_, 1.0);
+  if (goto_t0_ != state_t0_) {
+    goto_t0_ = state_t0_;
+    double d = 0.0;
+    for (int i = 0; i < 3; ++i) {
+      const double e = hover_pt_[i] - sched_.setpoint[i];
+      d += e * e;
+    }
+    goto_eta_ = std::sqrt(d) / std::max(hover_speed_, 1e-3) +
+      std::abs(wrap_angle(hover_yaw_ - sched_.setpoint_yaw)) /
+      std::max(hover_yaw_rate_, 1e-3);
+  }
+  sched_.setpoint = ramp_toward(sched_.setpoint, hover_pt_, hover_speed_ * dt);
+  sched_.setpoint_yaw = sched_.setpoint_yaw + ramp_toward(
+    0.0, wrap_angle(hover_yaw_ - sched_.setpoint_yaw), hover_yaw_rate_ * dt);
+  const bool ramp_done =
+    std::abs(sched_.setpoint[0] - hover_pt_[0]) < 1e-6 &&
+    std::abs(sched_.setpoint[1] - hover_pt_[1]) < 1e-6 &&
+    std::abs(sched_.setpoint[2] - hover_pt_[2]) < 1e-6;
   double sq = 0.0;
   for (int i = 0; i < 3; ++i) {
     const double d = sched_.odom->pos[i] - sched_.setpoint[i];
@@ -765,7 +1024,7 @@ void TuningConductor::st_goto_hover(double now)
     sched_.odom->vel[0] * sched_.odom->vel[0] +
     sched_.odom->vel[1] * sched_.odom->vel[1] +
     sched_.odom->vel[2] * sched_.odom->vel[2]);
-  if (err < hover_capture_radius_ && speed < hover_capture_speed_) {
+  if (ramp_done && err < hover_capture_radius_ && speed < hover_capture_speed_) {
     status(
       "At hover point; settling (<= " + fmt(settle_time_, 1) + "s) (rung " +
       std::to_string(rung_ + 1) + "/" + std::to_string(wn_ladder_.size()) +
@@ -777,7 +1036,7 @@ void TuningConductor::st_goto_hover(double now)
   // acceleration feedforward trim, the bounded stand-in for integral
   // action. The residual force each axis is missing equals kx * offset
   // (that's what the feedback is currently supplying).
-  if (now - state_t0_ > 5.0 && speed < 0.3 && gains_) {
+  if (ramp_done && now - state_t0_ > 5.0 && speed < 0.3 && gains_) {
     bool updated = false;
     for (const auto & ax : {std::string("x"), std::string("y"), std::string("z")}) {
       const int i = axis_index(ax);
@@ -808,10 +1067,10 @@ void TuningConductor::st_goto_hover(double now)
       return;
     }
   }
-  if (now - state_t0_ > hover_timeout_) {
+  if (now - state_t0_ > hover_timeout_ + goto_eta_) {
     set_trim_diagnosis();
     abort(
-      "could not reach hover point in " + fmt(hover_timeout_, 0) + "s" +
+      "could not reach hover point in " + fmt(hover_timeout_ + goto_eta_, 0) + "s" +
       (diagnosis_.empty() ? std::string() : "; " + diagnosis_));
   }
 }
@@ -848,18 +1107,38 @@ void TuningConductor::st_settle(double now)
     step = new_off - sched_.leg_offset;
     sched_.leg_offset = new_off;
     pre_step_yaw_ = TuningSchedule::yaw_of(sched_.odom->quat);
-    std::copy_n(hover_.begin(), 3, sched_.setpoint.begin());
-    sched_.setpoint_yaw = new_off;
+    sched_.setpoint = hover_pt_;
+    sched_.setpoint_yaw = wrap_angle(hover_yaw_ + new_off);
     wn_equiv = 1.0 / std::max(yaw_T_target_, 1e-3);
     status("Yaw step " + fmt(step, 2) + " rad");
   } else {
     const int i = axis_index(ax);
     const double mag = ax == "z" ? sched_.step_size_z : sched_.step_size;
-    const double new_off = sched_.next_leg(mag);
+    double new_off = sched_.next_leg(mag);
+    // A downward z leg is the one manoeuvre that flies at the ground. If
+    // the leg the schedule wants would put the commanded point (plus the
+    // undershoot it will overshoot to) under the safety floor, fly the
+    // opposite leg instead: the identification only needs a step, not a
+    // particular sign, and the alternative is descending into the floor
+    // and aborting there.
+    if (ax == "z" && new_off < 0.0) {
+      const auto agl = hover_agl();
+      if (agl && !z_leg_clears_floor(
+          *agl, new_off, sched_.step_size_z, z_step_margin_,
+          safety_.limits().min_altitude))
+      {
+        sched_.step_sign *= -1.0;
+        new_off = sched_.next_leg(mag);
+        status(
+          "down step would come within " +
+          fmt(safety_.limits().min_altitude, 1) + " m of the ground (" +
+          fmt(*agl, 1) + " m AGL); flying the up leg instead");
+      }
+    }
     step = new_off - sched_.leg_offset;
     sched_.leg_offset = new_off;
     pre_step_pos_ = sched_.odom->pos[i];
-    std::copy_n(hover_.begin(), 3, sched_.setpoint.begin());
+    sched_.setpoint = hover_pt_;
     sched_.setpoint[i] += new_off;
     wn_equiv = std::sqrt(std::max(gains_->at(ax).first, 1e-3));
     status("Step " + fmt(step, 2) + " m on " + ax);
@@ -1239,8 +1518,8 @@ void TuningConductor::episode_finished()
       goto_state(TunerState::SETTLE);
     } else {
       sched_.leg_offset = 0.0;
-      std::copy_n(hover_.begin(), 3, sched_.setpoint.begin());
-      sched_.setpoint_yaw = 0.0;
+      sched_.setpoint = hover_pt_;
+      sched_.setpoint_yaw = hover_yaw_;
       goto_state(TunerState::GOTO_HOVER);
     }
     return;
@@ -1260,8 +1539,7 @@ void TuningConductor::episode_finished()
 
 void TuningConductor::advance_axis()
 {
-  std::array<double, 3> hover{hover_[0], hover_[1], hover_[2]};
-  if (sched_.advance_axis(hover)) {
+  if (sched_.advance_axis(hover_pt_, hover_yaw_)) {
     ++rung_;
     if (rung_ >= wn_ladder_.size()) {
       finish();
@@ -1273,8 +1551,8 @@ void TuningConductor::advance_axis()
 
 void TuningConductor::finish()
 {
-  std::copy_n(hover_.begin(), 3, sched_.setpoint.begin());
-  sched_.setpoint_yaw = 0.0;
+  sched_.setpoint = hover_pt_;
+  sched_.setpoint_yaw = hover_yaw_;
   sched_.leg_offset = 0.0;
   set_trim_diagnosis();
   write_report("complete");
@@ -1382,16 +1660,17 @@ void TuningConductor::srv_reset(Trigger::Request::SharedPtr, Trigger::Response::
   sched_.axis_idx = 0;
   sched_.rep = 0;
   sched_.leg_offset = 0.0;
-  sched_.setpoint_yaw = 0.0;
   sched_.step_sign = 1.0;
   sched_.reset_quiet();
+  // The next session captures its own hover point: after an abort the
+  // vehicle is rarely where the last one started.
+  hover_captured_ = false;
+  goto_t0_ = -1.0;
   a_trim_ = {0.0, 0.0, 0.0};
   trim_updates_ = 0;
   start_requested_ = !require_enable_;
   safety_.reset();
-  if (sched_.odom) {
-    sched_.setpoint = sched_.odom->pos;
-  }
+  hold_here();
   baseline_read_ = false;
   request_gains();
   goto_state(TunerState::WAIT_ENABLE);
@@ -1414,6 +1693,11 @@ void TuningConductor::publish_health()
   } else if (state_ == TunerState::DONE) {
     st.level = DiagnosticStatus::OK;
     st.message = "complete";
+  } else if (state_ == TunerState::TOO_LOW) {
+    // Active (it is holding the vehicle) but not tuning, and the operator
+    // has to do something about it: warn, and say what.
+    st.level = DiagnosticStatus::WARN;
+    st.message = "refused: " + altitude_gate().second;
   } else if (is_active_state(state_)) {
     st.level = DiagnosticStatus::OK;
     st.message = std::string("tuning: ") + to_string(state_);
@@ -1495,6 +1779,26 @@ void TuningConductor::publish_health()
     add("pos_err", join(err, ","));
     add("altitude", fmt(sched_.odom->pos[2], 2));
   }
+  // Altitude, as the gate judges it. "altitude" above is the raw odometry
+  // z, which is not height above ground -- keep both, and label them.
+  const auto agl = agl_now();
+  add("agl", agl ? fmt(*agl, 2) : "-");
+  add("agl_source", agl_source());
+  const auto h_agl = hover_agl();
+  add("hover_agl", h_agl ? fmt(*h_agl, 2) : "-");
+  add("hover_mode", hover_mode_);
+  add(
+    "hover_point",
+    fmt(hover_pt_[0], 2) + "," + fmt(hover_pt_[1], 2) + "," + fmt(hover_pt_[2], 2));
+  add("hover_yaw", fmt(hover_yaw_, 2));
+  add("min_tuning_altitude", fmt(min_tuning_altitude_, 2));
+  add("min_start_altitude", fmt(min_start_altitude(), 2));
+  add("min_altitude", fmt(safety_.limits().min_altitude, 2));
+  add("z_step_clearance", fmt(z_step_clearance(), 2));
+  {
+    const auto [ok, why] = altitude_gate();
+    add("altitude_gate", ok ? "ok" : why);
+  }
   add(
     "setpoint",
     fmt(sched_.setpoint[0], 2) + "," + fmt(sched_.setpoint[1], 2) + "," +
@@ -1509,7 +1813,10 @@ void TuningConductor::abort(const std::string & reason)
   if (state_ == TunerState::ABORT) {return;}
   abort_reason_ = reason;
   RCLCPP_ERROR(get_logger(), "ABORT: %s", reason.c_str());
-  if (diagnosis_.empty() && sched_.odom &&
+  // Only meaningful while the vehicle was actually tracking a setpoint it
+  // had had time to reach. During an approach the error is the approach.
+  if (diagnosis_.empty() && sched_.odom && state_ != TunerState::GOTO_HOVER &&
+    state_ != TunerState::TOO_LOW &&
     std::abs(sched_.setpoint[2] - sched_.odom->pos[2]) > 0.5)
   {
     diagnosis_ =
@@ -1517,9 +1824,11 @@ void TuningConductor::abort(const std::string & reason)
       "max_thrust in geometric_mavros.yaml - fly a Position-mode hover and run "
       "geo-tuner-hover on the ulog.";
   }
-  std::copy_n(hover_.begin(), 3, sched_.setpoint.begin());
-  sched_.setpoint_yaw = 0.0;
-  sched_.leg_offset = 0.0;
+  // Hold where the vehicle IS. An abort that commands a point the vehicle
+  // is not at is a manoeuvre, and the bigger the trouble the bigger the
+  // manoeuvre: in the first field session the abort re-commanded a hover
+  // point 13.8 m above the vehicle and flew it there at full thrust.
+  hold_here();
   if (safe_gains_ && gains_ != safe_gains_) {
     gains_ = safe_gains_;
     apply_gains(*gains_);

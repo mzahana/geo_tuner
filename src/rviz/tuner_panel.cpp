@@ -91,6 +91,15 @@ TunerPanel::TunerPanel(QWidget * parent)
   vehicle_line_->setAlignment(Qt::AlignCenter);
   vehicle_line_->setStyleSheet("color:#909090;");
   root->addWidget(vehicle_line_);
+  // Height above ground, and whether the session may start at it. This is
+  // the number the conductor gates on, so it belongs next to START rather
+  // than behind a disclosure.
+  altitude_line_ = new QLabel("-", this);
+  altitude_line_->setAlignment(Qt::AlignCenter);
+  altitude_line_->setWordWrap(true);
+  altitude_line_->setStyleSheet("color:#909090;");
+  root->addWidget(altitude_line_);
+
   waiting_line_ = new QLabel(this);
   waiting_line_->setAlignment(Qt::AlignCenter);
   waiting_line_->setWordWrap(true);
@@ -155,6 +164,35 @@ TunerPanel::TunerPanel(QWidget * parent)
   auto * adv = new QVBoxLayout(advanced_box_);
   adv->setContentsMargins(0, 0, 0, 0);
   adv->setSpacing(3);
+
+  // Working altitude. The conductor tunes about the point the pilot hands
+  // it over at and refuses to start below this height above ground; it
+  // never climbs to reach it. The node validates the value against its
+  // safety floor plus the room a downward z step needs, and may refuse it.
+  {
+    auto * box = new QGroupBox("Working altitude", advanced_box_);
+    auto * grid = new QGridLayout(box);
+    grid->setContentsMargins(6, 3, 6, 3);
+    grid->setVerticalSpacing(2);
+    min_alt_spin_ = new QDoubleSpinBox(box);
+    min_alt_spin_->setRange(0.5, 100.0);
+    min_alt_spin_->setSingleStep(0.5);
+    min_alt_spin_->setDecimals(1);
+    min_alt_spin_->setSuffix(" m AGL");
+    min_alt_spin_->setKeyboardTracking(false);
+    min_alt_spin_->setToolTip(
+      "Minimum height above ground for a tuning session. The vehicle is "
+      "never commanded to climb to it: hand over above it, or the session "
+      "holds position and says so.");
+    connect(min_alt_spin_, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
+            this, [this]() { alt_dirty_ = true; });
+    grid->addWidget(new QLabel("start no lower than", box), 0, 0);
+    grid->addWidget(min_alt_spin_, 0, 1);
+    apply_alt_button_ = new QPushButton("Apply working altitude", box);
+    grid->addWidget(apply_alt_button_, 1, 0, 1, 2);
+    grid->setColumnStretch(1, 1);
+    adv->addWidget(box);
+  }
 
   // Manoeuvre envelope. The conductor steps the setpoint by these amounts
   // about the hover point and comes straight back, so the vehicle stays
@@ -228,6 +266,7 @@ TunerPanel::TunerPanel(QWidget * parent)
     callService("restore_safe", restore_client_, QString());
   });
   connect(apply_steps_button_, &QPushButton::clicked, this, &TunerPanel::applySteps);
+  connect(apply_alt_button_, &QPushButton::clicked, this, &TunerPanel::applyAltitude);
 
   timer_ = new QTimer(this);
   connect(timer_, &QTimer::timeout, this, &TunerPanel::refresh);
@@ -429,6 +468,58 @@ void TunerPanel::applySteps()
   steps_dirty_ = false;
 }
 
+void TunerPanel::applyAltitude()
+{
+  if(!param_client_ || !param_client_->service_is_ready())
+  {
+    log("working altitude: tuning_conductor not running at " + prefix(), false);
+    return;
+  }
+  const double value = min_alt_spin_->value();
+  QString agl, gate, floor, clearance;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto get = [this](const char * k) {
+        const auto it = values_.find(k);
+        return it == values_.end() ? QString("?") : QString::fromStdString(it->second);
+      };
+    agl = get("agl");
+    gate = get("min_start_altitude");
+    floor = get("min_altitude");
+    clearance = get("z_step_clearance");
+  }
+  // Changing the gate changes where the vehicle is allowed to fly step
+  // inputs: confirm with the numbers, not just the new value.
+  const QString text =
+    QString("Set the working altitude to %1 m AGL?\n\n"
+            "The session refuses to start below it and holds position "
+            "instead -- it never climbs to reach it.\n\n"
+            "Vehicle now: %2 m AGL.\nCurrent start gate: %3 m "
+            "(safety floor %4 m + %5 m for a downward z step).\n\n"
+            "The conductor refuses a value that leaves no room for the "
+            "vertical step above its floor.")
+      .arg(value, 0, 'f', 1).arg(agl, gate, floor, clearance);
+  if(QMessageBox::question(this, "working altitude", text,
+                           QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes)
+    return;
+  param_client_->set_parameters(
+    {rclcpp::Parameter("min_tuning_altitude", value)},
+    [this, value](std::shared_future<std::vector<rcl_interfaces::msg::SetParametersResult>> future) {
+      const auto results = future.get();
+      QString failures;
+      for(const auto & r : results)
+        if(!r.successful)
+          failures += QString::fromStdString(r.reason) + " ";
+      std::lock_guard<std::mutex> lock(mutex_);
+      have_pending_log_ = true;
+      pending_log_ok_ = failures.isEmpty();
+      pending_log_ = failures.isEmpty()
+                       ? QString("working altitude -> %1 m AGL").arg(value, 0, 'f', 1)
+                       : ("REJECTED: " + failures);
+    });
+  alt_dirty_ = false;
+}
+
 void TunerPanel::applyNamespace()
 {
   {
@@ -527,6 +618,8 @@ void TunerPanel::refresh()
     keep_button_->setEnabled(false);
     revert_button_->setEnabled(false);
     apply_steps_button_->setEnabled(false);
+    apply_alt_button_->setEnabled(false);
+    altitude_line_->setText("-");
     envelope_label_->setText("-");
     {
       std::lock_guard<std::mutex> lock(mutex_);
@@ -552,8 +645,34 @@ void TunerPanel::refresh()
       .arg(str("episode").c_str()).arg(str("wn_target").c_str())
       .arg(str("zeta_target").c_str()));
   vehicle_line_->setText(
-    QString("alt %1 m · err %2")
+    QString("alt %1 m (odom z) · err %2")
       .arg(str("altitude").c_str()).arg(str("pos_err").c_str()));
+
+  // Height above ground and the gate it is judged against. Green while a
+  // session could start here, amber while it could not -- the pilot reads
+  // this before switching to OFFBOARD.
+  {
+    const std::string gate = str("altitude_gate", "");
+    const bool ok = gate == "ok";
+    altitude_line_->setText(
+      QString("%1 m AGL (%2) · start gate %3 m")
+        .arg(str("agl").c_str()).arg(str("agl_source").c_str())
+        .arg(str("min_start_altitude").c_str()));
+    altitude_line_->setToolTip(
+      ok ? QString("Above the gate: a session may start here.")
+         : QString::fromStdString(gate));
+    altitude_line_->setStyleSheet(ok ? "color:#909090;" : "color:#b37400;");
+    apply_alt_button_->setEnabled(true);
+    if(!alt_dirty_)
+    {
+      const QSignalBlocker b(min_alt_spin_);
+      bool okv = false;
+      const double v = QString::fromStdString(str("min_tuning_altitude", "")).toDouble(&okv);
+      if(okv)
+        min_alt_spin_->setValue(v);
+      alt_dirty_ = false;
+    }
+  }
 
   // One line for why it is not progressing -- the question you actually ask
   // while watching a session sit still. Hidden while nothing blocks.
@@ -567,6 +686,11 @@ void TunerPanel::refresh()
   else if(state == "WAIT_OFFBOARD")
     blocked = QString("switch to OFFBOARD now - setpoints are streaming (mode: %1)")
                 .arg(str("px4_mode").c_str());
+  else if(state == "TOO_LOW")
+    // Holding where it was handed over, because that was below the gate.
+    // Say both ways out: climb, or lower the gate.
+    blocked = QString::fromStdString(str("altitude_gate")) +
+              " - take manual control and climb, or lower the working altitude";
   else if(state == "ABORT")
   {
     // The diagnosis says what to DO about it (e.g. a wrong thrust map);

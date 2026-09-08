@@ -609,6 +609,38 @@ TEST(Safety, AltitudeBounds)
   EXPECT_TRUE(has(m.check(sample(0, {0, 0, 30}), std::nullopt), Violation::ALTITUDE_HIGH));
 }
 
+TEST(Safety, AltitudeUsesAglWhenAvailable)
+{
+  // The field failure: the local frame's origin sat 6.6 m below ground, so
+  // odometry z read -3.8 while the vehicle hovered at 2.8 m AGL. Judged on
+  // z the floor fires on a perfectly safe hover; judged on AGL it does not.
+  SafetyLimits l;
+  l.min_altitude = 2.0;
+  l.max_altitude = 20.0;
+  SafetyMonitor m(l);
+  auto s = sample(0, {0, 0, -3.8});
+  s.agl = 2.8;
+  EXPECT_TRUE(m.check(s, std::nullopt).empty());
+  s.agl = 1.2;
+  EXPECT_TRUE(has(m.check(s, std::nullopt), Violation::ALTITUDE_LOW));
+  s.agl = 25.0;
+  EXPECT_TRUE(has(m.check(s, std::nullopt), Violation::ALTITUDE_HIGH));
+}
+
+TEST(Safety, MinAltitudeCanBeSuppressed)
+{
+  // While the conductor holds position after refusing to start too low it
+  // is knowingly below the floor; every other limit still applies.
+  SafetyLimits l;
+  l.min_altitude = 5.0;
+  l.max_velocity = 2.0;
+  SafetyMonitor m(l);
+  auto s = sample(0, {0, 0, 2.0}, {3, 0, 0});
+  const auto v = m.check(s, std::nullopt, /*check_min_altitude=*/false);
+  EXPECT_FALSE(has(v, Violation::ALTITUDE_LOW));
+  EXPECT_TRUE(has(v, Violation::VELOCITY));
+}
+
 TEST(Safety, VelocityViolation)
 {
   SafetyLimits l;

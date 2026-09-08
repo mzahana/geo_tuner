@@ -24,6 +24,32 @@ namespace geo_tuner
 /// Index of an axis name in a position triple; -1 for "yaw".
 int axis_index(const std::string & axis);
 
+/// One step of a rate-limited approach: move `from` toward `to` by at most
+/// `max_delta`, never overshooting. A setpoint that jumps is a step command
+/// to the controller, and a large one saturates it -- the conductor
+/// therefore never assigns a distant target directly, it ramps to it.
+double ramp_toward(double from, double to, double max_delta);
+
+/// Same, on a position triple, keeping the direction of travel: the whole
+/// vector moves at one speed rather than each axis independently.
+std::array<double, 3> ramp_toward(
+  const std::array<double, 3> & from, const std::array<double, 3> & to,
+  double max_delta);
+
+/// Shortest signed difference between two angles [rad], wrapped to +/-pi.
+double wrap_angle(double a);
+
+/// Would a vertical leg to `leg_offset` (m, signed, from the hover point)
+/// keep clear of the altitude floor?
+///
+/// The commanded point is hover_agl + leg_offset, and the response
+/// undershoots it by margin * step_size before it settles. Both terms scale
+/// with the step amplitude, which is a live parameter -- so this moves
+/// whenever the operator changes the vertical step size.
+bool z_leg_clears_floor(
+  double hover_agl, double leg_offset, double step_size_z, double margin,
+  double floor);
+
 class TuningSchedule
 {
 public:
@@ -114,7 +140,11 @@ public:
   /// Move to the next axis, clearing the leg schedule so a new axis
   /// always starts its steps from the hover point. Returns true when the
   /// axis list wrapped -- the caller then steps the wn ladder.
-  bool advance_axis(const std::array<double, 3> & hover);
+  ///
+  /// hover_yaw is the heading the session was handed over at: yaw legs are
+  /// offsets from it, never from an absolute zero (which would command a
+  /// snap to north the moment the session starts).
+  bool advance_axis(const std::array<double, 3> & hover, double hover_yaw);
 
   void reset_quiet() {quiet_t0_.reset();}
 

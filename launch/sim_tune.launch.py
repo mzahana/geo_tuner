@@ -68,7 +68,17 @@ def generate_launch_description():
         output="screen",
         parameters=[{
             "controller_node": "geometric_controller_node",
+            # quad_sim has no pilot to hand the vehicle over, so this is
+            # the one configuration that uses a fixed hover point -- and
+            # even here the setpoint ramps to it rather than stepping.
+            "hover_mode": "fixed",
             "hover_position": [0.0, 0.0, 3.0],
+            "hover_approach_speed": 0.7,
+            # No mavros in this graph: AGL falls back to (odom z - ground_z),
+            # and quad_sim's origin IS the ground.
+            "agl_topic": "",
+            "ground_z": 0.0,
+            "min_tuning_altitude": 2.0,
             "step_size": step_size,
             "step_size_z": step_size_z,
             "yaw_step": yaw_step,
@@ -81,7 +91,7 @@ def generate_launch_description():
             "estimate_consistency": 1.35,
             "require_offboard": False,  # quad_sim has no mavros/PX4
             "report_path": report_path,
-            "safety.min_altitude": 1.0,
+            "safety.min_altitude": 1.0,   # m AGL
             "safety.max_altitude": 20.0,
         }],
     )

@@ -29,7 +29,8 @@ double tilt_from_quat(const std::array<double, 4> & q)
 }
 
 std::vector<Violation> SafetyMonitor::check(
-  const OdomSample & s, const std::optional<std::array<double, 3>> & setpoint)
+  const OdomSample & s, const std::optional<std::array<double, 3>> & setpoint,
+  bool check_min_altitude)
 {
   std::vector<Violation> v;
   last_t_ = s.t;
@@ -44,10 +45,11 @@ std::vector<Violation> SafetyMonitor::check(
     v.push_back(Violation::VELOCITY);
   }
 
-  if (s.pos[2] < limits_.min_altitude) {
+  const double alt = altitude_of(s);
+  if (check_min_altitude && alt < limits_.min_altitude) {
     v.push_back(Violation::ALTITUDE_LOW);
   }
-  if (s.pos[2] > limits_.max_altitude) {
+  if (alt > limits_.max_altitude) {
     v.push_back(Violation::ALTITUDE_HIGH);
   }
 

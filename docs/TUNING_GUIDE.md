@@ -89,10 +89,14 @@ test passed ("Ready for takeoff"). The tuning-session flight itself (steps
 ### Phase 4 — Field auto-tune (one flight, mostly hands-off)
 1. Load Phase-1 yaml files. Conservative envelope: `max_tilt_angle: 0.52`,
    `max_accel: 5`, `ki: 0`.
-2. Take off, hover in OFFBOARD near the `hover_position` configured in
-   `geo_tuner/config/tuner_field.yaml` (≥ 10 m AGL, clear ground, geofence on,
-   pilot's thumb on the mode switch — RC override always wins; the tuner
-   never arms/disarms or changes modes).
+2. Take off and hover where the session should run — clear ground, geofence
+   on, at or above `min_tuning_altitude` in
+   `geo_tuner/config/tuner_field.yaml` (6 m AGL by default) — then hand over
+   in OFFBOARD. The session tunes about the point it is handed: it never
+   commands a climb, and handed over too low it holds position in state
+   `TOO_LOW` until you climb or lower the gate from the panel. Pilot's thumb
+   on the mode switch — RC override always wins; the tuner never
+   arms/disarms or changes modes.
 3. `ros2 launch geo_tuner field_tune.launch.py output_dir:=~/tuning_logs`
    (`output_dir`: timestamped report + raw episode CSVs per session, nothing
    overwritten — bring that folder home for analysis). The conductor
