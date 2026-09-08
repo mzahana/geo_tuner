@@ -144,8 +144,19 @@ parameters; both use a `/**:` node path so they apply in whatever namespace
 the node is launched into. The file is commented parameter by parameter —
 read it before a field session. The knobs that matter most:
 
-- `hover_position` — where to tune (odom/local frame, ≥ 10 m AGL, inside
-  the geofence);
+- `hover_mode` — `capture` (default) tunes about the point the pilot hands
+  the vehicle over at, captured when OFFBOARD engages: the setpoint never
+  jumps and the vehicle is never commanded to fly anywhere to start.
+  `fixed` (simulators) flies to `hover_position`, ramped at
+  `hover_approach_speed` — still never a step;
+- `min_tuning_altitude` — the session refuses to start below this height
+  **above ground** and holds position instead; it never climbs to reach it.
+  The effective gate is this or `safety.min_altitude` plus the room a
+  downward z step needs (`step_size_z × (1 + z_step_margin)`), whichever is
+  higher. Live-settable from the Tuner panel;
+- `agl_topic` — where height above ground comes from. Odometry z is *not*
+  AGL: PX4's local origin sat 6.6 m below ground on the first field
+  session, which put every altitude limit 6.6 m out;
 - `step_size`, `step_size_z`, `max_yaw_step` — the manoeuvre envelope: the
   vehicle stays within ± these of the hover point, so set them to the space
   you actually have (live-settable from the Tuner panel);

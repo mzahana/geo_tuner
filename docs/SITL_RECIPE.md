@@ -149,7 +149,8 @@ trajectory node in `mav_controllers_ros`, or your MPC) and check tracking.
 | Symptom | Cause / fix |
 |---|---|
 | OFFBOARD rejected | Conductor not running (no setpoint stream) — do step 3 before step 4 |
-| Abort right after start: `position error bound exceeded` | Vehicle hovering far from (0,0,2.5) — take off at the origin, or edit `hover_position` |
+| Abort right after start: `position error bound exceeded` | In `hover_mode: fixed` only, the vehicle is far from `hover_position`. The default `capture` mode tunes about wherever it is handed over |
+| State `TOO_LOW`, "too low to tune" | Handed over below `min_tuning_altitude` (or below the floor plus the room a down z step needs). Take manual control, climb, flip back to OFFBOARD — or lower the working altitude in the Tuner panel. The tuner never climbs on its own |
 | Abort: `below minimum altitude` | Take off first (step 2); the tuner never performs takeoff |
 | `could not reach hover point` + thrust-map diagnosis | Sim `geometric_mavros.yaml` `max_thrust` off — apply the suggested factor |
 | No odometry warning | mavros not up yet, or wrong namespace (`ns:=interceptor` missing) |

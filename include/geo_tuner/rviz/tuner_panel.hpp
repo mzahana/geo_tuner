@@ -70,6 +70,9 @@ private Q_SLOTS:
   void refresh();
   /// Push the step amplitudes to the conductor (validated node-side).
   void applySteps();
+  /// Push the working altitude to the conductor, after a confirmation that
+  /// spells out what the vehicle will and will not do with it.
+  void applyAltitude();
 
 private:
   void connectNode();
@@ -132,6 +135,13 @@ private:
 
   QToolButton * advanced_toggle_{nullptr};
   QWidget * advanced_box_{nullptr};
+  // The working altitude: the height above ground the session refuses to
+  // start below. The conductor never climbs to reach it -- it is a gate on
+  // where the pilot hands the vehicle over, not a commanded altitude.
+  QDoubleSpinBox * min_alt_spin_{nullptr};
+  QPushButton * apply_alt_button_{nullptr};
+  QLabel * altitude_line_{nullptr};
+  bool alt_dirty_{false};
   QDoubleSpinBox * step_xy_spin_{nullptr};
   QDoubleSpinBox * step_z_spin_{nullptr};
   QDoubleSpinBox * step_yaw_spin_{nullptr};

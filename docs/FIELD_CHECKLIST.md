@@ -175,7 +175,13 @@ Goal: identified, corrected gains on the real vehicle.
 Before arming:
 
 - [ ] Open `config/tuner_field.yaml` and check:
-  - [ ] `hover_position`: ≥ 10 m altitude, inside the geofence, clear air.
+  - [ ] `min_tuning_altitude`: the height above ground you intend to hand
+        over at (default 6 m). The session refuses to start below it and
+        never climbs to reach it — there is no hover point to fly to.
+  - [ ] `agl_topic`: reaching the node (`ros2 topic hz
+        <ns>/mavros/global_position/rel_alt`). The panel shows which
+        source is in use; `odom_z-ground_z` means the topic is silent and
+        the limits are only as good as `ground_z`.
   - [ ] `wn_ladder`: start modest, e.g. `[1.2, 1.6]`. You can ladder
         higher on a later flight.
   - [ ] safety block: `min_altitude`, `max_altitude`, `max_pos_error`

@@ -20,6 +20,37 @@ std::string fmt(double v, int precision)
 
 }  // namespace
 
+double ramp_toward(double from, double to, double max_delta)
+{
+  const double d = to - from;
+  if (max_delta <= 0.0 || std::abs(d) <= max_delta) {return to;}
+  return from + (d > 0.0 ? max_delta : -max_delta);
+}
+
+std::array<double, 3> ramp_toward(
+  const std::array<double, 3> & from, const std::array<double, 3> & to,
+  double max_delta)
+{
+  const std::array<double, 3> d{to[0] - from[0], to[1] - from[1], to[2] - from[2]};
+  const double n = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+  if (max_delta <= 0.0 || n <= max_delta || n < 1e-9) {return to;}
+  const double k = max_delta / n;
+  return {from[0] + k * d[0], from[1] + k * d[1], from[2] + k * d[2]};
+}
+
+double wrap_angle(double a)
+{
+  return std::atan2(std::sin(a), std::cos(a));
+}
+
+bool z_leg_clears_floor(
+  double hover_agl, double leg_offset, double step_size_z, double margin,
+  double floor)
+{
+  if (leg_offset >= 0.0) {return true;}   // an up leg never flies at the ground
+  return hover_agl + leg_offset - step_size_z * std::max(0.0, margin) >= floor;
+}
+
 int axis_index(const std::string & axis)
 {
   if (axis == "x") {return 0;}
@@ -111,12 +142,12 @@ bool TuningSchedule::bucket_settled() const
   return (*hi / *lo) <= early_stop_spread;
 }
 
-bool TuningSchedule::advance_axis(const std::array<double, 3> & hover)
+bool TuningSchedule::advance_axis(const std::array<double, 3> & hover, double hover_yaw)
 {
   rep = 0;
   bucket = EpisodeBucket();
   leg_offset = 0.0;
-  setpoint_yaw = 0.0;
+  setpoint_yaw = hover_yaw;
   ++axis_idx;
   bool wrapped = false;
   if (axis_idx >= axes.size()) {

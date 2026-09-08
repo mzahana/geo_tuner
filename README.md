@@ -100,11 +100,14 @@ ros2 run geo_tuner geo-tuner-design \
 
 ### Step 3 — in-flight auto-tune
 
-1. Edit `config/tuner_field.yaml` — at minimum `hover_position` and the
-   step sizes (the manoeuvre envelope: the vehicle stays within ± those of
-   the hover point, so set them to the space you have).
-2. Take off and hover in OFFBOARD under the geometric controller, near
-   that hover position.
+1. Edit `config/tuner_field.yaml` — at minimum `min_tuning_altitude` (the
+   height above ground the session refuses to start below) and the step
+   sizes (the manoeuvre envelope: the vehicle stays within ± those of the
+   point it is handed, so set them to the space you have).
+2. Take off, hover where you want the session to run — at or above
+   `min_tuning_altitude` — and hand over in OFFBOARD. The tuner tunes about
+   that point: it never commands a climb, and if you hand it over too low
+   it holds position and says so instead.
 3. Keep a thumb on the RC mode switch — **switching out of OFFBOARD always
    overrides everything**. The conductor never arms, disarms, or changes
    modes.
