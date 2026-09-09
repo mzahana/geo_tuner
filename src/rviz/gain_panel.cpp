@@ -820,6 +820,14 @@ void GainPanel::refresh()
       it->second->setText(text);
   };
 
+  // With the estimator off, thrust_scale_est sits at its init value 1.0
+  // forever, so "suggested" would just echo max_thrust back -- a dead number
+  // that looks like a live measurement (on 2026-09-09 it hid a 1.08 thrust-map
+  // error the tuner's hover-trim diagnosis caught). An older build without the
+  // flag is treated as enabled rather than hiding a suggestion that may be live.
+  const bool est_enabled =
+    mavros_live && (!mavros.count("thrust_estimator_enabled") ||
+                    mavros.at("thrust_estimator_enabled") == "true");
   if(mavros_live)
   {
     const double max_thrust = num(mavros, "max_thrust_n");
@@ -827,13 +835,19 @@ void GainPanel::refresh()
     const auto thrust_it = fields_.find("thrust");
     if(thrust_it != fields_.end())
     {
-      thrust_it->second->setText(QString("%1 N  x %2").arg(fmt(max_thrust, 1)).arg(fmt(scale, 3)));
-      const bool pinned = std::isfinite(scale) && (scale <= 0.801 || scale >= 1.249);
+      thrust_it->second->setText(est_enabled
+        ? QString("%1 N  x %2").arg(fmt(max_thrust, 1)).arg(fmt(scale, 3))
+        : QString("%1 N  (estimator off)").arg(fmt(max_thrust, 1)));
+      const bool pinned = est_enabled && std::isfinite(scale) &&
+                          (scale <= 0.801 || scale >= 1.249);
       thrust_it->second->setStyleSheet(pinned ? "color:#d05050; font-weight:bold;" : "");
     }
-    set("suggested", (std::isfinite(max_thrust) && std::isfinite(scale))
-                       ? fmt(max_thrust * scale, 1) + " N" + (armed ? " (disarm to save)" : "")
-                       : QString("-"));
+    if(!est_enabled)
+      set("suggested", "estimator off (enable_thrust_estimator)");
+    else
+      set("suggested", (std::isfinite(max_thrust) && std::isfinite(scale))
+                         ? fmt(max_thrust * scale, 1) + " N" + (armed ? " (disarm to save)" : "")
+                         : QString("-"));
   }
   else
   {
@@ -841,9 +855,10 @@ void GainPanel::refresh()
       set(k, "-");
   }
 
-  // The thrust correction is refused by the vehicle while armed; disabling
-  // it here as well means the operator is told before they click, not after.
-  thrust_correct_->setEnabled(interlock_->isChecked() && !armed);
+  // The thrust correction is refused by the vehicle while armed (and there is
+  // nothing to correct with while the estimator is off); disabling it here as
+  // well means the operator is told before they click, not after.
+  thrust_correct_->setEnabled(interlock_->isChecked() && !armed && est_enabled);
   if(armed && thrust_correct_->isChecked())
     thrust_correct_->setChecked(false);
 
