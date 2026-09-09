@@ -129,6 +129,10 @@ private:
   void finalize_pos_bucket(const std::string & ax);
   void episode_finished();
   void advance_axis();
+  /// Move forward until the current (axis, rung) is one this session flies
+  /// (see axis_eligible). Returns false when that walked off the end of the
+  /// ladder -- the session is then finished and no state change remains.
+  bool seek_eligible_axis();
   void finish();
   void set_trim_diagnosis();
   void abort(const std::string & reason);
@@ -236,6 +240,13 @@ private:
   double yaw_T_target_{0.35};
   double yaw_tau_min_{0.15};
   double yaw_tau_max_{1.2};
+  // Fly yaw buckets only on the final rung; the yaw target does not
+  // ladder, so earlier rungs would re-identify the same thing.
+  bool yaw_final_rung_only_{true};
+  // Per-episode nrmse screen for the yaw first-order fit. Looser than the
+  // 0.15 the closed-loop fit uses: yaw moves little against odometry noise
+  // and the bucket's median + consistency gate is the real protection.
+  double yaw_fit_nrmse_{0.25};
   std::vector<double> wn_ladder_{1.2, 1.6, 2.0};
   double zeta_target_{0.95};
   double max_change_{1.6};
@@ -277,6 +288,11 @@ private:
   double pre_step_pos_{0.0};
   size_t rung_{0};                  // index into wn_ladder_
   double episode_min_time_{0.0};    // earliest adaptive stop [s]
+  // Where the session's wall time goes: the report carries the total and,
+  // per episode, how long the pre-step settle and the recording took --
+  // the numbers that say which knob to turn when a session felt long.
+  double session_t0_{-1.0};         // first moment the session flew
+  double last_settle_dur_{0.0};     // SETTLE time before the current episode
   std::optional<Gains> gains_;
   std::optional<Gains> safe_gains_;
   // Frozen at baseline capture; the "old" column of the panel's result view.

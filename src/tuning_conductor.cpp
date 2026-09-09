@@ -177,6 +177,18 @@ TuningConductor::TuningConductor(const rclcpp::NodeOptions & options)
   yaw_T_target_ = declare_parameter<double>("yaw_time_constant", 0.35);   // s, target T
   yaw_tau_min_ = declare_parameter<double>("yawctrl_tau_min", 0.15);
   yaw_tau_max_ = declare_parameter<double>("yawctrl_tau_max", 1.2);
+  // Yaw is a time-constant target, not a wn target: it does not ladder, so
+  // a yaw bucket per rung re-identifies the same thing. Fly it once, on
+  // the final rung (the 2026-09-09 field session spent 6 of 24 episodes
+  // on yaw for at most one tau update's worth of information).
+  yaw_final_rung_only_ = declare_parameter<bool>("yaw_final_rung_only", true);
+  // Per-episode quality screen for the yaw fit. The closed-loop (position)
+  // fit keeps its 0.15: yaw is looser because a 0.5 rad heading response
+  // carries more relative sensor noise, and the real gate on what reaches
+  // yawctrl_tau is the bucket median + estimate_consistency. On 2026-09-09
+  // the fixed 0.15 rejected 5 of 6 yaw episodes at nrmse 0.148-0.172 whose
+  // T estimates agreed to ~1.3x -- consistent evidence thrown away.
+  yaw_fit_nrmse_ = declare_parameter<double>("yaw_fit_nrmse", 0.25);
   // wn ladder: identify at each rung before pushing bandwidth up
   wn_ladder_ = declare_parameter<std::vector<double>>("wn_ladder", {1.2, 1.6, 2.0});
   zeta_target_ = declare_parameter<double>("zeta_target", 0.95);
@@ -654,6 +666,10 @@ void TuningConductor::begin_flying()
     goto_state(TunerState::TOO_LOW);
     return;
   }
+  if (session_t0_ < 0.0) {session_t0_ = now_s();}
+  // The schedule may be parked on a bucket this session skips (a yaw-only
+  // axes list with yaw_final_rung_only, say): move to one it flies.
+  if (!seek_eligible_axis()) {return;}
   // In capture mode the setpoint is already the hover point; in fixed mode
   // GOTO_HOVER ramps to it.
   goto_state(TunerState::GOTO_HOVER);
@@ -1095,6 +1111,7 @@ void TuningConductor::st_settle(double now)
   // settle_time remains the hard cap: with a noisy/windy plant this
   // degrades exactly to the previous fixed-time behaviour.
   if (elapsed < settle_time_ && !sched_.is_quiet(now)) {return;}
+  last_settle_dur_ = elapsed;
   const std::string ax = sched_.axes[sched_.axis_idx];
   sched_.recording.clear();
   // Same clock as the samples that will be recorded against it.
@@ -1226,6 +1243,8 @@ void TuningConductor::analyze_yaw()
   rec["T_target"] = yaml_double(yaw_T_target_);
   rec["step"] = yaml_double(round_to(step, 3));
   rec["yaw_tau_applied"] = yaml_double(round_to(*yaw_tau_, 3));
+  rec["settle_s"] = yaml_double(round_to(last_settle_dur_, 2));
+  rec["record_s"] = yaml_double(round_to(t.size() > 0 ? t[t.size() - 1] : 0.0, 2));
 
   FirstOrderFitResult fit;
   try {
@@ -1243,9 +1262,14 @@ void TuningConductor::analyze_yaw()
   status(
     "yaw: T=" + fmt(fit.T, 2) + "s delay=" + fmt(fit.delay * 1e3, 0) +
     "ms nrmse=" + fmt(fit.nrmse, 2));
-  if (!fit.ok()) {
+  // Gate on the yaw-specific nrmse screen, not FirstOrderFitResult::ok():
+  // that hardcodes the position loops' 0.15 (see yaw_fit_nrmse above).
+  if (!(fit.converged && !fit.at_bounds && fit.nrmse < yaw_fit_nrmse_)) {
     rec["action"] = "fit rejected";
-    status("Yaw fit quality gate failed; episode discarded");
+    status(
+      "Yaw fit quality gate failed (nrmse " + fmt(fit.nrmse, 2) + " vs " +
+      fmt(yaw_fit_nrmse_, 2) + ", converged=" + (fit.converged ? "y" : "n") +
+      ", at_bounds=" + (fit.at_bounds ? "y" : "n") + "); episode discarded");
   } else {
     rec["action"] = "accepted";
     sched_.bucket.add(fit.T, fit.delay);
@@ -1325,6 +1349,8 @@ void TuningConductor::st_analyze(double)
   rec["step"] = yaml_double(step);
   rec["kx_applied"] = yaml_double(round_to(kx_now, 3));
   rec["kv_applied"] = yaml_double(round_to(kv_now, 3));
+  rec["settle_s"] = yaml_double(round_to(last_settle_dur_, 2));
+  rec["record_s"] = yaml_double(round_to(t.size() > 0 ? t[t.size() - 1] : 0.0, 2));
 
   LoopFitResult fit;
   try {
@@ -1546,7 +1572,27 @@ void TuningConductor::advance_axis()
       return;
     }
   }
+  if (!seek_eligible_axis()) {return;}
   goto_state(TunerState::GOTO_HOVER);
+}
+
+bool TuningConductor::seek_eligible_axis()
+{
+  while (!axis_eligible(
+      sched_.axes[sched_.axis_idx], rung_, wn_ladder_.size(), yaw_final_rung_only_))
+  {
+    status(
+      "skipping " + sched_.axes[sched_.axis_idx] + " on rung " +
+      std::to_string(rung_ + 1) + " (tuned once, on the final rung)");
+    if (sched_.advance_axis(hover_pt_, hover_yaw_)) {
+      ++rung_;
+      if (rung_ >= wn_ladder_.size()) {
+        finish();
+        return false;
+      }
+    }
+  }
+  return true;
 }
 
 void TuningConductor::finish()
@@ -1666,6 +1712,8 @@ void TuningConductor::srv_reset(Trigger::Request::SharedPtr, Trigger::Response::
   // vehicle is rarely where the last one started.
   hover_captured_ = false;
   goto_t0_ = -1.0;
+  session_t0_ = -1.0;
+  last_settle_dur_ = 0.0;
   a_trim_ = {0.0, 0.0, 0.0};
   trim_updates_ = 0;
   start_requested_ = !require_enable_;
@@ -1681,6 +1729,27 @@ void TuningConductor::srv_reset(Trigger::Request::SharedPtr, Trigger::Response::
   status(res->message);
 }
 
+// What the session is doing, in words a pilot who has never read this
+// code can act on. The machine-readable state stays in the "state" key;
+// this feeds the banner and the "phase" key.
+static const char * phase_string(TunerState s)
+{
+  switch (s) {
+    case TunerState::WAIT_ODOM: return "waiting for the vehicle's position feed";
+    case TunerState::WAIT_ENABLE: return "ready - press START";
+    case TunerState::WAIT_OFFBOARD: return "waiting for OFFBOARD handover";
+    case TunerState::TOO_LOW: return "too low to tune";
+    case TunerState::GOTO_HOVER: return "steadying at the tuning point";
+    case TunerState::SETTLE: return "holding steady before the next test step";
+    case TunerState::STEP: return "flying a test step";
+    case TunerState::ANALYZE: return "analyzing the response";
+    case TunerState::UPDATE_GAINS: return "applying updated gains";
+    case TunerState::DONE: return "finished";
+    case TunerState::ABORT: return "stopped";
+  }
+  return "";
+}
+
 void TuningConductor::publish_health()
 {
   DiagnosticStatus st;
@@ -1692,7 +1761,7 @@ void TuningConductor::publish_health()
     st.message = "aborted: " + abort_reason_;
   } else if (state_ == TunerState::DONE) {
     st.level = DiagnosticStatus::OK;
-    st.message = "complete";
+    st.message = "tuning finished";
   } else if (state_ == TunerState::TOO_LOW) {
     // Active (it is holding the vehicle) but not tuning, and the operator
     // has to do something about it: warn, and say what.
@@ -1700,10 +1769,10 @@ void TuningConductor::publish_health()
     st.message = "refused: " + altitude_gate().second;
   } else if (is_active_state(state_)) {
     st.level = DiagnosticStatus::OK;
-    st.message = std::string("tuning: ") + to_string(state_);
+    st.message = phase_string(state_);
   } else {
     st.level = DiagnosticStatus::WARN;
-    st.message = std::string("waiting: ") + to_string(state_);
+    st.message = phase_string(state_);
   }
 
   auto add = [&st](const std::string & key, const std::string & value) {
@@ -1727,6 +1796,22 @@ void TuningConductor::publish_health()
   add(
     "episode",
     std::to_string(sched_.rep + 1) + "/" + std::to_string(sched_.episodes_per_rung));
+  // Session-level progress for the ground station: how many test steps of
+  // the planned total are behind us, and the phase in plain words. DONE
+  // reports 100% even when buckets closed early -- finished is finished.
+  {
+    const auto [done, total] = session_progress(
+      sched_.axes, wn_ladder_.size(), sched_.episodes_per_rung,
+      rung_, sched_.axis_idx, sched_.rep, yaw_final_rung_only_);
+    const bool finished = state_ == TunerState::DONE;
+    add("steps_done", std::to_string(finished ? total : done));
+    add("steps_total", std::to_string(total));
+    add(
+      "progress_pct",
+      std::to_string(
+        finished ? 100 : (total > 0 ? (100 * done) / total : 0)));
+  }
+  add("phase", phase_string(state_));
   add("zeta_target", fmt(zeta_target_, 2));
   add("step_size", fmt(sched_.step_size, 2));
   add("step_size_z", fmt(sched_.step_size_z, 2));
@@ -1913,6 +1998,9 @@ void TuningConductor::write_report(const std::string & status_text)
     report["final_yawctrl_tau"] = YAML::Node(YAML::NodeType::Null);
   }
   report["time"] = std::string(timebuf);
+  if (session_t0_ >= 0.0) {
+    report["session_duration_s"] = yaml_double(round_to(now_s() - session_t0_, 1));
+  }
   report["zeta_target"] = yaml_double(zeta_target_);
   report["wn_ladder"] = ladder;
   report["episodes"] = episodes;

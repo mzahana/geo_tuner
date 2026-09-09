@@ -39,6 +39,25 @@ std::array<double, 3> ramp_toward(
 /// Shortest signed difference between two angles [rad], wrapped to +/-pi.
 double wrap_angle(double a);
 
+/// Is the (axis, rung) bucket flown in this session? With
+/// yaw_final_rung_only, yaw buckets fly only on the LAST rung: the yaw
+/// target (a time constant) does not ladder with wn, so identifying it on
+/// every rung re-measures the same thing -- the 2026-09-09 field session
+/// spent six episodes on yaw across two rungs for one tau update's worth
+/// of information.
+bool axis_eligible(
+  const std::string & axis, size_t rung, size_t n_rungs,
+  bool yaw_final_rung_only);
+
+/// (steps_done, steps_total) across the whole session, for a ground
+/// station's progress display. Every eligible bucket counts at its planned
+/// episodes_per_rung; a bucket that closed early counts as complete the
+/// moment the schedule moves past it, so the fraction only ever moves
+/// forward. (rung, axis_idx, rep) is the schedule's current position.
+std::pair<int, int> session_progress(
+  const std::vector<std::string> & axes, size_t n_rungs, int episodes_per_rung,
+  size_t rung, size_t axis_idx, int rep, bool yaw_final_rung_only);
+
 /// Would a vertical leg to `leg_offset` (m, signed, from the hover point)
 /// keep clear of the altitude floor?
 ///

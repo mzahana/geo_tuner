@@ -3,6 +3,8 @@
 
 #include <rviz_common/display_context.hpp>
 
+#include <algorithm>
+
 #include <QDateTime>
 #include <QFont>
 #include <QGridLayout>
@@ -81,6 +83,20 @@ TunerPanel::TunerPanel(QWidget * parent)
     row->addWidget(abort_button_, 1);
     root->addLayout(row);
   }
+
+  // How far through the session we are, as a bar a first-time operator can
+  // read without knowing what a rung or an episode is. The conductor is
+  // the authority on the numbers; the panel only draws them.
+  progress_bar_ = new QProgressBar(this);
+  progress_bar_->setRange(0, 100);
+  progress_bar_->setValue(0);
+  progress_bar_->setAlignment(Qt::AlignCenter);
+  progress_bar_->setToolTip(
+    "Completed test steps out of the total this session has planned. "
+    "It can jump forward: an axis whose measurements already agree "
+    "finishes early.");
+  progress_bar_->hide();
+  root->addWidget(progress_bar_);
 
   // The glance lines: is it progressing, and is the vehicle where it should
   // be. One line each -- the details live in the health topic, not here.
@@ -607,6 +623,7 @@ void TunerPanel::refresh()
     banner_->setStyleSheet(kStaleStyle);
     banner_->setText(received_ ? "NO DATA - tuning_conductor stopped"
                                : "tuning_conductor not running");
+    progress_bar_->hide();
     progress_line_->setText("-");
     vehicle_line_->setText("-");
     waiting_line_->hide();
@@ -639,11 +656,42 @@ void TunerPanel::refresh()
     last_state_ = state;
   }
 
+  // "1/3" -> "1 of 3": the slash form reads as a date or a fraction to a
+  // first-time operator; "of" does not.
+  auto of_form = [](const std::string & s) {
+      QString q = QString::fromStdString(s);
+      q.replace("/", " of ");
+      return q;
+    };
+
+  // The bar: completed test steps over the session's planned total.
+  {
+    bool ok_pct = false, ok_total = false;
+    const int pct = QString::fromStdString(str("progress_pct", "")).toInt(&ok_pct);
+    const int total = QString::fromStdString(str("steps_total", "")).toInt(&ok_total);
+    if(ok_pct && ok_total && total > 0)
+    {
+      progress_bar_->setValue(std::clamp(pct, 0, 100));
+      progress_bar_->setFormat(
+        QString("test step %1 of %2 · %p%").arg(str("steps_done").c_str()).arg(total));
+      progress_bar_->show();
+    }
+    else
+      progress_bar_->hide();
+  }
+
+  // Plain words: which axis, which repetition on it, which bandwidth pass.
+  // The expert detail (wn/zeta targets) moves to the tooltip.
   progress_line_->setText(
-    QString("%1 %2 · rung %3 · ep %4 · wn %5 ζ %6")
-      .arg(str("axis").c_str()).arg(str("axis_index").c_str()).arg(str("rung").c_str())
-      .arg(str("episode").c_str()).arg(str("wn_target").c_str())
-      .arg(str("zeta_target").c_str()));
+    QString("axis %1 (%2) · step %3 on it · pass %4")
+      .arg(str("axis").c_str())
+      .arg(of_form(str("axis_index")))
+      .arg(of_form(str("episode")))
+      .arg(of_form(str("rung"))));
+  progress_line_->setToolTip(
+    QString("Each pass tests every axis at one target bandwidth, then the "
+            "next pass raises it.\nCurrent targets: wn %1 rad/s, zeta %2.")
+      .arg(str("wn_target").c_str()).arg(str("zeta_target").c_str()));
   vehicle_line_->setText(
     QString("alt %1 m (odom z) · err %2")
       .arg(str("altitude").c_str()).arg(str("pos_err").c_str()));

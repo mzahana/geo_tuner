@@ -522,8 +522,30 @@ identified gains):
    than continuing would guarantee; any discard or disagreement flies
    the full `episodes_per_rung`.
 
+5. **Yaw once, on the final rung** (`yaw_final_rung_only`, default on).
+   The yaw target is a *time constant* ($T^\star$), not a $\omega_n$: it
+   does not ladder, so a yaw bucket per rung re-identifies the same
+   quantity. Yaw now flies a single bucket on the last rung. The
+   2026-09-09 field session spent 6 of its 24 episodes on yaw for (at
+   most) one $\tau_{yaw}$ update's worth of information.
+6. **Yaw-specific fit screen** (`yaw_fit_nrmse`, default 0.25). The
+   position loops keep their nrmse < 0.15 per-episode screen; yaw is
+   looser because a 0.5 rad heading response carries more relative
+   sensor noise, and the bucket median + `estimate_consistency` is the
+   gate that actually protects $\tau_{yaw}$. The same field session
+   rejected 5 of 6 yaw fits at nrmse 0.148–0.172 whose $\hat T$
+   estimates agreed to ~1.3× — consistent evidence thrown away, and the
+   whole bucket's flight time with it.
+
 Set `bidirectional_episodes: false` and `adaptive_episode: false` to
 reproduce the original fixed-schedule timing exactly.
+
+**Instrumented, not guessed.** Every episode record in the report now
+carries `settle_s` (time spent in SETTLE before the step) and `record_s`
+(recording length), and the report carries `session_duration_s`; the
+ground station's Tuner panel shows a progress bar fed by the conductor's
+`steps_done`/`steps_total` health keys. When a session feels long, the
+report says which of the knobs above is the one to turn.
 
 **Mode supervision.** Episodes only run while PX4 reports OFFBOARD
 (`mavros/state`): outside OFFBOARD the vehicle ignores the controller's

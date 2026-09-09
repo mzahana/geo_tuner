@@ -29,6 +29,7 @@
 #include <QDoubleSpinBox>
 #include <QGroupBox>
 #include <QLabel>
+#include <QProgressBar>
 #include <QPushButton>
 #include <QTextEdit>
 #include <QToolButton>
@@ -121,6 +122,10 @@ private:
   QLabel * banner_{nullptr};
   QPushButton * start_button_{nullptr};
   QPushButton * abort_button_{nullptr};
+  /// Session completion, fed by the conductor's steps_done/steps_total/
+  /// progress_pct health keys -- the at-a-glance answer to "how much
+  /// longer", for an operator who has not read the tuner's internals.
+  QProgressBar * progress_bar_{nullptr};
   QLabel * progress_line_{nullptr};
   QLabel * vehicle_line_{nullptr};
   QLabel * waiting_line_{nullptr};

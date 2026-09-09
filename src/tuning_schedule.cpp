@@ -43,6 +43,33 @@ double wrap_angle(double a)
   return std::atan2(std::sin(a), std::cos(a));
 }
 
+bool axis_eligible(
+  const std::string & axis, size_t rung, size_t n_rungs,
+  bool yaw_final_rung_only)
+{
+  if (!yaw_final_rung_only || axis != "yaw") {return true;}
+  return n_rungs == 0 || rung + 1 == n_rungs;
+}
+
+std::pair<int, int> session_progress(
+  const std::vector<std::string> & axes, size_t n_rungs, int episodes_per_rung,
+  size_t rung, size_t axis_idx, int rep, bool yaw_final_rung_only)
+{
+  int done = 0, total = 0;
+  for (size_t r = 0; r < n_rungs; ++r) {
+    for (size_t a = 0; a < axes.size(); ++a) {
+      if (!axis_eligible(axes[a], r, n_rungs, yaw_final_rung_only)) {continue;}
+      total += episodes_per_rung;
+      if (r < rung || (r == rung && a < axis_idx)) {
+        done += episodes_per_rung;
+      } else if (r == rung && a == axis_idx) {
+        done += std::clamp(rep, 0, episodes_per_rung);
+      }
+    }
+  }
+  return {done, total};
+}
+
 bool z_leg_clears_floor(
   double hover_agl, double leg_offset, double step_size_z, double margin,
   double floor)
