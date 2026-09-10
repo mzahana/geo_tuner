@@ -156,7 +156,15 @@ bool TuningSchedule::response_settled(double t_end_abs) const
   double mean = 0.0;
   for (double y : ys) {mean += y;}
   mean /= static_cast<double>(ys.size());
-  return mean * step > 0.0 && std::abs(mean) >= 0.6 * std::abs(step);
+  // Settled means parked AT the commanded step, not merely quiet past 60 %
+  // of it. The old acceptance ended a 2026-09-10 field episode with the
+  // vehicle parked -- by a standing accel bias -- at 61 % of the step; the
+  // fit then had to explain a record that never reaches the DC gain the
+  // model is built around, and identification fell apart (see
+  // test/data/field_2026-09-10, T3 in TUNER_IMPROVEMENTS_PLAN.md). An
+  // episode that cannot reach the band keeps recording to episode_time,
+  // and the tail it captures is exactly what the fit needs to see.
+  return std::abs(mean - step) <= band;
 }
 
 bool TuningSchedule::bucket_settled() const

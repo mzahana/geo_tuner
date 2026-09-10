@@ -7,6 +7,16 @@ simulator + tuning conductor.
 `thrust_scale_error` emulates a mis-identified thrust map (the plant
 produces only e.g. 75% of the force the controller thinks it commands);
 the conductor must identify this and converge anyway.
+
+`wind_x/y/z` inject a steady disturbance acceleration [m/s^2] -- the
+standing wind + thrust-trim bias the 2026-09-10 field session measured as
+[-0.24, -0.22, +0.34]. The T3/T4 acceptance: the SETTLE-phase trim
+absorbs it, episodes settle AT the commanded step, and the session
+converges to the same gains as a calm run.
+
+`lag_mode:=per_axis` freezes each axis's in-loop lag after its first
+clean episode (T2); the acceptance is gain-convergence identical to the
+default per_episode run on a calm plant.
 """
 
 from launch import LaunchDescription
@@ -27,6 +37,9 @@ def generate_launch_description():
                                  value_type=float)
     yaw_step = ParameterValue(LaunchConfiguration("yaw_step"),
                               value_type=float)
+    wind = {("wind_accel_" + ax): ParameterValue(
+        LaunchConfiguration("wind_" + ax), value_type=float)
+        for ax in ("x", "y", "z")}
 
     controller = Node(
         package="mav_controllers_ros",
@@ -55,6 +68,7 @@ def generate_launch_description():
         parameters=[{
             "mass": 2.5,
             "thrust_scale_error": thrust_scale,
+            **wind,
             "rate_tau": 0.06,
             "odom_delay": 0.06,
             "start_position": [0.0, 0.0, 3.0],
@@ -83,12 +97,14 @@ def generate_launch_description():
             "step_size_z": step_size_z,
             "yaw_step": yaw_step,
             "settle_time": 3.0,
-            "episode_time": 6.0,
+            # episode_time deliberately NOT pinned: the conductor's 8 s
+            # default (T3) is part of what this loop exists to exercise.
             "axes": "z,x,y,yaw",
             "wn_ladder": [1.2, 1.6],
             "zeta_target": 0.95,
             "episodes_per_rung": 2,  # median-of-N path, kept short in sim
             "estimate_consistency": 1.35,
+            "lag_mode": LaunchConfiguration("lag_mode"),
             "require_offboard": False,  # quad_sim has no mavros/PX4
             "report_path": report_path,
             "safety.min_altitude": 1.0,   # m AGL
@@ -105,5 +121,9 @@ def generate_launch_description():
         DeclareLaunchArgument("step_size", default_value="0.5"),
         DeclareLaunchArgument("step_size_z", default_value="0.4"),
         DeclareLaunchArgument("yaw_step", default_value="0.5"),
+        DeclareLaunchArgument("wind_x", default_value="0.0"),
+        DeclareLaunchArgument("wind_y", default_value="0.0"),
+        DeclareLaunchArgument("wind_z", default_value="0.0"),
+        DeclareLaunchArgument("lag_mode", default_value="per_episode"),
         controller, sim, conductor,
     ])

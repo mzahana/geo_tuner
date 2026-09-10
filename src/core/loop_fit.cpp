@@ -113,7 +113,8 @@ Eigen::VectorXd closed_loop_step(
 
 LoopFitResult fit_closed_loop(
   const Eigen::VectorXd & t, const Eigen::VectorXd & y, double step,
-  double kx, double kv, double tau_guess, bool model_output_delay)
+  double kx, double kv, double tau_guess, bool model_output_delay,
+  double fixed_tau)
 {
   if (t.size() < 10) {
     throw std::invalid_argument("Need at least 10 samples to fit a step response");
@@ -133,17 +134,27 @@ LoopFitResult fit_closed_loop(
       return (amp * closed_loop_step(shifted, kx, kv, alpha, tau) - yn).eval();
     };
 
-  const Eigen::Vector4d lb(kAlphaLo, kTauLo, kDelayLo, kAmpLo);
+  const bool tau_frozen = fixed_tau > 0.0;
+  const double tau_lo = tau_frozen ? fixed_tau : kTauLo;
+  const double tau_hi = tau_frozen ? fixed_tau : kTauHi;
+  const Eigen::Vector4d lb(kAlphaLo, tau_lo, kDelayLo, kAmpLo);
   const Eigen::Vector4d ub(
-    kAlphaHi, kTauHi, model_output_delay ? kDelayHi : kDelayLo, kAmpHi);
+    kAlphaHi, tau_hi, model_output_delay ? kDelayHi : kDelayLo, kAmpHi);
 
   // Multi-start over the two dynamic unknowns only. The old fit needed
   // five starts and a prior-nearest tie-break to escape a degenerate
   // basin; here the starts exist to confirm the minimum is unique, and
   // disagreement between near-equal minima is reported rather than
-  // resolved by preference.
-  const double tg = std::clamp(tau_guess, kTauLo, kTauHi);
-  const std::vector<Eigen::Vector3d> starts = {
+  // resolved by preference. With tau frozen, alpha is the only dynamic
+  // unknown and the starts bracket it.
+  const double tg = tau_frozen ? fixed_tau : std::clamp(tau_guess, kTauLo, kTauHi);
+  const std::vector<Eigen::Vector3d> starts = tau_frozen ?
+    std::vector<Eigen::Vector3d>{
+    {0.6, tg, 0.02},
+    {1.0, tg, 0.02},
+    {1.6, tg, 0.05},
+  } :
+    std::vector<Eigen::Vector3d>{
     {1.0, tg, 0.02},
     {1.0, 0.4 * tg, 0.02},
     {1.0, 2.0 * tg, 0.05},
@@ -188,6 +199,8 @@ LoopFitResult fit_closed_loop(
 
   const double alpha = best->x[0], tau = best->x[1];
   const double td = best->x[2], amp = best->x[3];
+  // (With fixed_tau the tau interval has zero width, so pinned() on it is
+  // vacuously false and only alpha/amp/delay can flag at_bounds.)
 
   // Zero residual shift is a real answer, so the delay keeps its
   // lower-bound exemption. The lag does NOT: kTauLo sits far below any

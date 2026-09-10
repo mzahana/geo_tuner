@@ -136,7 +136,10 @@ TuningConductor::TuningConductor(const rclcpp::NodeOptions & options)
   // Altitude gate. The session refuses to start below this height above
   // ground and holds position instead -- it never climbs to reach it.
   min_tuning_altitude_ = declare_parameter<double>("min_tuning_altitude", 5.0);  // m AGL
-  z_step_margin_ = declare_parameter<double>("z_step_margin", 0.5);
+  // 1.0, not 0.5: the 2026-09-10 flight bottomed at 2.40 m AGL against a
+  // 2.00 m floor -- down-steps overshot ~20 % and the settle drift ate the
+  // rest of the old 0.5x margin. 1.0 makes the clearance 2x the step (T6).
+  z_step_margin_ = declare_parameter<double>("z_step_margin", 1.0);
   // AGL source. Odometry z is NOT height above ground: PX4's local frame
   // origin sat 6.6 m below the ground in the first field session, which
   // put every altitude limit 6.6 m out. rel_alt is height above the home
@@ -149,7 +152,9 @@ TuningConductor::TuningConductor(const rclcpp::NodeOptions & options)
   sched_.step_size_z = declare_parameter<double>("step_size_z", 0.4);    // m
   settle_time_ = declare_parameter<double>("settle_time", 4.0);          // s before each step
   hover_timeout_ = declare_parameter<double>("hover_timeout", 20.0);     // s to reach hover point
-  episode_time_ = declare_parameter<double>("episode_time", 6.0);        // s of recording
+  // 8 s, not 6: rung-2 rise times measured 2.0-3.6 s on 2026-09-10, and a
+  // de-tuned rung must still show the fit >= 2 rise times (T3).
+  episode_time_ = declare_parameter<double>("episode_time", 8.0);        // s of recording
   // Directory for raw per-episode CSVs (t,y per odometry sample). Empty
   // disables. The report records only the fits; these are the data behind
   // them, for offline analysis of sessions whose estimates disagree.
@@ -205,6 +210,23 @@ TuningConductor::TuningConductor(const rclcpp::NodeOptions & options)
   sched_.episodes_per_rung =
     std::max(1, static_cast<int>(declare_parameter<int>("episodes_per_rung", 3)));
   consistency_ = declare_parameter<double>("estimate_consistency", 1.35);
+  // T2: how the in-loop lag is treated across a position axis's episodes.
+  //   per_episode -- (alpha, tau) fitted jointly on every record; the
+  //                  flown behaviour to date.
+  //   per_axis    -- the first clean episode of each axis identifies tau;
+  //                  the rest of the session holds it frozen and fits
+  //                  alpha alone, removing the alpha/tau trade-off
+  //                  (r = +0.73 across the 2026-09-10 session) that let
+  //                  corrupted records read as plausible low alphas.
+  // per_episode remains the default until per_axis has flown a SITL
+  // acceptance (quad_sim converges to the same gains as per_episode on
+  // clean data); flip it in tuner.yaml for an A/B on the bench.
+  lag_mode_ = declare_parameter<std::string>("lag_mode", "per_episode");
+  if (lag_mode_ != "per_episode" && lag_mode_ != "per_axis") {
+    RCLCPP_WARN(
+      get_logger(), "lag_mode '%s' unknown; using per_episode", lag_mode_.c_str());
+    lag_mode_ = "per_episode";
+  }
   // --- session-time reduction (see docs/TUNING_GUIDE.md) ---
   // Sequential stopping: fly at least this many reps, and stop the bucket
   // early when every flown episode was accepted AND they agree within
@@ -227,6 +249,14 @@ TuningConductor::TuningConductor(const rclcpp::NodeOptions & options)
   // the hard cap, so this is never slower).
   min_settle_time_ = declare_parameter<double>("min_settle_time", 0.3);
   sched_.settle_quiet_time = declare_parameter<double>("settle_quiet_time", 0.4);
+  // Steady offset above which the SETTLE-phase trim learner acts (T4).
+  // Deliberately below hover_capture_radius: the GOTO_HOVER learner only
+  // ever ran when capture FAILED for 5 s, which on the 2026-09-10 flight
+  // meant one update in 163 s while an unabsorbed [-0.24,-0.22,+0.34]
+  // m/s^2 bias skewed every low-gain episode. SETTLE is where the vehicle
+  // is parked and quiet by construction, so that is where the offset is
+  // measured.
+  trim_update_threshold_ = declare_parameter<double>("trim_update_threshold", 0.05);  // m
   sched_.settle_tol_pos = declare_parameter<double>("settle_tol_pos", 0.06);   // m
   sched_.settle_tol_vel = declare_parameter<double>("settle_tol_vel", 0.10);   // m/s
   sched_.settle_tol_yaw = declare_parameter<double>("settle_tol_yaw", 0.05);   // rad
@@ -1111,6 +1141,49 @@ void TuningConductor::st_settle(double now)
   // settle_time remains the hard cap: with a noisy/windy plant this
   // degrades exactly to the previous fixed-time behaviour.
   if (elapsed < settle_time_ && !sched_.is_quiet(now)) {return;}
+  // The vehicle is parked (quiet, or as steady as it gets): absorb any
+  // remaining steady offset into the accel trim BEFORE stepping, then
+  // let it re-settle under the new trim so the step record starts from a
+  // trimmed equilibrium. Without this the trim only ever learned when
+  // GOTO_HOVER failed to capture for 5 s -- once per flight in practice
+  // -- and the unabsorbed bias corrupted every low-gain episode (T4 in
+  // TUNER_IMPROVEMENTS_PLAN.md). The residual force each axis is missing
+  // equals kx * offset: that is what the feedback is currently supplying.
+  if (sched_.odom && gains_ && trim_updates_ < max_trim_updates_) {
+    bool updated = false;
+    for (const auto & ax2 : {std::string("x"), std::string("y"), std::string("z")}) {
+      const int i = axis_index(ax2);
+      const double off = sched_.setpoint[i] - sched_.odom->pos[i];
+      if (std::abs(off) > trim_update_threshold_) {
+        const double kx = gains_->at(ax2).first;
+        a_trim_[i] = std::clamp(a_trim_[i] + 0.8 * kx * off, -max_trim_, max_trim_);
+        updated = true;
+      }
+    }
+    if (updated) {
+      ++trim_updates_;
+      status(
+        "steady offset -> accel trim [" + fmt(a_trim_[0], 2) + ", " +
+        fmt(a_trim_[1], 2) + ", " + fmt(a_trim_[2], 2) + "] m/s^2 (" +
+        std::to_string(trim_updates_) + "/" + std::to_string(max_trim_updates_) + ")");
+      if (std::any_of(
+          a_trim_.begin(), a_trim_.end(),
+          [this](double a) {return std::abs(a) >= max_trim_;}))
+      {
+        set_trim_diagnosis();
+        abort(
+          "steady-state offset exceeds trim authority" +
+          (diagnosis_.empty() ? std::string() : "; " + diagnosis_));
+        return;
+      }
+      // Unlike GOTO_HOVER, an exhausted update budget here is not an
+      // abort: the trim simply freezes and the session continues with
+      // whatever it has learned.
+      state_t0_ = now;   // re-settle under the new trim before stepping
+      sched_.reset_quiet();
+      return;
+    }
+  }
   last_settle_dur_ = elapsed;
   const std::string ax = sched_.axes[sched_.axis_idx];
   sched_.recording.clear();
@@ -1353,11 +1426,17 @@ void TuningConductor::st_analyze(double)
   rec["record_s"] = yaml_double(round_to(t.size() > 0 ? t[t.size() - 1] : 0.0, 2));
 
   LoopFitResult fit;
+  const auto frozen = axis_tau_.find(ax);
+  const bool hold_tau = lag_mode_ == "per_axis" && frozen != axis_tau_.end();
   try {
     // Identify against the loop we actually commanded: kx and kv are
     // known, so the only dynamic unknowns are the plant-gain factor and
     // the in-loop lag. attctrl_tau seeds the lag; it does not constrain it.
-    fit = fit_closed_loop(t, y, step, kx_now, kv_now, attctrl_tau_.value_or(0.15));
+    // In per_axis lag mode the axis's identified lag is frozen after its
+    // first clean episode (T2), and only alpha remains dynamic.
+    fit = fit_closed_loop(
+      t, y, step, kx_now, kv_now, attctrl_tau_.value_or(0.15),
+      /*model_output_delay=*/false, hold_tau ? frozen->second : 0.0);
     // tau carries the transport delay too; see loop_fit.hpp.
   } catch (const std::exception & e) {
     rec["action"] = std::string("episode discarded (fit error: ") + e.what() + ")";
@@ -1407,6 +1486,13 @@ void TuningConductor::st_analyze(double)
   rec["action"] = "accepted";
   results_.push_back(rec);
   sched_.bucket.add(fit.alpha, fit.tau);
+  if (lag_mode_ == "per_axis" && !hold_tau) {
+    axis_tau_[ax] = fit.tau;
+    rec["axis_tau_frozen"] = yaml_double(round_to(fit.tau, 3));
+    status(
+      ax + ": in-loop lag frozen at " + fmt(fit.tau * 1e3, 0) +
+      " ms for the rest of the session (lag_mode per_axis)");
+  }
   episode_finished();
 }
 
@@ -1716,6 +1802,7 @@ void TuningConductor::srv_reset(Trigger::Request::SharedPtr, Trigger::Response::
   last_settle_dur_ = 0.0;
   a_trim_ = {0.0, 0.0, 0.0};
   trim_updates_ = 0;
+  axis_tau_.clear();
   start_requested_ = !require_enable_;
   safety_.reset();
   hold_here();

@@ -277,6 +277,27 @@ TEST(AdaptiveEpisodeEnd, WrongDirectionRejected)
   EXPECT_FALSE(c.response_settled(t_end));
 }
 
+TEST(AdaptiveEpisodeEnd, BiasParkedShortOfTargetDoesNotEnd)
+{
+  // The 2026-09-10 regression: a standing accel bias parks the vehicle
+  // quietly at 61 % of the step. The old acceptance (quiet AND past 60 %)
+  // ended the recording there, handing the fit a curve that never reaches
+  // the DC gain the model assumes. Settled now means AT the step, within
+  // the settle band -- a bias-parked episode keeps recording to the cap.
+  auto c = make_schedule();
+  c.step_applied = 1.0;
+  const double t_end = record(c, std::vector<double>(300, 0.61));
+  EXPECT_FALSE(c.response_settled(t_end));
+}
+
+TEST(AdaptiveEpisodeEnd, WithinTheBandOfTheStepEnds)
+{
+  auto c = make_schedule();
+  c.step_applied = 1.0;   // band = max(0.04 * 1.0, 0.01) = 0.04
+  EXPECT_TRUE(c.response_settled(record(c, std::vector<double>(300, 0.97))));
+  EXPECT_FALSE(c.response_settled(record(c, std::vector<double>(300, 0.94))));
+}
+
 // -------------------------------------------------------- sequential stop
 
 TEST(SequentialStop, StopsEarlyOnTightAgreement)

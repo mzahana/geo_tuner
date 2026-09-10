@@ -170,36 +170,13 @@ std::string verdict(const geo_tuner::LoopFitResult & fit)
   return "accepted";
 }
 
-// Refit one position episode with the in-loop lag frozen: LM over
-// (alpha, delay, amplitude) only, same residual as fit_closed_loop.
+// Refit one position episode with the in-loop lag frozen -- the
+// production path (fit_closed_loop with fixed_tau), so the preview
+// exercises exactly what lag_mode per_axis flies.
 geo_tuner::LoopFitResult refit_fixed_tau(const Episode & ep, double tau)
 {
-  const Eigen::VectorXd yn = ep.y / ep.step;
-  auto residuals = [&](const Eigen::VectorXd & p) {
-      const Eigen::VectorXd shifted = ep.t.array() - p[1];
-      return (p[2] * geo_tuner::closed_loop_step(shifted, ep.kx, ep.kv, p[0], tau) -
-             yn).eval();
-    };
-  const Eigen::Vector3d lb(0.05, 0.0, 0.3), ub(10.0, 0.4, 1.7);
-  geo_tuner::LeastSquaresResult best;
-  for (double a0 : {0.6, 1.0, 1.6}) {
-    auto r = geo_tuner::least_squares_bounded(
-      residuals, geo_tuner::clip(Eigen::Vector3d(a0, 0.02, 1.0), lb, ub), lb, ub);
-    if (!best.success || (r.success && r.cost < best.cost)) {best = std::move(r);}
-  }
-  geo_tuner::LoopFitResult out;
-  out.alpha = best.x[0];
-  out.tau = tau;
-  out.delay = best.x[1];
-  out.amplitude = best.x[2] * ep.step;
-  const double rmse =
-    std::sqrt(best.fun.squaredNorm() / static_cast<double>(best.fun.size()));
-  out.rmse = rmse * std::abs(ep.step);
-  out.nrmse = rmse;
-  out.converged = best.success;
-  out.at_bounds = (best.x[0] - 0.05 < 0.01 * (10.0 - 0.05)) ||
-    (10.0 - best.x[0] < 0.01 * (10.0 - 0.05));
-  return out;
+  return geo_tuner::fit_closed_loop(
+    ep.t, ep.y, ep.step, ep.kx, ep.kv, tau, /*model_output_delay=*/false, tau);
 }
 
 struct BucketRow

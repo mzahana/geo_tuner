@@ -311,6 +311,11 @@ private:
   // which the controller uses as feedforward a_ref.
   std::array<double, 3> a_trim_{0.0, 0.0, 0.0};
   int trim_updates_{0};
+  double trim_update_threshold_{0.05};   // m; SETTLE-phase learner gate (T4)
+  // T2: lag handling ("per_episode" | "per_axis") and, in per_axis mode,
+  // the lag each axis's first clean episode identified.
+  std::string lag_mode_{"per_episode"};
+  std::map<std::string, double> axis_tau_;
   double max_trim_{3.0};            // m/s^2 per axis
   int max_trim_updates_{8};
   std::optional<rclcpp::Client<GetParameters>::SharedFuture> pending_get_;

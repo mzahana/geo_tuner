@@ -45,6 +45,15 @@ QuadSim::QuadSim(const rclcpp::NodeOptions & options)
   rate_tau_ = declare_parameter<double>("rate_tau", 0.06);            // s, PX4 rate-loop lag
   thrust_scale_ = declare_parameter<double>("thrust_scale_error", 1.0);
   drag_ = declare_parameter<double>("drag_coeff", 0.15);              // N per m/s
+  // Constant disturbance acceleration [m/s^2], inertial frame: steady
+  // wind push + thrust-map bias, the combination the 2026-09-10 field
+  // session measured as [-0.24, -0.22, +0.34]. Exists so the T3/T4
+  // acceptance (bias absorbed by the trim, episodes settle AT the target)
+  // can be flown in sim.
+  wind_accel_ = Eigen::Vector3d(
+    declare_parameter<double>("wind_accel_x", 0.0),
+    declare_parameter<double>("wind_accel_y", 0.0),
+    declare_parameter<double>("wind_accel_z", 0.0));
   const auto start =
     declare_parameter<std::vector<double>>("start_position", {0.0, 0.0, 3.0});
   cmd_timeout_ = declare_parameter<double>("cmd_timeout", 0.5);
@@ -111,7 +120,7 @@ void QuadSim::step()
   double thrust = thrust_scale_ * f_cmd_->dot(R.col(2));
   thrust = std::max(0.0, thrust);
   const Eigen::Vector3d acc = (thrust / mass_) * R.col(2) -
-    Eigen::Vector3d(0.0, 0.0, kGravity) - (drag_ / mass_) * v_;
+    Eigen::Vector3d(0.0, 0.0, kGravity) - (drag_ / mass_) * v_ + wind_accel_;
 
   v_ += acc * dt;
   p_ += v_ * dt;

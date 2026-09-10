@@ -58,6 +58,7 @@ private:
   double rate_tau_{0.06};
   double thrust_scale_{1.0};
   double drag_{0.15};
+  Eigen::Vector3d wind_accel_{0.0, 0.0, 0.0};   // steady disturbance [m/s^2]
   double odom_delay_{0.06};
   double pos_noise_{0.003};
   double vel_noise_{0.02};

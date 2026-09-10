@@ -839,3 +839,77 @@ TEST(FieldReplay, BucketOutcomesAfterRejection)
   EXPECT_FALSE(z_est.ok) << "one clean z estimate must HOLD gains, not update";
   EXPECT_EQ(static_cast<int>(z_bucket.size()), 1);
 }
+
+// ------------------------------------------------- fixed-tau fits (T2)
+
+// With the lag frozen at its true value, alpha must come back as cleanly
+// as the free fit finds it -- and the frozen dimension must never flag
+// at_bounds (the zero-width tau interval is vacuously unpinned).
+TEST(FixedTauFit, RecoversAlphaWithTheTrueLagFrozen)
+{
+  const double kx = 2.0, kv = kv_for(2.0);
+  for (double alpha : {0.7, 1.0, 1.3}) {
+    const auto s = simulate_loop(kx, kv, alpha, 0.15, 1.0, 6.0, 0.01, 0.003, 7);
+    const auto fit = fit_closed_loop(s.t, s.y, 1.0, kx, kv, 0.15, false, 0.15);
+    EXPECT_TRUE(fit.ok());
+    EXPECT_NEAR(fit.alpha, alpha, 0.06);
+    EXPECT_DOUBLE_EQ(fit.tau, 0.15);   // frozen, byte-for-byte
+  }
+}
+
+// A moderately wrong frozen lag must not silently corrupt alpha: the
+// mismatch shows up in the residual, not in a biased estimate. (The
+// 2026-09-10 preview measured this on flight data: freezing at a
+// session-median lag moved clean-episode alphas by up to ~30 % when the
+// true lag differed -- which is why lag_mode per_axis freezes each axis
+// at its OWN first clean identification, never a pooled value.)
+TEST(FixedTauFit, WrongLagShowsInTheResidual)
+{
+  const double kx = 2.0, kv = kv_for(2.0);
+  const auto s = simulate_loop(kx, kv, 1.0, 0.20, 1.0);
+  const auto right = fit_closed_loop(s.t, s.y, 1.0, kx, kv, 0.2, false, 0.20);
+  const auto wrong = fit_closed_loop(s.t, s.y, 1.0, kx, kv, 0.2, false, 0.05);
+  EXPECT_LT(right.nrmse, 0.01);
+  EXPECT_GT(wrong.nrmse, 2.0 * right.nrmse);
+}
+
+// On the flight data, freezing the lag at the axis's clean median keeps
+// the clean episodes' alphas where the free fit put them (the estimator
+// is consistent) while the corrupted episodes' corruption -- which the
+// free fit hid by pinning tau -- reappears as a residual 2x and more
+// above the clean episodes'. Note what this implies for the conductor:
+// with tau frozen there is no tau floor to pin, so T1's at-bounds
+// rejection cannot fire; in lag_mode per_axis the bucket spread gate is
+// the backstop. That is why per_episode stays the default.
+TEST(FixedTauFit, CorruptionShowsInTheResidualOnFlightData)
+{
+  const double z_tau = 0.141;   // median of the session's clean z lags
+  const auto clean = load_field_csv("ep010_z_rung1_rep2.csv");
+  const auto fclean = fit_closed_loop(
+    clean.t, clean.y, clean.step, 1.736, 2.389, z_tau, false, z_tau);
+  EXPECT_TRUE(fclean.ok());
+  EXPECT_NEAR(fclean.alpha, 1.053, 0.05);   // the free fit's answer
+  for (const char * file : {"ep008_z_rung1_rep0.csv", "ep009_z_rung1_rep1.csv"}) {
+    const auto ep = load_field_csv(file);
+    const auto fit = fit_closed_loop(
+      ep.t, ep.y, ep.step, 1.736, 2.389, z_tau, false, z_tau);
+    EXPECT_GT(fit.nrmse, 2.0 * fclean.nrmse) << file;
+  }
+}
+
+// Same invariance on the x axis: the two clean rung-1 episodes keep their
+// free-fit alphas under a frozen lag.
+TEST(FixedTauFit, CleanAlphasInvariantUnderFrozenLag)
+{
+  const struct {const char * file; double free_alpha;} cases[] = {
+    {"ep012_x_rung1_rep1.csv", 0.989},
+    {"ep013_x_rung1_rep2.csv", 1.106},
+  };
+  for (const auto & c : cases) {
+    const auto ep = load_field_csv(c.file);
+    const auto fit = fit_closed_loop(
+      ep.t, ep.y, ep.step, 1.230, 1.948, 0.138, false, 0.138);
+    EXPECT_TRUE(fit.ok()) << c.file;
+    EXPECT_NEAR(fit.alpha, c.free_alpha, 0.05) << c.file;
+  }
+}

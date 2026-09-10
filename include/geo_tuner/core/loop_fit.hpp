@@ -120,9 +120,17 @@ Eigen::VectorXd closed_loop_step(
 /// lag. Off by default and it should stay off -- see "Where the transport
 /// delay belongs" above. The switch exists so the regression test can
 /// demonstrate the worse variant.
+/// fixed_tau: > 0 freezes the in-loop lag at that value and fits only
+/// (alpha, delay, amplitude). The lag is a property of the airframe, not
+/// of an episode, so once one clean episode has identified it the
+/// remaining episodes of that axis can hold it fixed -- which removes the
+/// alpha/tau trade-off that let corrupted records masquerade as plausible
+/// low-alpha fits (T2 in TUNER_IMPROVEMENTS_PLAN.md). The returned tau is
+/// the frozen value and never counts as at_bounds.
 LoopFitResult fit_closed_loop(
   const Eigen::VectorXd & t, const Eigen::VectorXd & y, double step,
-  double kx, double kv, double tau_guess = 0.15, bool model_output_delay = false);
+  double kx, double kv, double tau_guess = 0.15, bool model_output_delay = false,
+  double fixed_tau = 0.0);
 
 }  // namespace geo_tuner
 
