@@ -2,8 +2,11 @@
 // Ported 1:1 from the package's original pytest suite.
 #include <gtest/gtest.h>
 
+#include <cctype>
 #include <cmath>
+#include <fstream>
 #include <random>
+#include <string>
 #include <vector>
 
 #include "geo_tuner/core/aggregate.hpp"
@@ -689,4 +692,150 @@ TEST(Safety, StaleOdom)
   ASSERT_EQ(v.size(), 1u);
   EXPECT_EQ(v[0], Violation::ODOM_STALE);
   EXPECT_TRUE(m.check_stale(0.1).empty());
+}
+
+// ---------------------------------------------------------------------
+// Field-session regression: the 2026-09-10 tuning flight, replayed from
+// the conductor's episode dumps (test/data/field_2026-09-10/).
+//
+// That session accepted three episodes whose fitted in-loop lag rested on
+// the solver's 5 ms floor -- z rung1 reps 0 and 1, x rung1 rep 0 -- while
+// the lag measured from the same flight's attitude telemetry is
+// 160-170 ms. Their alphas (0.905, 0.505, 0.618) poisoned both buckets
+// past the consistency gate and the session kept rung-1 gains on x and z,
+// 19-29 % under the design bandwidth. These tests pin the fix (T1 in
+// ihunter_fixes/docs/TUNER_IMPROVEMENTS_PLAN.md): a lag on the lower
+// bound is a failed fit, not "no measurable lag".
+
+namespace
+{
+
+struct FieldEpisode
+{
+  double step{};
+  Eigen::VectorXd t, y;
+};
+
+FieldEpisode load_field_csv(const std::string & name)
+{
+  const std::string path = std::string(GEO_TUNER_TEST_DATA_DIR) +
+    "/field_2026-09-10/" + name;
+  std::ifstream f(path);
+  EXPECT_TRUE(f.good()) << "missing fixture " << path;
+  FieldEpisode ep;
+  std::string line;
+  std::vector<double> ts, ys;
+  while (std::getline(f, line)) {
+    if (line.empty()) {continue;}
+    if (line[0] == '#') {
+      const auto pos = line.find("step=");
+      if (pos != std::string::npos) {ep.step = std::stod(line.substr(pos + 5));}
+      continue;
+    }
+    if (!std::isdigit(static_cast<unsigned char>(line[0])) && line[0] != '-') {
+      continue;   // "t,y"
+    }
+    const auto comma = line.find(',');
+    ts.push_back(std::stod(line.substr(0, comma)));
+    ys.push_back(std::stod(line.substr(comma + 1)));
+  }
+  ep.t = Eigen::Map<Eigen::VectorXd>(ts.data(), static_cast<Eigen::Index>(ts.size()));
+  ep.y = Eigen::Map<Eigen::VectorXd>(ys.data(), static_cast<Eigen::Index>(ys.size()));
+  return ep;
+}
+
+// Applied gains per episode, from the session report (kx_applied/kv_applied).
+struct FieldCase
+{
+  const char * file;
+  double kx, kv;
+};
+
+constexpr double kFlightTauGuess = 0.3;   // the flight's attctrl_tau
+
+}  // namespace
+
+// The three floor-pinned episodes must come back at_bounds and fail ok().
+// Before the fix they were "accepted" with alphas 0.905 / 0.505 / 0.618.
+TEST(FieldReplay, TauFloorFitsAreRejected)
+{
+  const FieldCase cases[] = {
+    {"ep008_z_rung1_rep0.csv", 1.736, 2.389},
+    {"ep009_z_rung1_rep1.csv", 1.736, 2.389},
+    {"ep011_x_rung1_rep0.csv", 1.230, 1.948},
+  };
+  for (const auto & c : cases) {
+    const auto ep = load_field_csv(c.file);
+    const auto fit = fit_closed_loop(ep.t, ep.y, ep.step, c.kx, c.kv, kFlightTauGuess);
+    EXPECT_LT(fit.tau, 0.02) << c.file << ": expected the lag to sit on the floor";
+    EXPECT_TRUE(fit.at_bounds) << c.file << ": a floor lag must count as at_bounds";
+    EXPECT_FALSE(fit.ok()) << c.file << ": a floor lag must not be accepted";
+  }
+}
+
+// Every episode whose lag fitted freely must keep fitting cleanly -- the
+// rejection must not take good identifications with it.
+TEST(FieldReplay, CleanFitsSurvive)
+{
+  const FieldCase cases[] = {
+    {"ep000_z_rung0_rep0.csv", 2.778, 2.504},
+    {"ep001_z_rung0_rep1.csv", 2.778, 2.504},
+    {"ep002_z_rung0_rep2.csv", 2.778, 2.504},
+    {"ep003_x_rung0_rep0.csv", 1.961, 2.329},
+    {"ep004_x_rung0_rep1.csv", 1.961, 2.329},
+    {"ep005_x_rung0_rep2.csv", 1.961, 2.329},
+    {"ep006_y_rung0_rep0.csv", 2.778, 3.167},
+    {"ep007_y_rung0_rep1.csv", 2.778, 3.167},
+    {"ep010_z_rung1_rep2.csv", 1.736, 2.389},
+    {"ep012_x_rung1_rep1.csv", 1.230, 1.948},
+    {"ep013_x_rung1_rep2.csv", 1.230, 1.948},
+    {"ep014_y_rung1_rep0.csv", 1.736, 2.295},
+    {"ep015_y_rung1_rep1.csv", 1.736, 2.295},
+  };
+  for (const auto & c : cases) {
+    const auto ep = load_field_csv(c.file);
+    const auto fit = fit_closed_loop(ep.t, ep.y, ep.step, c.kx, c.kv, kFlightTauGuess);
+    EXPECT_TRUE(fit.ok()) << c.file;
+    EXPECT_GT(fit.tau, 0.02) << c.file << ": clean flight lags were 61-268 ms";
+    EXPECT_GE(fit.alpha, 0.85) << c.file;
+    EXPECT_LE(fit.alpha, 1.30) << c.file;
+  }
+}
+
+// Bucket-level consequence of the rejection, with the conductor's own
+// aggregation: x rung 1 recovers (two clean estimates agree), z rung 1 is
+// safely HELD (one clean estimate is not enough to act on) instead of
+// being updated from poisoned data. Both beat the flown outcome, where
+// the poisoned spreads (2.09x, 1.79x) rejected the buckets wholesale.
+TEST(FieldReplay, BucketOutcomesAfterRejection)
+{
+  auto alpha_of = [](const char * file, double kx, double kv) {
+      const auto ep = load_field_csv(file);
+      return fit_closed_loop(ep.t, ep.y, ep.step, kx, kv, kFlightTauGuess);
+    };
+  std::vector<double> x_bucket, z_bucket;
+  for (const char * f :
+    {"ep011_x_rung1_rep0.csv", "ep012_x_rung1_rep1.csv", "ep013_x_rung1_rep2.csv"})
+  {
+    const auto fit = alpha_of(f, 1.230, 1.948);
+    if (fit.ok() && fit.alpha >= 0.4 && fit.alpha <= 2.5) {
+      x_bucket.push_back(fit.alpha);
+    }
+  }
+  for (const char * f :
+    {"ep008_z_rung1_rep0.csv", "ep009_z_rung1_rep1.csv", "ep010_z_rung1_rep2.csv"})
+  {
+    const auto fit = alpha_of(f, 1.736, 2.389);
+    if (fit.ok() && fit.alpha >= 0.4 && fit.alpha <= 2.5) {
+      z_bucket.push_back(fit.alpha);
+    }
+  }
+  const auto x_est = robust_ratio_estimate(x_bucket, 2, 1.35);
+  EXPECT_TRUE(x_est.ok) << x_est.reason;
+  EXPECT_EQ(x_est.n_used, 2);
+  EXPECT_LT(x_est.spread, 1.35);
+
+  const auto z_est = robust_ratio_estimate(z_bucket, 2, 1.35);
+  EXPECT_FALSE(z_est.ok) << "one clean z estimate must HOLD gains, not update";
+  EXPECT_EQ(static_cast<int>(z_bucket.size()), 1);
 }

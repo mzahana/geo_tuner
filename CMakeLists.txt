@@ -81,7 +81,14 @@ target_link_libraries(quad_sim geo_tuner_nodes)
 add_executable(geo-tuner-design src/nodes/design_gains_main.cpp)
 target_link_libraries(geo-tuner-design geo_tuner_core)
 
-install(TARGETS tuning_conductor quad_sim geo-tuner-design
+# Offline session replay: re-run a flown session's episode dumps through
+# the fitter, so fitter changes are proven against real flight data
+# before they fly. test/data/ carries the 2026-09-10 field session as the
+# regression fixture.
+add_executable(geo-tuner-replay src/nodes/replay_episodes_main.cpp)
+target_link_libraries(geo-tuner-replay geo_tuner_core)
+
+install(TARGETS tuning_conductor quad_sim geo-tuner-design geo-tuner-replay
   DESTINATION lib/${PROJECT_NAME}
 )
 install(TARGETS geo_tuner_core geo_tuner_nodes
@@ -167,6 +174,9 @@ if(BUILD_TESTING)
   )
   if(TARGET test_geo_tuner_core)
     target_link_libraries(test_geo_tuner_core geo_tuner_core)
+    # Field-session regression fixtures (see test_core.cpp, FieldReplay).
+    target_compile_definitions(test_geo_tuner_core PRIVATE
+      GEO_TUNER_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/data")
   endif()
 endif()
 

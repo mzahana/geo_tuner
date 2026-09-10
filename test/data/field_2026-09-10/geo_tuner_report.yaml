@@ -1,0 +1,399 @@
+status: accepted
+diagnosis: "z accel trim 0.34 m/s^2 implies thrust-map scale ~0.97: multiply max_thrust in geometric_mavros.yaml by 0.97"
+accel_trim:
+  - -0.243
+  - -0.219
+  - 0.343
+final_yawctrl_tau: 0.976
+time: 2026-09-10 12:24:07
+session_duration_s: 180.4
+zeta_target: 0.95
+wn_ladder:
+  - 1.2
+  - 1.6
+episodes:
+  - axis: z
+    rung: 0
+    rep: 0
+    wn_target: 1.2
+    step: 1.0000000000000002
+    kx_applied: 2.778
+    kv_applied: 2.504
+    settle_s: 4.02
+    record_s: 2.57
+    alpha: 1.195
+    tau_lag: 0.157
+    nrmse: 0.011
+    overshoot: 0.008
+    wn_meas: 1.822
+    zeta_meas: 0.821
+    action: accepted
+  - axis: z
+    rung: 0
+    rep: 1
+    wn_target: 1.2
+    step: -1.0000000000000002
+    kx_applied: 2.778
+    kv_applied: 2.504
+    settle_s: 4.01
+    record_s: 2.53
+    alpha: 0.903
+    tau_lag: 0.125
+    nrmse: 0.003
+    overshoot: 0.006
+    wn_meas: 1.583
+    zeta_meas: 0.714
+    action: accepted
+  - axis: z
+    rung: 0
+    rep: 2
+    wn_target: 1.2
+    step: -1.0000000000000002
+    kx_applied: 2.778
+    kv_applied: 2.504
+    settle_s: 4.02
+    record_s: 2.53
+    alpha: 0.954
+    tau_lag: 0.079
+    nrmse: 0.004
+    overshoot: 0.008
+    wn_meas: 1.628
+    zeta_meas: 0.734
+    action: accepted
+  - axis: z
+    rung: 0
+    wn_target: 1.2
+    n_episodes: 3
+    n_used: 3
+    spread: 1.324
+    tau_median: 0.125
+    wn_stability_cap: 3.8
+    alpha: 0.954
+    kx_new: 1.736
+    kv_new: 2.389
+    action: gains updated (median)
+  - axis: x
+    rung: 0
+    rep: 0
+    wn_target: 1.2
+    step: -1.0000000000000004
+    kx_applied: 1.961
+    kv_applied: 2.329
+    settle_s: 4.02
+    record_s: 3.0
+    alpha: 0.944
+    tau_lag: 0.138
+    nrmse: 0.009
+    overshoot: 0.02
+    wn_meas: 1.36
+    zeta_meas: 0.808
+    action: accepted
+  - axis: x
+    rung: 0
+    rep: 1
+    wn_target: 1.2
+    step: 1.0000000000000004
+    kx_applied: 1.961
+    kv_applied: 2.329
+    settle_s: 4.01
+    record_s: 3.04
+    alpha: 1.247
+    tau_lag: 0.268
+    nrmse: 0.003
+    overshoot: 0.014
+    wn_meas: 1.564
+    zeta_meas: 0.929
+    action: accepted
+  - axis: x
+    rung: 0
+    rep: 2
+    wn_target: 1.2
+    step: 1.0000000000000004
+    kx_applied: 1.961
+    kv_applied: 2.329
+    settle_s: 4.02
+    record_s: 3.03
+    alpha: 1.171
+    tau_lag: 0.188
+    nrmse: 0.006
+    overshoot: 0.004
+    wn_meas: 1.515
+    zeta_meas: 0.9
+    action: accepted
+  - axis: x
+    rung: 0
+    wn_target: 1.2
+    n_episodes: 3
+    n_used: 3
+    spread: 1.322
+    tau_median: 0.188
+    wn_stability_cap: 2.521
+    alpha: 1.171
+    kx_new: 1.23
+    kv_new: 1.948
+    action: gains updated (median)
+  - axis: y
+    rung: 0
+    rep: 0
+    wn_target: 1.2
+    step: 1.0000000000000004
+    kx_applied: 2.778
+    kv_applied: 3.167
+    settle_s: 4.02
+    record_s: 2.93
+    alpha: 0.952
+    tau_lag: 0.121
+    nrmse: 0.009
+    overshoot: 0.022
+    wn_meas: 1.626
+    zeta_meas: 0.927
+    action: accepted
+  - axis: y
+    rung: 0
+    rep: 1
+    wn_target: 1.2
+    step: -1.0000000000000004
+    kx_applied: 2.778
+    kv_applied: 3.167
+    settle_s: 4.01
+    record_s: 2.53
+    alpha: 1.035
+    tau_lag: 0.171
+    nrmse: 0.008
+    overshoot: 0.005
+    wn_meas: 1.696
+    zeta_meas: 0.967
+    action: accepted
+  - axis: y
+    rung: 0
+    wn_target: 1.2
+    n_episodes: 2
+    n_used: 2
+    spread: 1.088
+    tau_median: 0.146
+    wn_stability_cap: 3.248
+    alpha: 0.993
+    kx_new: 1.736
+    kv_new: 2.295
+    action: gains updated (median)
+  - axis: z
+    rung: 1
+    rep: 0
+    wn_target: 1.6
+    step: -1.0000000000000002
+    kx_applied: 1.736
+    kv_applied: 2.389
+    settle_s: 4.02
+    record_s: 3.97
+    alpha: 0.905
+    tau_lag: 0.005
+    nrmse: 0.023
+    overshoot: 0.029
+    wn_meas: 1.254
+    zeta_meas: 0.862
+    action: accepted
+  - axis: z
+    rung: 1
+    rep: 1
+    wn_target: 1.6
+    step: 1.0000000000000002
+    kx_applied: 1.736
+    kv_applied: 2.389
+    settle_s: 4.01
+    record_s: 4.87
+    alpha: 0.505
+    tau_lag: 0.005
+    nrmse: 0.04
+    overshoot: 0.04
+    wn_meas: 0.936
+    zeta_meas: 0.644
+    action: accepted
+  - axis: z
+    rung: 1
+    rep: 2
+    wn_target: 1.6
+    step: 1.0000000000000002
+    kx_applied: 1.736
+    kv_applied: 2.389
+    settle_s: 4.02
+    record_s: 3.2
+    alpha: 1.053
+    tau_lag: 0.162
+    nrmse: 0.008
+    overshoot: 0.006
+    wn_meas: 1.352
+    zeta_meas: 0.93
+    action: accepted
+  - axis: z
+    rung: 1
+    wn_target: 1.6
+    n_episodes: 3
+    n_used: 3
+    spread: 2.087
+    action: "keeping gains (estimates inconsistent: spread 2.09x > 1.35x)"
+  - axis: x
+    rung: 1
+    rep: 0
+    wn_target: 1.6
+    step: 1.0000000000000004
+    kx_applied: 1.23
+    kv_applied: 1.948
+    settle_s: 4.02
+    record_s: 4.7
+    alpha: 0.618
+    tau_lag: 0.005
+    nrmse: 0.028
+    overshoot: 0.039
+    wn_meas: 0.872
+    zeta_meas: 0.69
+    action: accepted
+  - axis: x
+    rung: 1
+    rep: 1
+    wn_target: 1.6
+    step: -1.0000000000000004
+    kx_applied: 1.23
+    kv_applied: 1.948
+    settle_s: 4.02
+    record_s: 3.8
+    alpha: 0.989
+    tau_lag: 0.099
+    nrmse: 0.01
+    overshoot: 0.007
+    wn_meas: 1.103
+    zeta_meas: 0.873
+    action: accepted
+  - axis: x
+    rung: 1
+    rep: 2
+    wn_target: 1.6
+    step: -1.0000000000000004
+    kx_applied: 1.23
+    kv_applied: 1.948
+    settle_s: 4.01
+    record_s: 4.26
+    alpha: 1.105
+    tau_lag: 0.079
+    nrmse: 0.012
+    overshoot: 0.035
+    wn_meas: 1.166
+    zeta_meas: 0.923
+    action: accepted
+  - axis: x
+    rung: 1
+    wn_target: 1.6
+    n_episodes: 3
+    n_used: 3
+    spread: 1.788
+    action: "keeping gains (estimates inconsistent: spread 1.79x > 1.35x)"
+  - axis: y
+    rung: 1
+    rep: 0
+    wn_target: 1.6
+    step: -1.0000000000000004
+    kx_applied: 1.736
+    kv_applied: 2.295
+    settle_s: 4.02
+    record_s: 3.67
+    alpha: 1.124
+    tau_lag: 0.061
+    nrmse: 0.008
+    overshoot: 0.029
+    wn_meas: 1.397
+    zeta_meas: 0.923
+    action: accepted
+  - axis: y
+    rung: 1
+    rep: 1
+    wn_target: 1.6
+    step: 1.0000000000000004
+    kx_applied: 1.736
+    kv_applied: 2.295
+    settle_s: 4.01
+    record_s: 3.54
+    alpha: 1.033
+    tau_lag: 0.087
+    nrmse: 0.007
+    overshoot: 0.028
+    wn_meas: 1.34
+    zeta_meas: 0.885
+    action: accepted
+  - axis: y
+    rung: 1
+    wn_target: 1.6
+    n_episodes: 2
+    n_used: 2
+    spread: 1.087
+    tau_median: 0.074
+    wn_stability_cap: 6.418
+    alpha: 1.079
+    kx_new: 2.373
+    kv_new: 2.818
+    action: gains updated (median)
+  - axis: yaw
+    rung: 1
+    rep: 0
+    T_target: 0.35
+    step: 0.5
+    yaw_tau_applied: 1.0
+    settle_s: 4.02
+    record_s: 2.6
+    T_meas: 0.338
+    delay: 0.355
+    nrmse: 0.057
+    action: accepted
+  - axis: yaw
+    rung: 1
+    rep: 1
+    T_target: 0.35
+    step: -0.5
+    yaw_tau_applied: 1.0
+    settle_s: 4.02
+    record_s: 2.47
+    T_meas: 0.379
+    delay: 0.257
+    nrmse: 0.061
+    action: accepted
+  - axis: yaw
+    rung: 1
+    n_episodes: 2
+    n_used: 2
+    spread: 1.122
+    T_median: 0.358
+    yaw_tau_new: 0.976
+    action: tau updated (median)
+final_gains:
+  x:
+    kx: 1.23
+    kv: 1.948
+    wn_nominal: 1.109
+    zeta_nominal: 0.878
+    alpha: 1.105
+    wn_effective: 1.166
+    zeta_effective: 0.923
+  y:
+    kx: 2.373
+    kv: 2.818
+    wn_nominal: 1.541
+    zeta_nominal: 0.915
+    alpha: 1.079
+    wn_effective: 1.6
+    zeta_effective: 0.95
+  z:
+    kx: 1.736
+    kv: 2.389
+    wn_nominal: 1.318
+    zeta_nominal: 0.906
+    alpha: 1.053
+    wn_effective: 1.352
+    zeta_effective: 0.93
+controller_yaml_snippet:
+  gains:
+    pos:
+      x: 1.23
+      y: 2.373
+      z: 1.736
+    vel:
+      x: 1.948
+      y: 2.818
+      z: 2.389

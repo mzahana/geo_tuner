@@ -189,11 +189,20 @@ LoopFitResult fit_closed_loop(
   const double alpha = best->x[0], tau = best->x[1];
   const double td = best->x[2], amp = best->x[3];
 
-  // A lag at its lower bound means "no measurable in-loop lag", and zero
-  // residual shift is likewise a real answer; neither is a failure.
+  // Zero residual shift is a real answer, so the delay keeps its
+  // lower-bound exemption. The lag does NOT: kTauLo sits far below any
+  // lag this control path can exhibit (attitude loop + transport,
+  // measured at 160-170 ms by cmd-vs-attitude cross-correlation on the
+  // 2026-09-10 flight), so tau resting on the floor means the optimizer
+  // spent the bound to buy fit quality -- a failed fit. That flight
+  // accepted three floor fits (alpha 0.905/0.505/0.618 against 0.99-1.25
+  // for clean episodes) and their spread cost the session its final rung
+  // on x and z. Regression: test_core.cpp FieldReplay, data in
+  // test/data/field_2026-09-10; rationale: ihunter_fixes/docs/
+  // TUNER_IMPROVEMENTS_PLAN.md (T1).
   const bool at_bounds =
     pinned(alpha, lb[0], ub[0]) ||
-    pinned(tau, lb[1], ub[1], /*skip_lo=*/true) ||
+    pinned(tau, lb[1], ub[1]) ||
     (model_output_delay && pinned(td, lb[2], ub[2], /*skip_lo=*/true)) ||
     pinned(amp, lb[3], ub[3]);
 
