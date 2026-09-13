@@ -52,6 +52,25 @@ RobustEstimate robust_ratio_estimate(
       std::to_string(min_count)};
   }
   if (spread > max_spread) {
+    // One outlier is exactly what the median absorbs; let the spread
+    // gate absorb it too (see the header for the field evidence).
+    if (n >= 3 && n - 1 >= min_count) {
+      size_t worst = 0;
+      double dmax = -1.0;
+      for (size_t i = 0; i < vals.size(); ++i) {
+        const double d = std::abs(std::log(vals[i] / med));
+        if (d > dmax) {dmax = d; worst = i;}
+      }
+      std::vector<double> kept = vals;
+      kept.erase(kept.begin() + static_cast<std::ptrdiff_t>(worst));
+      const double med2 = median(kept);
+      const double spread2 =
+        *std::max_element(kept.begin(), kept.end()) /
+        *std::min_element(kept.begin(), kept.end());
+      if (spread2 <= max_spread) {
+        return {med2, n - 1, spread2, true, "", 1};
+      }
+    }
     return {med, n, spread, false,
       "estimates inconsistent: spread " + fmt(spread, 2) + "x > " +
       fmt(max_spread, 2) + "x"};

@@ -105,6 +105,10 @@ public:
   std::array<double, 3> setpoint{0.0, 0.0, 3.0};
   double setpoint_yaw{0.0};
   int rep{0};
+  // Extra episodes granted to THIS bucket beyond episodes_per_rung, when
+  // aggregation failed its gate and budget remains -- disagreement is
+  // answered with more evidence, not surrender. Reset with the bucket.
+  int extra_reps{0};
   EpisodeBucket bucket;
   std::vector<std::pair<double, double>> recording;   // (t, pos[axis])
   double step_t0{0.0};

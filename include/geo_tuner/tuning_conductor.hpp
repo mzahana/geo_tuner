@@ -127,6 +127,12 @@ private:
     const Eigen::VectorXd & y, double step);
   void finalize_yaw_bucket();
   void finalize_pos_bucket(const std::string & ax);
+  /// Grant the current bucket one more episode when its aggregation
+  /// failed and extension budget remains; true when granted (the caller
+  /// returns without recording an aggregate outcome).
+  bool extend_bucket(const std::string & ax, const std::string & why);
+  /// Re-enter the episode loop for the next repetition of this bucket.
+  void fly_next_rep();
   void episode_finished();
   void advance_axis();
   /// Move forward until the current (axis, rung) is one this session flies
@@ -252,6 +258,7 @@ private:
   double max_change_{1.6};
   double stability_margin_{4.0};
   double consistency_{1.35};
+  int max_extra_episodes_{2};
   double min_settle_time_{0.3};
   bool adaptive_episode_{true};
   double min_episode_time_{2.0};

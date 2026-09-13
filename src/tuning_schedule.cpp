@@ -180,6 +180,7 @@ bool TuningSchedule::bucket_settled() const
 bool TuningSchedule::advance_axis(const std::array<double, 3> & hover, double hover_yaw)
 {
   rep = 0;
+  extra_reps = 0;
   bucket = EpisodeBucket();
   leg_offset = 0.0;
   setpoint_yaw = hover_yaw;

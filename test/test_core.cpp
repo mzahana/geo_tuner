@@ -502,17 +502,38 @@ TEST(Aggregate, MedianOfThree)
   EXPECT_EQ(est.n_used, 3);
 }
 
-TEST(Aggregate, OutlierResistant)
+TEST(Aggregate, OneOutlierIsTrimmedNotFatal)
 {
-  // median ignores one wild episode... but the spread gate must then
-  // refuse the update (2.2/0.95 >> 1.35)
+  // The median ignores one wild episode; since 2026-09-13 the spread
+  // gate does too: the two remaining estimates corroborate each other
+  // (1.0/0.95 well inside the gate), so the wild one is trimmed and the
+  // bucket passes on the remainder.
   auto est = robust_ratio_estimate({0.95, 1.0, 2.2});
+  EXPECT_TRUE(est.ok);
+  EXPECT_EQ(est.n_used, 2);
+  EXPECT_EQ(est.n_trimmed, 1);
+  EXPECT_NEAR(est.value, 0.975, 1e-12);
+  // Straight from the field (2026-09-13 09:20 flight, x rung 0: spread
+  // 1.364 failed the whole bucket even though the median was fine).
+  est = robust_ratio_estimate({1.137, 0.833, 1.027});
+  EXPECT_TRUE(est.ok);
+  EXPECT_EQ(est.n_trimmed, 1);
+  EXPECT_NEAR(est.value, 1.082, 1e-12);
+}
+
+TEST(Aggregate, TrimIsBounded)
+{
+  // Only ONE estimate may be trimmed: if the remainder still disagrees,
+  // the identification is inconsistent and the bucket fails.
+  auto est = robust_ratio_estimate({0.7, 1.0, 1.5});
   EXPECT_FALSE(est.ok);
   EXPECT_NE(est.reason.find("inconsistent"), std::string::npos);
-  // ...unless the gate is opened
-  est = robust_ratio_estimate({0.95, 1.0, 2.2}, 2, 3.0);
-  EXPECT_TRUE(est.ok);
-  EXPECT_NEAR(est.value, 1.0, 1e-12);
+  // Two disagreeing estimates cannot be trimmed below min_count -- that
+  // case is answered by flying more episodes, not by dropping half the
+  // evidence (2026-09-13 10:38 flight, x and z rung 1).
+  est = robust_ratio_estimate({1.123, 0.810});
+  EXPECT_FALSE(est.ok);
+  EXPECT_EQ(est.n_trimmed, 0);
 }
 
 TEST(Aggregate, ConsistentPairAccepted)

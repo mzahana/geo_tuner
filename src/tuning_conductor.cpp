@@ -209,6 +209,14 @@ TuningConductor::TuningConductor(const rclcpp::NodeOptions & options)
   // estimates disagree by more than this factor.
   sched_.episodes_per_rung =
     std::max(1, static_cast<int>(declare_parameter<int>("episodes_per_rung", 3)));
+  // When a bucket's aggregation fails (too few accepted estimates, or
+  // spread over the consistency gate), fly up to this many EXTRA episodes
+  // for it before giving up -- disagreement is answered with more
+  // evidence. One episode costs ~12-15 s; a failed bucket on the final
+  // rung costs the whole rung (field 2026-09-13, 10:38 flight: x and z
+  // both lost their design rung to 2-sample spreads of 1.38-1.39).
+  max_extra_episodes_ =
+    std::max(0, static_cast<int>(declare_parameter<int>("max_extra_episodes", 2)));
   consistency_ = declare_parameter<double>("estimate_consistency", 1.35);
   // T2: how the in-loop lag is treated across a position axis's episodes.
   //   per_episode -- (alpha, tau) fitted jointly on every record; the
@@ -1368,12 +1376,16 @@ void TuningConductor::finalize_yaw_bucket()
     rec["spread"] = YAML::Node(YAML::NodeType::Null);
   }
   if (!est.ok) {
+    if (extend_bucket("yaw", est.reason)) {return;}
     rec["action"] = "keeping yawctrl_tau (" + est.reason + ")";
     results_.push_back(rec);
     session_result_["yaw"] = "kept: " + est.reason;
     status("yaw: " + est.reason + "; keeping tau");
     advance_axis();
     return;
+  }
+  if (est.n_trimmed > 0) {
+    rec["n_trimmed"] = est.n_trimmed;
   }
   const double T_med = est.value;
   // T scales with the applied tau through the same (unknown) efficiency
@@ -1572,12 +1584,16 @@ void TuningConductor::finalize_pos_bucket(const std::string & ax)
     rec["spread"] = YAML::Node(YAML::NodeType::Null);
   }
   if (!est.ok) {
+    if (extend_bucket(ax, est.reason)) {return;}
     rec["action"] = "keeping gains (" + est.reason + ")";
     results_.push_back(rec);
     session_result_[ax] = "kept: " + est.reason;
     status(ax + ": " + est.reason + "; keeping gains");
     advance_axis();
     return;
+  }
+  if (est.n_trimmed > 0) {
+    rec["n_trimmed"] = est.n_trimmed;
   }
 
   // Stability margin, from the identified in-loop lag rather than a rule
@@ -1623,6 +1639,33 @@ void TuningConductor::finalize_pos_bucket(const std::string & ax)
   const double kv_new =
     std::clamp(corr.kv_new, kv_now / max_change_, kv_now * max_change_);
   rec["alpha"] = yaml_double(round_to(alpha, 3));
+
+  // A ladder rung's design can sit BELOW the gains the session entered
+  // with -- on an already-tuned vehicle every rung but the last does, by
+  // construction. Applying that design de-tunes a proven vehicle mid-
+  // session, and if the FINAL rung's bucket then fails its gate, the
+  // session ends there: strictly worse than not flying at all (field
+  // 2026-09-13, 10:38 flight -- x ended at kx 1.50 against the 2.40 it
+  // entered with). The identification itself never needs the down-step:
+  // fits are made against whatever gains were applied. So intermediate
+  // rungs only ever tune UP; only a final-rung identification, which has
+  // passed every gate, may lower gains (that is the designed correction).
+  const bool final_rung = rung_ + 1 >= wn_ladder_.size();
+  if (!final_rung && kx_new < kx_now) {
+    rec["action"] = "identified (alpha " + fmt(alpha, 2) +
+      "); current gains already above this rung's design -- not de-tuning";
+    results_.push_back(rec);
+    safe_gains_ = gains_;   // current set flew safely
+    session_result_[ax] =
+      "alpha " + fmt(alpha, 2) + " (n=" + std::to_string(est.n_used) +
+      "), holding above-rung gains";
+    status(
+      ax + ": median alpha=" + fmt(alpha, 2) + " but rung design kx " +
+      fmt(kx_new, 2) + " < current " + fmt(kx_now, 2) + "; not de-tuning");
+    advance_axis();
+    return;
+  }
+
   rec["kx_new"] = yaml_double(round_to(kx_new, 3));
   rec["kv_new"] = yaml_double(round_to(kv_new, 3));
   rec["action"] = "gains updated (median)";
@@ -1664,6 +1707,32 @@ void TuningConductor::st_update_gains(double now)
   advance_axis();
 }
 
+void TuningConductor::fly_next_rep()
+{
+  if (sched_.bidirectional) {
+    // Already settled-ish at the current leg; SETTLE waits for the
+    // quiet window rather than flying a discarded return.
+    goto_state(TunerState::SETTLE);
+  } else {
+    sched_.leg_offset = 0.0;
+    sched_.setpoint = hover_pt_;
+    sched_.setpoint_yaw = hover_yaw_;
+    goto_state(TunerState::GOTO_HOVER);
+  }
+}
+
+bool TuningConductor::extend_bucket(const std::string & ax, const std::string & why)
+{
+  if (sched_.extra_reps >= max_extra_episodes_) {return false;}
+  ++sched_.extra_reps;
+  status(
+    ax + ": " + why + " after " + std::to_string(sched_.rep) +
+    " episodes; flying one more (" + std::to_string(sched_.extra_reps) + "/" +
+    std::to_string(max_extra_episodes_) + " extra)");
+  fly_next_rep();
+  return true;
+}
+
 void TuningConductor::episode_finished()
 {
   // One step episode analyzed (accepted or discarded). Fly the next
@@ -1678,17 +1747,10 @@ void TuningConductor::episode_finished()
     sched_.step_sign *= -1.0;
   }
   ++sched_.rep;
-  if (sched_.rep < sched_.episodes_per_rung && !sched_.bucket_settled()) {
-    if (sched_.bidirectional) {
-      // Already settled-ish at the current leg; SETTLE waits for the
-      // quiet window rather than flying a discarded return.
-      goto_state(TunerState::SETTLE);
-    } else {
-      sched_.leg_offset = 0.0;
-      sched_.setpoint = hover_pt_;
-      sched_.setpoint_yaw = hover_yaw_;
-      goto_state(TunerState::GOTO_HOVER);
-    }
+  if (sched_.rep < sched_.episodes_per_rung + sched_.extra_reps &&
+    !sched_.bucket_settled())
+  {
+    fly_next_rep();
     return;
   }
   if (sched_.bucket.count() == sched_.rep && sched_.rep < sched_.episodes_per_rung) {
