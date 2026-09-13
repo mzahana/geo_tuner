@@ -14,9 +14,9 @@ standing wind + thrust-trim bias the 2026-09-10 field session measured as
 absorbs it, episodes settle AT the commanded step, and the session
 converges to the same gains as a calm run.
 
-`lag_mode:=per_axis` freezes each axis's in-loop lag after its first
-clean episode (T2); the acceptance is gain-convergence identical to the
-default per_episode run on a calm plant.
+`gust_sigma` adds the gusting disturbance the 2026-09-13 flights measured
+(0.13 m/s^2 rms, ~2 s correlation): the acceptance is that a session on
+correct gains confirms them, and one on wrong gains corrects and validates.
 """
 
 from launch import LaunchDescription
@@ -37,6 +37,7 @@ def generate_launch_description():
                                  value_type=float)
     yaw_step = ParameterValue(LaunchConfiguration("yaw_step"),
                               value_type=float)
+    gust = ParameterValue(LaunchConfiguration("gust_sigma"), value_type=float)
     wind = {("wind_accel_" + ax): ParameterValue(
         LaunchConfiguration("wind_" + ax), value_type=float)
         for ax in ("x", "y", "z")}
@@ -51,8 +52,12 @@ def generate_launch_description():
             "use_external_yaw": True,
             # deliberately conservative / slightly wrong starting gains:
             # the conductor has to identify and fix them
-            "gains.pos.x": 2.0, "gains.pos.y": 2.0, "gains.pos.z": 3.0,
-            "gains.vel.x": 2.7, "gains.vel.y": 2.7, "gains.vel.z": 3.3,
+            "gains.pos.x": LaunchConfiguration("kx_xy"),
+            "gains.pos.y": LaunchConfiguration("kx_xy"),
+            "gains.pos.z": LaunchConfiguration("kx_z"),
+            "gains.vel.x": LaunchConfiguration("kv_xy"),
+            "gains.vel.y": LaunchConfiguration("kv_xy"),
+            "gains.vel.z": LaunchConfiguration("kv_z"),
             "gains.ki.x": 0.0, "gains.ki.y": 0.0, "gains.ki.z": 0.0,
             "attctrl_tau": 0.3,
             "max_tilt_angle": 0.52,
@@ -69,6 +74,7 @@ def generate_launch_description():
             "mass": 2.5,
             "thrust_scale_error": thrust_scale,
             **wind,
+            "gust_sigma": gust,
             "rate_tau": 0.06,
             "odom_delay": 0.06,
             "start_position": [0.0, 0.0, 3.0],
@@ -90,7 +96,7 @@ def generate_launch_description():
             "hover_approach_speed": 0.7,
             # No mavros in this graph: AGL falls back to (odom z - ground_z),
             # and quad_sim's origin IS the ground.
-            "agl_topic": "",
+            "agl_topic": LaunchConfiguration("agl_topic"),
             "ground_z": 0.0,
             "min_tuning_altitude": 2.0,
             "step_size": step_size,
@@ -100,12 +106,17 @@ def generate_launch_description():
             # episode_time deliberately NOT pinned: the conductor's 8 s
             # default (T3) is part of what this loop exists to exercise.
             "axes": "z,x,y,yaw",
-            "wn_ladder": [1.2, 1.6],
+            "wn_target": 1.6,
             "zeta_target": 0.95,
-            "episodes_per_rung": 2,  # median-of-N path, kept short in sim
-            "estimate_consistency": 1.35,
-            "lag_mode": LaunchConfiguration("lag_mode"),
-            "require_offboard": False,  # quad_sim has no mavros/PX4
+            "episodes_per_round": 4,
+            "max_rounds": 3,
+            # quad_sim has no geometric_mavros node, hence no thrust estimator
+            # to verify: the only configuration that may skip the check.
+            "estimator_node": "",
+            # quad_sim has no mavros/PX4; fault-injection tests publish a fake
+            # mavros/state and rel_alt to exercise mode and AGL supervision.
+            "require_offboard": ParameterValue(
+                LaunchConfiguration("require_offboard"), value_type=bool),
             "report_path": report_path,
             "safety.min_altitude": 1.0,   # m AGL
             "safety.max_altitude": 20.0,
@@ -124,6 +135,12 @@ def generate_launch_description():
         DeclareLaunchArgument("wind_x", default_value="0.0"),
         DeclareLaunchArgument("wind_y", default_value="0.0"),
         DeclareLaunchArgument("wind_z", default_value="0.0"),
-        DeclareLaunchArgument("lag_mode", default_value="per_episode"),
+        DeclareLaunchArgument("gust_sigma", default_value="0.0"),
+        DeclareLaunchArgument("kx_xy", default_value="2.0"),
+        DeclareLaunchArgument("kv_xy", default_value="2.7"),
+        DeclareLaunchArgument("kx_z", default_value="3.0"),
+        DeclareLaunchArgument("kv_z", default_value="3.3"),
+        DeclareLaunchArgument("require_offboard", default_value="false"),
+        DeclareLaunchArgument("agl_topic", default_value=""),
         controller, sim, conductor,
     ])

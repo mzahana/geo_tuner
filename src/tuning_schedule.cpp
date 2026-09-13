@@ -70,6 +70,27 @@ std::pair<int, int> session_progress(
   return {done, total};
 }
 
+double measured_overshoot(
+  const std::vector<std::pair<double, double>> & recording, double step)
+{
+  if (recording.size() < 5 || std::abs(step) < 1e-9) {return 0.0;}
+  const double t0 = recording.front().first, t1 = recording.back().first;
+  const double t_lo = t1 - 0.2 * (t1 - t0);
+  const double sign = step > 0.0 ? 1.0 : -1.0;
+  double sum = 0.0, peak = -1e300;
+  int n = 0;
+  for (const auto & [t, y] : recording) {
+    peak = std::max(peak, sign * y);
+    if (t >= t_lo) {
+      sum += sign * y;
+      ++n;
+    }
+  }
+  const double ss = n > 0 ? sum / n : 0.0;
+  if (ss <= 1e-6) {return 0.0;}
+  return std::max(0.0, (peak - ss) / ss);
+}
+
 bool z_leg_clears_floor(
   double hover_agl, double leg_offset, double step_size_z, double margin,
   double floor)

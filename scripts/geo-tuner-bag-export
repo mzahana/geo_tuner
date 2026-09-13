@@ -1,0 +1,126 @@
+#!/usr/bin/env python3
+"""Export a recorded tuning flight to the session-recording CSV that
+geo-tuner-identify reads (the same format the conductor now writes itself).
+
+    geo-tuner-bag-export BAG_DIR OUT.csv --report REPORT.yaml [--mass 2.3] [--ns interceptor]
+
+Needs a sourced ROS 2 environment with mav_controllers_ros (SE3Command).
+Written for bags flown before the conductor recorded sessions itself: the
+gains in force are rebuilt from the report (the gains each axis entered with)
+plus the conductor's "-> kx a->b, kv c->d" status lines.
+
+Columns: t,seg,rx,ry,rz,vx,vy,vz,ux,uy,uz,kxx,kxy,kxz,kvx,kvy,kvz
+  r  setpoint position, v measured velocity, u commanded acceleration
+  (SE3Command.force / mass, gravity removed), kx/kv gains in force.
+"""
+import argparse
+import re
+
+import numpy as np
+import rosbag2_py
+import yaml
+from rclpy.serialization import deserialize_message
+from rosidl_runtime_py.utilities import get_message
+
+G = 9.81
+FS = 50.0
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('bag')
+    ap.add_argument('out')
+    ap.add_argument('--report', required=True)
+    ap.add_argument('--mass', type=float, default=2.3)
+    ap.add_argument('--ns', default='interceptor')
+    a = ap.parse_args()
+    p = '/' + a.ns.strip('/') + '/' if a.ns else '/'
+    topics = {
+        'cmd': p + 'geometric_controller/cmd',
+        'odom': p + 'geometric_controller/odom',
+        'sp': p + 'geometric_controller/multi_dof_setpoint',
+        'status': p + 'geo_tuner/status',
+    }
+    r = rosbag2_py.SequentialReader()
+    r.open(rosbag2_py.StorageOptions(uri=a.bag, storage_id='sqlite3'),
+           rosbag2_py.ConverterOptions('', ''))
+    types = {t.name: t.type for t in r.get_all_topics_and_types()}
+    r.set_filter(rosbag2_py.StorageFilter(topics=list(topics.values())))
+    cls = {k: get_message(types[v]) for k, v in topics.items()}
+    rev = {v: k for k, v in topics.items()}
+    cmd, odom, sp, status = [], [], [], []
+    while r.has_next():
+        name, data, t = r.read_next()
+        k = rev[name]
+        m = deserialize_message(data, cls[k])
+        tb = t * 1e-9
+        if k == 'cmd':
+            cmd.append((tb, m.force.x / a.mass, m.force.y / a.mass, m.force.z / a.mass - G))
+        elif k == 'odom':
+            v = m.twist.twist.linear
+            odom.append((tb, v.x, v.y, v.z))
+        elif k == 'sp':
+            tr = m.points[0].transforms[0].translation
+            sp.append((tb, tr.x, tr.y, tr.z))
+        else:
+            status.append((tb, m.data))
+    cmd, odom, sp = np.array(cmd), np.array(odom), np.array(sp)
+
+    rep = yaml.safe_load(open(a.report))
+    gains = {}
+    for e in rep['episodes']:
+        ax = e.get('axis')
+        if ax in 'xyz' and 'kx_applied' in e and ax not in gains:
+            gains[ax] = [e['kx_applied'], e['kv_applied']]
+    events = []   # (t, axis, kx, kv)
+    t_on = t_off = None
+    pat = re.compile(r'\] (\w): median alpha.*-> kx [\d.]+->([\d.]+), kv [\d.]+->([\d.]+)')
+    for tb, s in status:
+        if t_on is None and 'At hover point' in s:
+            t_on = tb
+        if 'Tuning complete' in s or 'ABORT' in s:
+            t_off = tb
+        mm = pat.search(s)
+        if mm:
+            events.append((tb, mm.group(1), float(mm.group(2)), float(mm.group(3))))
+    if t_on is None:
+        raise SystemExit('no "At hover point" status: not a tuning flight?')
+    t_off = t_off or cmd[-1, 0]
+
+    tg = np.arange(t_on, t_off, 1.0 / FS)
+    cols = {'t': tg - tg[0]}
+    for i, ax in enumerate('xyz'):
+        cols['r' + ax] = np.interp(tg, sp[:, 0], sp[:, 1 + i])
+        cols['v' + ax] = np.interp(tg, odom[:, 0], odom[:, 1 + i])
+        cols['u' + ax] = np.interp(tg, cmd[:, 0], cmd[:, 1 + i])
+    for ax in 'xyz':
+        kx = np.full(len(tg), gains[ax][0])
+        kv = np.full(len(tg), gains[ax][1])
+        for tb, eax, nkx, nkv in events:
+            if eax == ax:
+                kx[tg >= tb] = nkx
+                kv[tg >= tb] = nkv
+        cols['kx' + ax] = kx
+        cols['kv' + ax] = kv
+    # A new segment wherever the command stream stalls (a pause, or the
+    # controller not publishing): filters must not run across a gap.
+    last_cmd = np.interp(tg, cmd[:, 0], cmd[:, 0], left=-1e9)
+    idx = np.searchsorted(cmd[:, 0], tg)
+    prev_t = cmd[np.clip(idx - 1, 0, len(cmd) - 1), 0]
+    gap = (tg - prev_t) > 0.2
+    seg = np.cumsum(np.concatenate([[0], (gap[1:] & ~gap[:-1]).astype(int)]))
+    keep = ~gap
+    del last_cmd
+    order = ['t', 'rx', 'ry', 'rz', 'vx', 'vy', 'vz', 'ux', 'uy', 'uz',
+             'kxx', 'kxy', 'kxz', 'kvx', 'kvy', 'kvz']
+    with open(a.out, 'w') as f:
+        f.write('# exported from %s, mass %.3f\n' % (a.bag, a.mass))
+        f.write('t,seg,' + ','.join(order[1:]) + '\n')
+        for i in np.nonzero(keep)[0]:
+            f.write('%.3f,%d,' % (cols['t'][i], seg[i]) +
+                    ','.join('%.4f' % cols[c][i] for c in order[1:]) + '\n')
+    print('%s: %d samples, %.0f s, %d gain events' % (a.out, keep.sum(), tg[-1] - tg[0], len(events)))
+
+
+if __name__ == '__main__':
+    main()

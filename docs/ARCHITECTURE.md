@@ -66,25 +66,75 @@ Folding them in here renamed the classes from
 
 ## What the conductor does, step by step
 
-Fully automatic once started:
+Fully automatic once started. The session is flown in **rounds**:
 
-- reads the controller's current gains as the **safe baseline**;
-- injects small alternating steps (z first, then x, y, yaw) and identifies
-  each response **against the closed loop it actually commanded** — `kx`
-  and `kv` are known, so the only unknowns are the plant-gain factor α
-  (thrust-map error, inner-loop droop) and the in-loop lag τ;
-- re-places the closed-loop poles at the target `(wn, ζ)` through a **live
-  parameter update** — no landing, no restart;
-- walks `wn` up the configured ladder, re-identifying at each rung;
-- trims steady-state offsets through the setpoint acceleration feedforward
-  (bounded, ±3 m/s²) and converts a persistent z-trim into a **`max_thrust`
-  correction suggestion**;
-- writes a session report plus a tuned YAML snippet.
+1. **Preconditions.** Reads the controller's gains and `mass` as the safe
+   baseline, and refuses to start until `/<ns>/geometric_mavros_node` reports
+   `enable_thrust_estimator: false` — that estimator adapts the very plant
+   gain being measured. (It is checked on the live node because a launch-file
+   pin silently lost to the persisted override on every tuning flight
+   2026-09-09..13: an exact node-name key beats a `/**` key in ROS 2
+   parameter files.)
+2. **Excite and record.** Each axis flies `episodes_per_round` steps
+   (0 → +d → 0 → −d → 0). The whole time, at 50 Hz, the conductor records
+   setpoint, measured velocity, commanded acceleration (`SE3Command.force /
+   mass`) and the gains in force (`geo_tuner_session_<stamp>.csv`).
+3. **Identify** (`core/accel_loop_id`). Per position axis, from everything
+   recorded so far: `a = α · e^(−d s)/(τ s + 1) · a_cmd + w`. Estimated with
+   the **setpoint as instrument** (a command under feedback is correlated
+   with the wind; the setpoint is not): the nominal-loop command at several
+   time shifts spans the candidate responses, and both α and the lag are
+   chosen by **two-stage least squares** -- the residual projected onto the
+   instruments, which the gust cannot bias. (Choosing the lag on the plain
+   residual read it short in simulated gusts and long on the field flights.)
+   **90 % intervals from a block jackknife**. The work runs on a worker
+   thread in state IDENTIFY while the vehicle holds the hover point. Yaw
+   keeps its first-order fit of the heading step.
+4. **Decide** (`core/loop_design`). The design is lag-aware: `kx = wn²/α`,
+   `kv = 2ζwn/α` with `wn` the largest value ≤ `wn_target` keeping
+   `pm_nominal_deg` at the estimate and `pm_worst_deg` on the worst plant in
+   the interval. The gains in force are
+   - **updated** when they lack the margins (less `pm_tolerance_deg`) or lie
+     outside the range the α interval supports (±`gain_tolerance`) -- both
+     significant at the interval's level however wide it is -- by the
+     smallest move the evidence supports: to the nearest edge of that range
+     (the design at the upper α for soft gains, the lower α for stiff ones;
+     the soft edge for missing margin), never to the point estimate, and at
+     most `max_gain_change_factor` from the session's entry gains;
+   - **confirmed** when inside the range with margins AND the α interval is
+     at most `max_alpha_ci_ratio` wide. 1.19 is derived, not tuned: with the
+     10 % tolerance it bounds a confirmed gain's error to ~20 %;
+   - **inconclusive** otherwise: another round is flown and pooled.
+5. **Validate.** Applied gains fly the next round and are judged on **that
+   round's data alone**, as a safety test: the nominal phase margin at the
+   fresh estimate must stay above the `pm_worst_deg` floor, the α intervals
+   of design and validation must overlap (the plant did not change), and the
+   measured overshoot must stay under `validation_max_overshoot`. A failure
+   restores the entry gains. It deliberately does not re-demand the design
+   target: on a one-round estimate that rejects correct updates about half
+   the time. Whether validated gains are the best is decided again, on the
+   pooled data, by step 4. A change is never applied without a round left
+   to validate it — `max_rounds: 1` is therefore a check-only session.
 
-Each `(axis, rung)` is repeated `episodes_per_rung` times and the gains
-update from the **median** identified α; a consistency gate blocks the
-update when the accepted estimates disagree by more than
-`estimate_consistency`.
+The accel-trim learner still absorbs steady offsets through the setpoint
+feedforward (bounded) and turns a persistent z trim into a `max_thrust`
+suggestion.
+
+### Why this design (and not step-response fitting)
+
+Up to 2026-09-13 the conductor fitted `(α, τ)` to each step's position
+response and gated per-bucket spreads. Three field flights showed per-episode
+α scattering ±12 % and τ 5–268 ms on one airframe; a Monte Carlo of that
+fitter with the measured disturbance (0.13 m/s² rms, ~2 s correlation) and the
+true α fixed at 1.0 reproduced both the scatter and the "τ on the solver
+floor" fits, and put the chance of a two-rung session failing its spread gate
+at 61 % by noise alone. One step cannot separate gain from lag against a gust.
+The session recording of those flights gives, with the method above, the
+same α and lag on all three (x/y lag 110–130 ms, z 60–70 ms, α intervals
+overlapping) — pinned as tests in `test/test_identification.cpp`. An
+output-error check (closed loop simulated from the setpoint and gains alone,
+scored on measured velocity) independently puts the best lag at x 90–110,
+y 110–130, z 50–90 ms on the same flights.
 
 ## Safety architecture
 
@@ -93,20 +143,26 @@ altitude floor and ceiling, odometry staleness, and roll/pitch-rate
 oscillation energy. Any violation → gains restored to the last known-safe
 set, hover hold, session aborted with a diagnosis in the report.
 
+After an abort the **full** safe set (all axes and yawctrl_tau) is resent and
+the controller's answer awaited, with retries; health key `restore` reads
+`pending`, `confirmed` or `UNCONFIRMED`, and `~/reset` is refused until it is
+confirmed. In ABORT and DONE, while PX4 is not in OFFBOARD, the held setpoint
+follows the vehicle (and the trim is dropped), so re-engaging OFFBOARD later
+never flies back to where the session ended. Losing the height-above-ground
+topic mid-session aborts instead of re-basing the floor on odometry z.
+
 On top of that:
 
-- fit-quality gates reject bad identifications;
-- per-episode gain changes are rate-limited (`max_gain_change_factor`);
-- the ladder refuses to climb past the Routh–Hurwitz stability margin
-  implied by the *measured* in-loop lag — the closed loop is
-  `tau·s³ + s² + α·kv·s + α·kx`, unstable at `kv = tau·kx`, so the cap is
-  `wn ≤ 2ζ/(stability_margin·τ̂)`. The bandwidth limit is therefore derived
-  from what the vehicle actually did, not assumed.
+- a session cannot start unless the controller node answers
+  `enable_thrust_estimator` with an explicit boolean false (the node reads it
+  only at startup, so the fix is a relaunch, never `ros2 param set`);
+- gain changes are rate-limited (`max_gain_change_factor`) and designed to
+  keep phase margin on the worst plant the evidence allows;
+- no change survives without an out-of-sample validation; a failed one
+  restores the entry gains, so a session never ends worse than it began.
 
 The conductor **never arms, disarms or changes flight mode**. Switching out
 of OFFBOARD on the RC overrides everything.
-
-Details and quantities: TUNING_GUIDE.md §3 and A.10.
 
 ## ROS interface (tuning_conductor)
 
@@ -116,11 +172,13 @@ Details and quantities: TUNING_GUIDE.md §3 and A.10.
 | pub | `geo_tuner/status` | `std_msgs/String` |
 | pub | `geo_tuner/health` | `diagnostic_msgs/DiagnosticStatus` |
 | sub | `geometric_controller/odom` (`odom_topic`) | `nav_msgs/Odometry`, ≥ 50 Hz |
+| sub | `geometric_controller/cmd` (`cmd_topic`) | `mav_controllers_ros/SE3Command` (identification input) |
 | sub | `mavros/state` | `mavros_msgs/State` (optional) |
 | srv | `~/start`, `~/abort`, `~/accept`, `~/restore`, `~/reset` | `std_srvs/Trigger` |
 
 Gains are read and written on the controller node named by
-`controller_node` via ROS parameter services.
+`controller_node` via ROS parameter services; `enable_thrust_estimator` is
+read from `estimator_node` (a bare name takes the controller's namespace).
 
 ## Executables, launch files, configs
 
@@ -129,12 +187,14 @@ Gains are read and written on the controller node named by
 | `tuning_conductor` | the auto-tune node (field and SITL alike) |
 | `quad_sim` | lightweight quadrotor plant for the no-Gazebo closed-loop test |
 | `geo-tuner-design` | offline pole-placement gain designer (C++) |
+| `geo-tuner-identify` | the conductor's identification + verdict, offline, on a session recording CSV |
+| `geo-tuner-bag-export` | older tuning bag → session recording CSV (needs a sourced ROS env) |
 | `geo-tuner-hover` | offline ulog → hover throttle → `max_thrust` (Python; run it as `.venv/bin/python scripts/geo-tuner-hover`, it needs pyulog) |
 | `tracking_viz.py` | commanded/measured poses → Paths + error, for RViz |
 
 | Launch file | Brings up |
 | --- | --- |
-| `sim_tune.launch.py` | real controller + `quad_sim` + conductor. Args: `thrust_scale_error`, `report_path`, `step_size`, `step_size_z`, `yaw_step` |
+| `sim_tune.launch.py` | real controller + `quad_sim` + conductor. Args: `thrust_scale_error`, `gust_sigma`, `kx_xy`/`kv_xy`/`kx_z`/`kv_z` (start gains), `report_path`, `step_size`, `step_size_z`, `yaw_step` |
 | `field_tune.launch.py` | conductor only, for a real or SITL vehicle. Args: `params`, `require_enable`, `ns`, `output_dir` |
 | `field_monitor.launch.py` | RViz with the field panels (+ `tracking_viz`). Args: `rviz_config`, `tracking_viz` |
 | `sitl_test.launch.py` | d2dtracker SITL bringup with panels. Args: `ns` (default `interceptor`), `open_rviz`, `tuner`, `trajectory_type` |
@@ -160,7 +220,9 @@ read it before a field session. The knobs that matter most:
 - `step_size`, `step_size_z`, `max_yaw_step` — the manoeuvre envelope: the
   vehicle stays within ± these of the hover point, so set them to the space
   you actually have (live-settable from the Tuner panel);
-- `wn_ladder`, `zeta_target` — the bandwidth targets;
+- `wn_target`, `zeta_target`, `pm_nominal_deg`/`pm_worst_deg` — what the
+  design aims for, and the margins it will not trade away for bandwidth;
+- `max_rounds` — 3 to tune, 1 to check without changing anything;
 - `output_dir` — the one knob for session data;
 - `safety.*` — the monitor's limits.
 

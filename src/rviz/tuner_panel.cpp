@@ -683,14 +683,15 @@ void TunerPanel::refresh()
   // Plain words: which axis, which repetition on it, which bandwidth pass.
   // The expert detail (wn/zeta targets) moves to the tooltip.
   progress_line_->setText(
-    QString("axis %1 (%2) · step %3 on it · pass %4")
+    QString("axis %1 (%2) · step %3 on it · round %4")
       .arg(str("axis").c_str())
       .arg(of_form(str("axis_index")))
       .arg(of_form(str("episode")))
       .arg(of_form(str("rung"))));
   progress_line_->setToolTip(
-    QString("Each pass tests every axis at one target bandwidth, then the "
-            "next pass raises it.\nCurrent targets: wn %1 rad/s, zeta %2.")
+    QString("Each round steps every axis still being tuned, then identifies the "
+            "loop from all rounds so far and confirms, updates or keeps the gains;\n"
+            "an update is validated on the next round. Target: wn %1 rad/s, zeta %2.")
       .arg(str("wn_target").c_str()).arg(str("zeta_target").c_str()));
   vehicle_line_->setText(
     QString("alt %1 m (odom z) · err %2")
@@ -728,9 +729,16 @@ void TunerPanel::refresh()
   if(state == "WAIT_ODOM")
     blocked = "waiting on odometry";
   else if(state == "WAIT_ENABLE")
-    blocked = (str("start_requested") == "true")
+  {
+    // A refused precondition (e.g. the thrust estimator still on) is the
+    // reason a started session sits here: say it, not "waiting".
+    const std::string precondition = str("precondition", "");
+    blocked = !precondition.empty() && precondition != "-"
+                ? QString("REFUSED: ") + QString::fromStdString(precondition)
+                : (str("start_requested") == "true")
                 ? "waiting on baseline gains"
                 : "press START before switching to OFFBOARD";
+  }
   else if(state == "WAIT_OFFBOARD")
     blocked = QString("switch to OFFBOARD now - setpoints are streaming (mode: %1)")
                 .arg(str("px4_mode").c_str());
@@ -745,6 +753,15 @@ void TunerPanel::refresh()
     // the reason alone only says what tripped.
     const std::string diagnosis = str("diagnosis", "");
     blocked = QString::fromStdString(diagnosis.empty() ? str("abort_reason") : diagnosis);
+    // Whether the controller accepted the restore of the validated gains:
+    // UNCONFIRMED means land and check the gains before flying again.
+    const std::string restore = str("restore", "-");
+    if(restore == "UNCONFIRMED")
+      blocked = "GAIN RESTORE UNCONFIRMED - land and check the controller gains. " + blocked;
+    else if(restore == "pending")
+      blocked = "restoring gains... " + blocked;
+    else if(restore == "confirmed")
+      blocked = "gains restored (confirmed) - " + blocked;
     waiting_line_->setToolTip(QString::fromStdString(str("abort_reason")));
   }
   waiting_line_->setText(blocked);

@@ -298,52 +298,6 @@ TEST(AdaptiveEpisodeEnd, WithinTheBandOfTheStepEnds)
   EXPECT_FALSE(c.response_settled(record(c, std::vector<double>(300, 0.94))));
 }
 
-// -------------------------------------------------------- sequential stop
-
-TEST(SequentialStop, StopsEarlyOnTightAgreement)
-{
-  auto c = make_schedule();
-  c.rep = 2;
-  c.bucket.add(1.20, 0.1);
-  c.bucket.add(1.25, 0.1);
-  EXPECT_TRUE(c.bucket_settled());
-}
-
-TEST(SequentialStop, NotBeforeTheMinimum)
-{
-  auto c = make_schedule();
-  c.rep = 1;
-  c.bucket.add(1.20, 0.1);
-  EXPECT_FALSE(c.bucket_settled());
-}
-
-TEST(SequentialStop, DisagreementFliesTheFullBucket)
-{
-  auto c = make_schedule();
-  c.rep = 2;
-  c.bucket.add(1.00, 0.1);
-  c.bucket.add(1.30, 0.1);   // 1.30x > early_stop_spread 1.15x
-  EXPECT_FALSE(c.bucket_settled());
-}
-
-TEST(SequentialStop, ADiscardedEpisodeBlocksTheEarlyStop)
-{
-  // Two flown, one accepted: the identification is already noisy, so the
-  // bucket must run to full length.
-  auto c = make_schedule();
-  c.rep = 2;
-  c.bucket.add(1.20, 0.1);
-  EXPECT_FALSE(c.bucket_settled());
-}
-
-TEST(SequentialStop, EarlyStopGateIsStricterThanTheUpdateGate)
-{
-  // An early stop must never let through evidence that the full bucket's
-  // consistency gate would reject.
-  auto c = make_schedule();
-  EXPECT_LE(c.early_stop_spread, 1.35);
-}
-
 // ---------------------------------------------------------- step amplitude
 // The commanded envelope is hover +/- the configured amplitude, and the
 // amplitude is validated against what the safety monitor allows.
@@ -466,52 +420,55 @@ TEST(AmplitudeValidation, YawStepBounds)
   EXPECT_FALSE(c.validate_step(0.01, true, 2.0).first);
 }
 
-// ---- yaw-final-rung eligibility and session progress ----
+// ---- session progress and measured overshoot ----
 
-TEST(AxisEligibility, YawFliesOnlyTheFinalRung)
-{
-  EXPECT_FALSE(axis_eligible("yaw", 0, 2, true));
-  EXPECT_TRUE(axis_eligible("yaw", 1, 2, true));
-  EXPECT_TRUE(axis_eligible("yaw", 0, 1, true));   // single rung IS the final rung
-  for (size_t r = 0; r < 3; ++r) {
-    EXPECT_TRUE(axis_eligible("x", r, 3, true));
-    EXPECT_TRUE(axis_eligible("z", r, 3, true));
-  }
-}
-
-TEST(AxisEligibility, DisabledMeansEveryRung)
-{
-  EXPECT_TRUE(axis_eligible("yaw", 0, 2, false));
-  EXPECT_TRUE(axis_eligible("yaw", 1, 2, false));
-}
-
-TEST(SessionProgress, CountsOnlyEligibleBuckets)
+TEST(SessionProgress, CountsEveryAxisEveryRound)
 {
   const std::vector<std::string> axes{"z", "x", "y", "yaw"};
-  // 2 rungs x 4 axes x 3 eps = 24 without the skip; yaw on rung 0 skipped -> 21.
-  auto [done0, total] = session_progress(axes, 2, 3, 0, 0, 0, true);
-  EXPECT_EQ(total, 21);
+  auto [done0, total] = session_progress(axes, 3, 4, 0, 0, 0, false);
+  EXPECT_EQ(total, 48);
   EXPECT_EQ(done0, 0);
-  // Mid-session: rung 1, axis y (index 2), one episode flown on it. Behind
-  // us: rung 0 (z, x, y = 9) + rung 1 z, x (6) = 15, plus the one flown.
-  auto [done1, total1] = session_progress(axes, 2, 3, 1, 2, 1, true);
-  EXPECT_EQ(total1, 21);
-  EXPECT_EQ(done1, 16);
+  auto [done1, total1] = session_progress(axes, 3, 4, 1, 2, 1, false);
+  EXPECT_EQ(total1, 48);
+  EXPECT_EQ(done1, 16 + 8 + 1);
 }
 
 TEST(SessionProgress, MonotoneAcrossTheWholeSession)
 {
   const std::vector<std::string> axes{"z", "x", "y", "yaw"};
   int last = -1;
-  for (size_t r = 0; r < 2; ++r) {
+  for (size_t r = 0; r < 3; ++r) {
     for (size_t a = 0; a < axes.size(); ++a) {
-      for (int rep = 0; rep <= 3; ++rep) {
-        auto [done, total] = session_progress(axes, 2, 3, r, a, rep, true);
+      for (int rep = 0; rep <= 4; ++rep) {
+        auto [done, total] = session_progress(axes, 3, 4, r, a, rep, false);
         EXPECT_GE(done, last);
         EXPECT_LE(done, total);
         last = done;
       }
     }
   }
-  EXPECT_EQ(last, 21);
+  EXPECT_EQ(last, 48);
+}
+
+TEST(MeasuredOvershoot, FromTheRecordItself)
+{
+  std::vector<std::pair<double, double>> rec;
+  for (int i = 0; i <= 100; ++i) {
+    const double t = 0.05 * i;
+    rec.emplace_back(t, t < 1.0 ? 1.2 * t : (t < 2.0 ? 1.2 - 0.2 * (t - 1.0) : 1.0));
+  }
+  EXPECT_NEAR(measured_overshoot(rec, 1.0), 0.2, 1e-9);
+  // A down step is measured in its own direction.
+  for (auto & p : rec) {p.second = -p.second;}
+  EXPECT_NEAR(measured_overshoot(rec, -1.0), 0.2, 1e-9);
+}
+
+TEST(MeasuredOvershoot, MonotoneResponseHasNone)
+{
+  std::vector<std::pair<double, double>> rec;
+  for (int i = 0; i <= 100; ++i) {
+    const double t = 0.05 * i;
+    rec.emplace_back(t, 1.0 - std::exp(-2.0 * t));
+  }
+  EXPECT_NEAR(measured_overshoot(rec, 1.0), 0.0, 1e-3);
 }

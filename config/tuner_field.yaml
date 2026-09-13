@@ -71,34 +71,40 @@
     service_timeout: 5.0
 
     axes: "z,x,y,yaw"           # z first: thrust-map errors show up there
-    # Bandwidth ladder [rad/s]: each rung is identified before moving up.
-    # Keep the last rung <= (2/attctrl_tau)/4 and <= 0.35/latency.
-    wn_ladder: [1.2, 1.6, 2.0]
+    # --- identification and decision (docs/ARCHITECTURE.md) ---
+    # One bandwidth request; the lag-aware design lowers it on its own when
+    # the identified lag would not keep the phase margins below.
+    wn_target: 1.6
+    wn_target_z: -1.0         # <= 0: same as wn_target
     zeta_target: 0.95
+    # Classical robustness pair: nominal margin at the identified plant and a
+    # floor on the worst plant inside the 90 % confidence interval.
+    pm_nominal_deg: 45.0
+    pm_worst_deg: 35.0
+    # Estimation noise allowance: gains in force stand, and applied gains
+    # validate, while within this of the margins above.
+    pm_tolerance_deg: 5.0
+    # Gains within this fraction of the range the evidence supports stand.
+    gain_tolerance: 0.10
     max_gain_change_factor: 1.6
-    # How far the identified loop must stay clear of the Routh-Hurwitz
-    # stability boundary before the ladder climbs a rung. The closed loop
-    # is tau*s^3 + s^2 + alpha*kv*s + alpha*kx, unstable at kv = tau*kx, so
-    # the cap is wn <= 2*zeta / (stability_margin * tau_measured). 1.0 is
-    # the boundary itself; 4 keeps a 4x margin on the Routh product and is
-    # about as conservative as the old wn*delay <= 0.45 rule.
-    stability_margin: 4.0
-    # Repeat each step this many times per (axis, rung); gains update
-    # from the MEDIAN identified alpha. 3 gives reproducible gains at
-    # ~2x session length; the consistency gate blocks updates when the
-    # accepted estimates disagree by more than this factor.
-    episodes_per_rung: 3
-    estimate_consistency: 1.35
+    # Rounds: identify -> apply -> validate on fresh data. 3 lets a
+    # rate-limited update continue once and still be validated.
+    max_rounds: 3
+    episodes_per_round: 4     # one bidirectional cycle per axis per round
+    validation_max_overshoot: 0.25
+    yaw_tolerance: 0.25       # yaw T within 25 % of yaw_time_constant confirms
+    estimate_consistency: 1.35   # yaw per-episode agreement
+    id_confidence: 0.90
+    # geometric_mavros must report enable_thrust_estimator false before a
+    # session starts. "" skips the check: simulators without that node only.
+    estimator_node: "geometric_mavros_node"
 
     # --- session-time reduction (keeps every quality gate) ---
     # Fly the return leg as a recorded episode instead of dead time,
     # leave SETTLE/STEP as soon as the vehicle is demonstrably settled,
-    # and stop a bucket early when the reps already agree more tightly
-    # than the consistency gate demands. settle_time / episode_time stay
+    # settle_time / episode_time stay
     # the hard caps, so a noisy plant simply degrades to the old timing.
     bidirectional_episodes: true
-    min_episodes_per_rung: 2
-    early_stop_spread: 1.15
     adaptive_episode: true
     min_episode_time: 2.0
     episode_quiet_time: 0.5

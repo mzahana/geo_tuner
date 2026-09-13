@@ -1,5 +1,14 @@
 # Geometric Controller Tuning Plan — X500v2 Interceptor (2.5 kg, Jetson Orin NX)
 
+> **Superseded in part (2026-09-13).** The in-flight identification described
+> here — per-step `(α, τ)` fits, median-of-N buckets, spread gates and the
+> `wn_ladder` — has been replaced by whole-session acceleration-loop
+> identification with confidence intervals, a lag-aware phase-margin design,
+> and out-of-sample validation. See docs/ARCHITECTURE.md ("What the conductor
+> does" and "Why this design") for the current method and the flight evidence
+> behind the change. The gain-design theory and hover/max_thrust procedure
+> below remain valid.
+
 Master plan for safely computing, validating, and auto-tuning the gains of the
 `mav_controllers_ros` geometric attitude controller
 (`geometric_attitude_control_node` + mavros interface to PX4).

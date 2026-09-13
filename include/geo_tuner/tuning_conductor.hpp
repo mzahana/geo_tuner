@@ -1,16 +1,23 @@
 // In-flight auto-tuner for the mav_controllers_ros geometric controller.
 //
-// Episode-based identification tuner ("Tier 2"): while the vehicle hovers
-// in OFFBOARD under the geometric controller, this node
+// While the vehicle hovers in OFFBOARD under the geometric controller, this
+// node flies the session in ROUNDS:
 //
-//   1. publishes hover setpoints (MultiDOFJointTrajectory, the
-//      controller's standard setpoint input -- no custom messages needed);
-//   2. injects a small position step on one axis and records the response;
-//   3. fits a second-order-plus-delay model to the response;
-//   4. corrects kx/kv by pole placement toward the target (wn, zeta) via a
-//      live parameter update on the controller node (no landing/restart);
-//   5. repeats per axis, walking wn up a conservative ladder, and finally
-//      writes a tuned geometric_controller.yaml + full session report.
+//   1. publishes hover setpoints (MultiDOFJointTrajectory, the controller's
+//      standard setpoint input) and, per axis, a few position steps that
+//      excite the loop; the whole time it records setpoint, velocity,
+//      commanded acceleration (SE3Command) and the gains in force;
+//   2. at the end of a round identifies each axis's acceleration loop
+//      (plant gain + lag, with confidence intervals) from EVERYTHING recorded
+//      so far -- core/accel_loop_id.hpp;
+//   3. decides per axis (core/loop_design.hpp): gains the evidence supports
+//      and with phase margin are CONFIRMED and left alone; otherwise the
+//      lag-aware design is applied;
+//   4. flies the next round on the applied gains and VALIDATES them on that
+//      round's data alone; a failed validation restores the entry gains.
+//
+// Refuses to start while geometric_mavros's thrust-scale estimator is on: it
+// adapts the very plant gain being measured.
 //
 // A fully independent SafetyMonitor watches odometry the entire time. Any
 // violation aborts the session: gains are restored to the last known-safe
@@ -27,6 +34,7 @@
 #include <Eigen/Core>
 #include <yaml-cpp/yaml.h>
 
+#include <future>
 #include <map>
 #include <memory>
 #include <optional>
@@ -49,7 +57,13 @@
 #include <mavros_msgs/msg/state.hpp>
 #endif
 
+#include <mav_controllers_ros/msg/se3_command.hpp>
+
+#include "geo_tuner/core/accel_loop_id.hpp"
+#include "geo_tuner/core/aggregate.hpp"
+#include "geo_tuner/core/loop_design.hpp"
 #include "geo_tuner/core/safety.hpp"
+#include "geo_tuner/core/session_recording.hpp"
 #include "geo_tuner/tuning_schedule.hpp"
 
 namespace geo_tuner
@@ -65,6 +79,7 @@ enum class TunerState
   SETTLE,
   STEP,
   ANALYZE,
+  IDENTIFY,       // round flown; identification running off the control thread
   UPDATE_GAINS,
   DONE,
   ABORT,
@@ -76,11 +91,19 @@ const char * to_string(TunerState s);
 /// monitoring + offboard supervision apply).
 bool is_active_state(TunerState s);
 
-// Identified plant-gain factors outside this range are physically
-// implausible (thrust maps are not off by >2.5x on a flying vehicle) and
-// indicate a corrupted episode -- such identifications are discarded.
-inline constexpr double kAlphaMin = 0.4;
-inline constexpr double kAlphaMax = 2.5;
+/// Per-axis session bookkeeping across rounds.
+struct AxisProgress
+{
+  bool active{true};               // still flown in the next round
+  bool pending_validation{false};  // gains applied last round, not yet validated
+  bool validated{false};
+  AccelLoopResult id_design;       // identification that designed the applied gains
+  double yaw_T_design{0.0};        // yaw: T that designed the applied tau
+  std::vector<double> overshoots;  // this round's measured overshoots
+  std::vector<double> yaw_T;       // yaw: this round's accepted time constants
+  AccelLoopResult id_last;         // latest identification, for the report
+  std::string outcome;             // final one-liner for report/panel
+};
 
 class TuningConductor : public rclcpp::Node
 {
@@ -107,7 +130,7 @@ private:
   // ---- gain get/set through the controller's parameter interface ----
   void request_gains(std::optional<double> now = std::nullopt);
   void apply_yaw_tau(double tau);
-  void apply_gains(const Gains & gains);
+  void apply_gains(const Gains & gains, std::optional<double> yaw_tau = std::nullopt);
 
   // ---- state machine ----
   void tick();
@@ -120,25 +143,35 @@ private:
   void st_step(double now);
   void st_analyze(double now);
   void st_update_gains(double now);
+  void st_identify(double now);
+  /// ABORT: confirm the gain restore, retrying until the controller accepts.
+  void st_abort(double now);
+  void send_restore(double now);
 
   void analyze_yaw();
   void dump_episode(
     const std::string & ax, const Eigen::VectorXd & t,
     const Eigen::VectorXd & y, double step);
-  void finalize_yaw_bucket();
-  void finalize_pos_bucket(const std::string & ax);
-  /// Grant the current bucket one more episode when its aggregation
-  /// failed and extension budget remains; true when granted (the caller
-  /// returns without recording an aggregate outcome).
-  bool extend_bucket(const std::string & ax, const std::string & why);
-  /// Re-enter the episode loop for the next repetition of this bucket.
+  /// End of a round: identify, validate what the previous round applied,
+  /// decide, apply. Moves to the next round or finishes.
+  void finish_round();
+  /// Second half of finish_round, once the identifications are in.
+  void conclude_round();
+  void decide_position_axis(const std::string & ax, Gains & to_apply);
+  bool decide_yaw();   // true when a new tau was applied
+  /// Re-enter the episode loop for the next repetition on this axis.
   void fly_next_rep();
   void episode_finished();
   void advance_axis();
-  /// Move forward until the current (axis, rung) is one this session flies
-  /// (see axis_eligible). Returns false when that walked off the end of the
-  /// ladder -- the session is then finished and no state change remains.
-  bool seek_eligible_axis();
+  /// Move to an axis still active this round. Returns false when the round
+  /// is over (finish_round has then taken over).
+  bool seek_active_axis();
+  void record_sample();
+  void save_session_recording();
+  void cmd_cb(const mav_controllers_ros::msg::SE3Command::SharedPtr msg);
+  /// Thrust-estimator precondition, polled until it reads false.
+  bool estimator_ok(double now);
+  void start_next_round();
   void finish();
   void set_trim_diagnosis();
   void abort(const std::string & reason);
@@ -201,7 +234,10 @@ private:
 #ifdef GEO_TUNER_HAVE_MAVROS_MSGS
   rclcpp::Subscription<mavros_msgs::msg::State>::SharedPtr state_sub_;
 #endif
+  rclcpp::Subscription<mav_controllers_ros::msg::SE3Command>::SharedPtr cmd_sub_;
   rclcpp::Client<GetParameters>::SharedPtr get_param_cli_;
+  // geometric_mavros node's parameters: the thrust-estimator precondition.
+  rclcpp::Client<GetParameters>::SharedPtr estimator_param_cli_;
   rclcpp::Client<SetParameters>::SharedPtr set_param_cli_;
   rclcpp::Service<Trigger>::SharedPtr start_srv_, abort_srv_, accept_srv_,
     restore_srv_, reset_srv_;
@@ -246,19 +282,25 @@ private:
   double yaw_T_target_{0.35};
   double yaw_tau_min_{0.15};
   double yaw_tau_max_{1.2};
-  // Fly yaw buckets only on the final rung; the yaw target does not
-  // ladder, so earlier rungs would re-identify the same thing.
-  bool yaw_final_rung_only_{true};
   // Per-episode nrmse screen for the yaw first-order fit. Looser than the
   // 0.15 the closed-loop fit uses: yaw moves little against odometry noise
   // and the bucket's median + consistency gate is the real protection.
   double yaw_fit_nrmse_{0.25};
-  std::vector<double> wn_ladder_{1.2, 1.6, 2.0};
+  // Design and decision (core/loop_design.hpp). wn_target applies to x/y,
+  // wn_target_z to z.
+  DecisionConfig decision_;
+  double wn_target_z_{1.6};
   double zeta_target_{0.95};
   double max_change_{1.6};
-  double stability_margin_{4.0};
-  double consistency_{1.35};
-  int max_extra_episodes_{2};
+  int max_rounds_{3};
+  double pm_tolerance_{5.0};       // deg: hysteresis on "gains in force keep the margins"
+  double max_overshoot_{0.25};     // measured overshoot a validation accepts
+  double yaw_tolerance_{0.25};     // |log(T/T_target)| <= log(1 + this) confirms yaw
+  double consistency_{1.35};       // yaw episode agreement gate
+  AccelLoopConfig id_cfg_;
+  // Node whose enable_thrust_estimator must be false before a session may
+  // start ("" skips the check -- simulators without geometric_mavros only).
+  std::string estimator_node_;
   double min_settle_time_{0.3};
   bool adaptive_episode_{true};
   double min_episode_time_{2.0};
@@ -293,7 +335,7 @@ private:
   std::optional<double> attctrl_tau_;  // seeds the in-loop lag prior
   double pre_step_yaw_{0.0};
   double pre_step_pos_{0.0};
-  size_t rung_{0};                  // index into wn_ladder_
+  size_t round_{0};                 // 0-based round index
   double episode_min_time_{0.0};    // earliest adaptive stop [s]
   // Where the session's wall time goes: the report carries the total and,
   // per episode, how long the pre-step settle and the recording took --
@@ -306,6 +348,7 @@ private:
   // safe_gains_ won't do: it is promoted after every validated bucket.
   std::optional<Gains> baseline_gains_;
   std::optional<double> baseline_yaw_tau_;
+  std::optional<double> safe_yaw_tau_;   // last validated (or entry) yawctrl_tau
   // Per-axis one-line outcome of the last finished bucket ("alpha 1.18" or
   // "kept: ..."), published in health for the panel's result view.
   std::map<std::string, std::string> session_result_;
@@ -319,14 +362,41 @@ private:
   std::array<double, 3> a_trim_{0.0, 0.0, 0.0};
   int trim_updates_{0};
   double trim_update_threshold_{0.05};   // m; SETTLE-phase learner gate (T4)
-  // T2: lag handling ("per_episode" | "per_axis") and, in per_axis mode,
-  // the lag each axis's first clean episode identified.
-  std::string lag_mode_{"per_episode"};
-  std::map<std::string, double> axis_tau_;
-  // Every accepted (alpha, tau) this session, per axis, in all lag modes.
-  // Feeds the floor-fit rescue in st_analyze: a free fit resting on the
-  // tau floor is retried with the lag frozen at this axis's median.
-  std::map<std::string, std::vector<std::pair<double, double>>> accepted_fits_;
+  std::map<std::string, AxisProgress> axis_prog_;
+  // Round-end identification runs on a worker: a full session costs up to
+  // seconds on the vehicle computer, and the 50 Hz tick (setpoints, odometry
+  // staleness, safety) must not stall behind it.
+  struct RoundIds
+  {
+    AccelLoopResult validation;   // this round only (gains applied last round)
+    AccelLoopResult all;          // every round (the plant)
+  };
+  std::future<std::map<std::string, RoundIds>> id_future_;
+  std::map<std::string, RoundIds> round_ids_;
+  double max_identify_s_{30.0};
+  // Gain restore after an abort: "", "pending", "confirmed", "UNCONFIRMED".
+  std::string restore_state_;
+  int restore_tries_{0};
+  double restore_t0_{0.0};
+  // True when an AGL topic is configured: required to start and throughout;
+  // losing it mid-session must not silently re-base the floor on odometry z.
+  bool agl_required_{false};
+  // Session recording (identification input) and its segmentation.
+  SessionRecording recording_;
+  int rec_seg_{0};
+  bool rec_gap_{true};
+  size_t round_first_sample_{0};
+  double controller_mass_{0.0};    // kg, read from the controller with the gains
+  std::optional<std::array<double, 3>> last_cmd_force_;
+  double last_cmd_t_{-1.0};
+  // Estimator precondition.
+  std::optional<rclcpp::Client<GetParameters>::SharedFuture> pending_est_;
+  int64_t est_req_id_{0};
+  double est_request_t0_{0.0};
+  std::optional<bool> estimator_off_;
+  std::string precondition_;       // why the session is refusing to start
+  std::string session_csv_;        // where the session recording was saved
+  bool finish_after_update_{false};  // last round's parameter write ends the session
   double max_trim_{3.0};            // m/s^2 per axis
   int max_trim_updates_{8};
   std::optional<rclcpp::Client<GetParameters>::SharedFuture> pending_get_;

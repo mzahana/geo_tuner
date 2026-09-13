@@ -54,6 +54,12 @@ QuadSim::QuadSim(const rclcpp::NodeOptions & options)
     declare_parameter<double>("wind_accel_x", 0.0),
     declare_parameter<double>("wind_accel_y", 0.0),
     declare_parameter<double>("wind_accel_z", 0.0));
+  // Gusts: a first-order (Ornstein-Uhlenbeck) disturbance per axis. The
+  // 2026-09-13 flights measured 0.12-0.17 m/s^2 rms below 1 Hz with ~2 s
+  // correlation -- the disturbance that made per-step identification
+  // scatter +/-12 %. The tuner must be acceptance-tested against it.
+  gust_sigma_ = declare_parameter<double>("gust_sigma", 0.0);
+  gust_tc_ = declare_parameter<double>("gust_tc", 2.0);
   const auto start =
     declare_parameter<std::vector<double>>("start_position", {0.0, 0.0, 3.0});
   cmd_timeout_ = declare_parameter<double>("cmd_timeout", 0.5);
@@ -74,8 +80,8 @@ QuadSim::QuadSim(const rclcpp::NodeOptions & options)
     std::bind(&QuadSim::queue_odom, this));
   RCLCPP_INFO(
     get_logger(),
-    "quad_sim: mass=%g thrust_scale_error=%g rate_tau=%g odom_delay=%g",
-    mass_, thrust_scale_, rate_tau_, odom_delay_);
+    "quad_sim: mass=%g thrust_scale_error=%g rate_tau=%g odom_delay=%g gust_sigma=%g",
+    mass_, thrust_scale_, rate_tau_, odom_delay_, gust_sigma_);
 }
 
 double QuadSim::now_s()
@@ -119,8 +125,14 @@ void QuadSim::step()
   // Thrust: project commanded inertial force on current body z
   double thrust = thrust_scale_ * f_cmd_->dot(R.col(2));
   thrust = std::max(0.0, thrust);
+  if (gust_sigma_ > 0.0) {
+    std::normal_distribution<double> n01(0.0, 1.0);
+    const double ph = std::exp(-dt / std::max(gust_tc_, dt));
+    const double q = std::sqrt(1.0 - ph * ph) * gust_sigma_;
+    for (int i = 0; i < 3; ++i) {gust_[i] = ph * gust_[i] + q * n01(rng_);}
+  }
   const Eigen::Vector3d acc = (thrust / mass_) * R.col(2) -
-    Eigen::Vector3d(0.0, 0.0, kGravity) - (drag_ / mass_) * v_ + wind_accel_;
+    Eigen::Vector3d(0.0, 0.0, kGravity) - (drag_ / mass_) * v_ + wind_accel_ + gust_;
 
   v_ += acc * dt;
   p_ += v_ * dt;

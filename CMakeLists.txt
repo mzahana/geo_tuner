@@ -1,6 +1,12 @@
 cmake_minimum_required(VERSION 3.8)
 project(geo_tuner)
 
+# The round-end identification is a grid search over the whole session: an
+# unoptimised build is several times slower on the vehicle computer.
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Build type" FORCE)
+endif()
+
 if(NOT CMAKE_CXX_STANDARD)
   set(CMAKE_CXX_STANDARD 17)
   set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -40,6 +46,9 @@ add_library(geo_tuner_core SHARED
   src/core/first_order_fit.cpp
   src/core/safety.cpp
   src/core/aggregate.cpp
+  src/core/accel_loop_id.cpp
+  src/core/loop_design.cpp
+  src/core/session_recording.cpp
   src/tuning_schedule.cpp
 )
 target_include_directories(geo_tuner_core PUBLIC
@@ -81,14 +90,12 @@ target_link_libraries(quad_sim geo_tuner_nodes)
 add_executable(geo-tuner-design src/nodes/design_gains_main.cpp)
 target_link_libraries(geo-tuner-design geo_tuner_core)
 
-# Offline session replay: re-run a flown session's episode dumps through
-# the fitter, so fitter changes are proven against real flight data
-# before they fly. test/data/ carries the 2026-09-10 field session as the
-# regression fixture.
-add_executable(geo-tuner-replay src/nodes/replay_episodes_main.cpp)
-target_link_libraries(geo-tuner-replay geo_tuner_core)
+# Offline identification + gain decision on a session recording (the
+# conductor's own CSV, or one exported from an older bag).
+add_executable(geo-tuner-identify src/nodes/identify_session_main.cpp)
+target_link_libraries(geo-tuner-identify geo_tuner_core)
 
-install(TARGETS tuning_conductor quad_sim geo-tuner-design geo-tuner-replay
+install(TARGETS tuning_conductor quad_sim geo-tuner-design geo-tuner-identify
   DESTINATION lib/${PROJECT_NAME}
 )
 install(TARGETS geo_tuner_core geo_tuner_nodes
@@ -162,7 +169,7 @@ install(DIRECTORY rviz_config/ DESTINATION share/${PROJECT_NAME}/rviz)
 
 # The only Python left: the offline ulog analyser (pyulog) and the 3D
 # tracking-trail republisher.
-install(PROGRAMS scripts/geo-tuner-hover scripts/tracking_viz.py
+install(PROGRAMS scripts/geo-tuner-hover scripts/tracking_viz.py scripts/geo-tuner-bag-export
   DESTINATION lib/${PROJECT_NAME}
 )
 
@@ -171,10 +178,11 @@ if(BUILD_TESTING)
   ament_add_gtest(test_geo_tuner_core
     test/test_core.cpp
     test/test_schedule.cpp
+    test/test_identification.cpp
   )
   if(TARGET test_geo_tuner_core)
     target_link_libraries(test_geo_tuner_core geo_tuner_core)
-    # Field-session regression fixtures (see test_core.cpp, FieldReplay).
+    # Field-flight session recordings (test_identification.cpp, FieldFlights).
     target_compile_definitions(test_geo_tuner_core PRIVATE
       GEO_TUNER_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/data")
   endif()

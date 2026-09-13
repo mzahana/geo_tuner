@@ -30,7 +30,6 @@ struct RobustEstimate
   double spread{};     // max/min ratio of the used estimates (>= 1)
   bool ok{false};      // enough estimates and spread within the gate
   std::string reason;  // human-readable rejection reason if not ok
-  int n_trimmed{0};    // estimates dropped as the single outlier (0 or 1)
 };
 
 /// Aggregate repeated estimates of a positive ratio-type quantity
@@ -44,16 +43,9 @@ struct RobustEstimate
 ///             session's identification is inconsistent and no gain
 ///             update should be made from it.
 ///
-/// With >= 3 estimates, ONE outlier may be trimmed: the median is robust
-/// to a single corrupted episode by construction, but the max/min spread
-/// gate is not -- any one gust-hit episode fails the whole bucket even
-/// though the median it would have produced is fine (field 2026-09-13,
-/// 10:38 flight: three buckets failed at spreads 1.36-1.39 in ordinary
-/// air). If dropping the single estimate farthest from the median (in
-/// log) brings the remainder within the gate and still >= min_count, the
-/// bucket passes on the remainder, reported via n_trimmed. Never more
-/// than one: with 3-5 samples, trimming further is just picking the
-/// answer you like.
+/// Used for the yaw time constant only. Position axes no longer aggregate
+/// per-episode fits: they are identified from the whole session recording
+/// (core/accel_loop_id.hpp).
 RobustEstimate robust_ratio_estimate(
   const std::vector<double> & values, int min_count = 2, double max_spread = 1.35);
 

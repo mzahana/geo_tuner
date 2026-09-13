@@ -182,8 +182,14 @@ Before arming:
         <ns>/mavros/global_position/rel_alt`). The panel shows which
         source is in use; `odom_z-ground_z` means the topic is silent and
         the limits are only as good as `ground_z`.
-  - [ ] `wn_ladder`: start modest, e.g. `[1.2, 1.6]`. You can ladder
-        higher on a later flight.
+  - [ ] `wn_target` (default 1.6): the bandwidth you want. The design
+        lowers it on its own if the measured lag would cost the phase
+        margins (`pm_nominal_deg`/`pm_worst_deg`), and says so in the report.
+  - [ ] `max_rounds`: 3 to tune; 1 to check the deployed gains without
+        changing anything (`ihunter fly tuner_confirm`).
+  - [ ] Thrust estimator OFF on geometric_mavros for this launch. The
+        conductor verifies it on the live node and refuses to start
+        otherwise (health `precondition` says why).
   - [ ] safety block: `min_altitude`, `max_altitude`, `max_pos_error`
         match your field, not someone else's.
   - [ ] `step_size` / `step_size_z` / `yaw_step`: the vehicle stays within
@@ -193,9 +199,8 @@ Before arming:
         see TUNING_GUIDE A.7b. They can also be changed in flight from the
         RViz Tuner panel.
 - [ ] Fresh battery. With the default adaptive schedule a full
-      `episodes_per_rung: 3` session is ~1.5-3 min of flight (~3x
-      shorter than the old fixed schedule; see TUNING_GUIDE A.7a) —
-      still budget a battery, since wind lengthens the settle waits.
+      3-round session is ~2-5 min of flight (axes that are confirmed
+      stop flying early) — budget a battery, wind lengthens the settles.
 
 Fly:
 
@@ -224,9 +229,10 @@ sees OFFBOARD, so launch it after you are already there):
       ```
 
 - [ ] The conductor hovers, then steps each axis (z first, then x, y,
-      yaw), several times per rung. **This looks like small, repeated
-      nudges — that is normal.** Watch the terminal: it prints each
-      identification and any gain update.
+      yaw), four times per round. **This looks like small, repeated
+      nudges — that is normal.** At the end of each round it prints, per
+      axis, the identified plant gain and lag with intervals and a verdict:
+      `confirmed`, `applied ... validating next round`, or `validated`.
 - [ ] Pilot: hands on sticks the whole time. Abort = flip out of
       OFFBOARD. The conductor pauses on mode change and resumes when
       you come back to OFFBOARD; its own safety monitor also aborts and
@@ -236,9 +242,17 @@ sees OFFBOARD, so launch it after you are already there):
 After landing:
 
 - [ ] Open the report (`report_path`, default `/tmp/geo_tuner_report.yaml`).
-- [ ] Check `estimate spreads` ≤ ~1.15× (consistent identification).
-      If spreads are large or many episodes were rejected: fly the
-      session again before trusting the gains.
+- [ ] Check `final_gains.<axis>.outcome`: `confirmed` or `validated` is a
+      result you can keep. `kept, ... more data needed` means the gains in
+      force are consistent with the data but one session was not enough to
+      confirm them (y, with its short excitation, is the usual one): not a
+      failure, fly another session if you need the confirmation. `validation failed ... entry gains restored` or
+      `kept: no estimate` means the gains in force are the ones you started
+      with — read the reason before flying again.
+- [ ] Sanity-check the physics: `lag_ms` roughly 50-120 ms on z and
+      90-220 ms on x/y for this class of vehicle (x/y above z), `alpha` near 1.0 when
+      max_thrust is right. `geo-tuner-identify <session csv>` reproduces
+      the verdict offline from the recorded session.
 - [ ] Copy the `controller_yaml_snippet` from the report into
       geometric_controller.yaml (and `final_yawctrl_tau` if present).
       **Gains applied in flight are RAM-only — if you skip this, they
@@ -302,6 +316,6 @@ step by step. Uses the trajectory test node (`circle`, then
 | Anything looks wrong | Pilot: flip out of OFFBOARD (Position mode). Always works, always allowed. |
 | Drone oscillates / shakes | Take over, land. Lower gains (smaller `--wn` or previous yaml). Don't re-try with the same gains. |
 | Drone slowly sinks/climbs in hover under the controller | `max_thrust` wrong → redo the hover-ulog step. |
-| Tuner aborted itself | It restored the last safe gains and holds. Read its message, land if unsure. |
+| Tuner aborted itself | It holds position and resends the last safe gains. Health `restore` must read `confirmed`; if it reads `UNCONFIRMED`, land and `ros2 param get` the gains before flying again. |
 | Trajectory node died | Controller holds position by itself (`hold_on_setpoint_timeout`). Take over when ready. |
 | Odometry lost | Controller goes silent → PX4 offboard-loss failsafe acts. Pilot takes over immediately. |

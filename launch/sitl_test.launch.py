@@ -51,6 +51,14 @@ def generate_launch_description():
             'tuner', default_value='true',
             description='Run the geo_tuner conductor that the Tuner tab drives. '
                         'It flies nothing until START is pressed.'),
+        # panel_support reads this name directly (launch configurations are not
+        # scoped). trajectory_test_node streams TargetCommand setpoints at
+        # 100 Hz even while holding, and the controller follows whichever
+        # source spoke last -- it must not run alongside the tuner. The Tuner
+        # panel refuses START while it does.
+        DeclareLaunchArgument(
+            'trajectory', default_value='false',
+            description='Run trajectory_test_node. Only with tuner:=false.'),
         DeclareLaunchArgument(
             'trajectory_type', default_value='',
             description='Initial shape for trajectory_test_node (empty keeps the '

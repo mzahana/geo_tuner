@@ -44,9 +44,10 @@ ros2 launch geo_tuner sim_tune.launch.py
 
 This runs the **real compiled controller** against a lightweight quadrotor
 plant plus the conductor, end to end. When it finishes,
-`/tmp/geo_tuner_report.yaml` should say `status: complete` with
-`wn_effective` at the ladder target. Try
-`thrust_scale_error:=0.9` to watch it detect and correct a bad thrust map.
+`/tmp/geo_tuner_report.yaml` should say `status: complete` with every axis
+`validated` (or `confirmed`). Try `gust_sigma:=0.13` for field-level wind and
+`thrust_scale_error:=0.8` to watch it detect, correct and validate a bad
+thrust map.
 
 If that works, your build is good and you understand what a session looks
 like.
@@ -129,10 +130,12 @@ a day of repeated sessions never overwrites anything.
 - Copy `final_gains` from the report into `geometric_controller.yaml`.
 - If the report suggests a `max_thrust` correction, apply it to
   `geometric_mavros.yaml` — that fix benefits everything, not just tuning.
-- Keep the whole `output_dir` folder: the reports carry every episode's fit
-  (α, τ, NRMSE, overshoot, action) and the CSVs are the raw responses
-  behind them.
-- For an agility pass, re-run with `attctrl_tau: 0.2` and a higher ladder.
+- Keep the whole `output_dir` folder: the report carries each round's
+  identification (α and lag with intervals), verdict, design, phase margins
+  and validation; `geo_tuner_session_<stamp>.csv` is the recording they came
+  from — `geo-tuner-identify` reproduces the verdict offline.
+- For an agility pass, re-run with `attctrl_tau: 0.2` and a higher
+  `wn_target` — the design will refuse bandwidth the lag cannot support.
 
 ---
 

@@ -58,6 +58,13 @@ std::pair<int, int> session_progress(
   const std::vector<std::string> & axes, size_t n_rungs, int episodes_per_rung,
   size_t rung, size_t axis_idx, int rep, bool yaw_final_rung_only);
 
+/// Overshoot of a recorded step, straight from the data: how far past its
+/// final value (mean of the last 20 % of the record) the response went, as a
+/// fraction of that value, in the direction of the step. 0 when it never
+/// passed it.
+double measured_overshoot(
+  const std::vector<std::pair<double, double>> & recording, double step);
+
 /// Would a vertical leg to `leg_offset` (m, signed, from the hover point)
 /// keep clear of the altitude floor?
 ///

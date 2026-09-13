@@ -88,6 +88,7 @@ const char * to_string(TunerState s)
     case TunerState::SETTLE: return "SETTLE";
     case TunerState::STEP: return "STEP";
     case TunerState::ANALYZE: return "ANALYZE";
+    case TunerState::IDENTIFY: return "IDENTIFY";
     case TunerState::UPDATE_GAINS: return "UPDATE_GAINS";
     case TunerState::DONE: return "DONE";
     case TunerState::ABORT: return "ABORT";
@@ -100,7 +101,7 @@ bool is_active_state(TunerState s)
   return s == TunerState::TOO_LOW || s == TunerState::GOTO_HOVER ||
          s == TunerState::SETTLE ||
          s == TunerState::STEP || s == TunerState::ANALYZE ||
-         s == TunerState::UPDATE_GAINS;
+         s == TunerState::IDENTIFY || s == TunerState::UPDATE_GAINS;
 }
 
 TuningConductor::TuningConductor(const rclcpp::NodeOptions & options)
@@ -148,6 +149,10 @@ TuningConductor::TuningConductor(const rclcpp::NodeOptions & options)
     declare_parameter<std::string>("agl_topic", "mavros/global_position/rel_alt");
   agl_timeout_ = declare_parameter<double>("agl_timeout", 2.0);            // s
   ground_z_ = declare_parameter<double>("ground_z", 0.0);                  // m, odom frame
+  // A configured AGL topic is REQUIRED -- to start and for the whole session.
+  // Deciding from whether a message happened to have arrived at hover capture
+  // raced the topic's first message and silently put the floor on odometry z.
+  agl_required_ = !agl_topic.empty();
   sched_.step_size = declare_parameter<double>("step_size", 0.5);        // m
   sched_.step_size_z = declare_parameter<double>("step_size_z", 0.4);    // m
   settle_time_ = declare_parameter<double>("settle_time", 4.0);          // s before each step
@@ -182,11 +187,6 @@ TuningConductor::TuningConductor(const rclcpp::NodeOptions & options)
   yaw_T_target_ = declare_parameter<double>("yaw_time_constant", 0.35);   // s, target T
   yaw_tau_min_ = declare_parameter<double>("yawctrl_tau_min", 0.15);
   yaw_tau_max_ = declare_parameter<double>("yawctrl_tau_max", 1.2);
-  // Yaw is a time-constant target, not a wn target: it does not ladder, so
-  // a yaw bucket per rung re-identifies the same thing. Fly it once, on
-  // the final rung (the 2026-09-09 field session spent 6 of 24 episodes
-  // on yaw for at most one tau update's worth of information).
-  yaw_final_rung_only_ = declare_parameter<bool>("yaw_final_rung_only", true);
   // Per-episode quality screen for the yaw fit. The closed-loop (position)
   // fit keeps its 0.15: yaw is looser because a 0.5 rad heading response
   // carries more relative sensor noise, and the real gate on what reaches
@@ -194,58 +194,67 @@ TuningConductor::TuningConductor(const rclcpp::NodeOptions & options)
   // the fixed 0.15 rejected 5 of 6 yaw episodes at nrmse 0.148-0.172 whose
   // T estimates agreed to ~1.3x -- consistent evidence thrown away.
   yaw_fit_nrmse_ = declare_parameter<double>("yaw_fit_nrmse", 0.25);
-  // wn ladder: identify at each rung before pushing bandwidth up
-  wn_ladder_ = declare_parameter<std::vector<double>>("wn_ladder", {1.2, 1.6, 2.0});
+  // ---- design and decision (core/loop_design.hpp) ----
+  // One bandwidth request, not a ladder: the lag-aware design lowers it on
+  // its own when the identified lag would not leave the phase margin.
+  decision_.wn_target = declare_parameter<double>("wn_target", 1.6);
+  wn_target_z_ = declare_parameter<double>("wn_target_z", -1.0);
+  if (wn_target_z_ <= 0.0) {wn_target_z_ = decision_.wn_target;}
   zeta_target_ = declare_parameter<double>("zeta_target", 0.95);
+  decision_.zeta = zeta_target_;
+  // Classical robustness pair, not fitted to any flight: nominal margin at
+  // the identified plant, and a floor on the worst plant in the interval.
+  decision_.margins.nominal_deg = declare_parameter<double>("pm_nominal_deg", 45.0);
+  decision_.margins.worst_deg = declare_parameter<double>("pm_worst_deg", 35.0);
+  // Materiality: gains within this fraction of the range the evidence
+  // supports are left alone.
+  decision_.gain_tolerance = declare_parameter<double>("gain_tolerance", 0.10);
+  // Confirming gains needs an alpha interval at most this wide (hi/lo);
+  // wider evidence flies another round instead.
+  decision_.max_alpha_ci_ratio = declare_parameter<double>("max_alpha_ci_ratio", 1.19);
   max_change_ = declare_parameter<double>("max_gain_change_factor", 1.6);
-  // How far the identified loop must stay clear of the Routh-Hurwitz
-  // stability boundary before the ladder is allowed to climb. 1.0 is the
-  // boundary itself; the default keeps a 4x margin on the Routh product.
-  stability_margin_ = declare_parameter<double>("stability_margin", 4.0);
-  // Repeat each step N times per (axis, rung) and update from the MEDIAN
-  // identified alpha/T: single-episode fits are noisy (the lateral
-  // response is truly higher-order) and that noise maps 1:1 into the
-  // gains. The consistency gate refuses any update when the accepted
-  // estimates disagree by more than this factor.
+  decision_.max_change = max_change_;
+  // Rounds: identify -> apply -> validate. Three lets a rate-limited
+  // update continue once and still be validated.
+  max_rounds_ = std::max(1, static_cast<int>(declare_parameter<int>("max_rounds", 3)));
+  // Degrees of phase margin estimation noise is allowed to cost: gains in
+  // force stand, and validated gains pass, while within this of the spec.
+  pm_tolerance_ = declare_parameter<double>("pm_tolerance_deg", 5.0);
+  decision_.pm_hysteresis_deg = pm_tolerance_;
+  max_overshoot_ = declare_parameter<double>("validation_max_overshoot", 0.25);
+  yaw_tolerance_ = declare_parameter<double>("yaw_tolerance", 0.25);
+  // Steps per axis per round. 4 = one full bidirectional cycle
+  // (0 -> +d -> 0 -> -d -> 0), so a round never leaves the vehicle offset.
   sched_.episodes_per_rung =
-    std::max(1, static_cast<int>(declare_parameter<int>("episodes_per_rung", 3)));
-  // When a bucket's aggregation fails (too few accepted estimates, or
-  // spread over the consistency gate), fly up to this many EXTRA episodes
-  // for it before giving up -- disagreement is answered with more
-  // evidence. One episode costs ~12-15 s; a failed bucket on the final
-  // rung costs the whole rung (field 2026-09-13, 10:38 flight: x and z
-  // both lost their design rung to 2-sample spreads of 1.38-1.39).
-  max_extra_episodes_ =
-    std::max(0, static_cast<int>(declare_parameter<int>("max_extra_episodes", 2)));
+    std::max(1, static_cast<int>(declare_parameter<int>("episodes_per_round", 4)));
+  sched_.min_episodes = sched_.episodes_per_rung;
+  // Yaw's per-episode time constants must agree this well to act on.
   consistency_ = declare_parameter<double>("estimate_consistency", 1.35);
-  // T2: how the in-loop lag is treated across a position axis's episodes.
-  //   per_episode -- (alpha, tau) fitted jointly on every record; the
-  //                  flown behaviour to date.
-  //   per_axis    -- the first clean episode of each axis identifies tau;
-  //                  the rest of the session holds it frozen and fits
-  //                  alpha alone, removing the alpha/tau trade-off
-  //                  (r = +0.73 across the 2026-09-10 session) that let
-  //                  corrupted records read as plausible low alphas.
-  // per_episode remains the default until per_axis has flown a SITL
-  // acceptance (quad_sim converges to the same gains as per_episode on
-  // clean data); flip it in tuner.yaml for an A/B on the bench.
-  lag_mode_ = declare_parameter<std::string>("lag_mode", "per_episode");
-  if (lag_mode_ != "per_episode" && lag_mode_ != "per_axis") {
-    RCLCPP_WARN(
-      get_logger(), "lag_mode '%s' unknown; using per_episode", lag_mode_.c_str());
-    lag_mode_ = "per_episode";
+  // Identification (core/accel_loop_id.hpp).
+  id_cfg_.fs = rate_hz_;
+  id_cfg_.confidence = declare_parameter<double>("id_confidence", 0.90);
+  id_cfg_.min_excited_s = declare_parameter<double>("id_min_excited_s", 1.5);
+  id_cfg_.min_r2 = declare_parameter<double>("id_min_r2", 0.6);
+  // The node whose enable_thrust_estimator must read false before a session
+  // starts: that estimator adapts the plant gain while it is measured. A bare
+  // name takes controller_node's namespace. "" skips the check (only for
+  // simulators that have no geometric_mavros node).
+  estimator_node_ = declare_parameter<std::string>("estimator_node", "geometric_mavros_node");
+  const auto cmd_topic =
+    declare_parameter<std::string>("cmd_topic", "geometric_controller/cmd");
+
+  // Parameters of the retired ladder/bucket logic. A profile still setting
+  // them would silently not do what it says: say so.
+  for (const char * gone : {"wn_ladder", "episodes_per_rung", "max_extra_episodes",
+      "lag_mode", "stability_margin", "min_episodes_per_rung", "early_stop_spread",
+      "yaw_final_rung_only"})
+  {
+    if (get_node_parameters_interface()->get_parameter_overrides().count(gone)) {
+      RCLCPP_WARN(
+        get_logger(), "parameter '%s' no longer exists and is ignored (see wn_target, "
+        "episodes_per_round, max_rounds)", gone);
+    }
   }
-  // --- session-time reduction (see docs/TUNING_GUIDE.md) ---
-  // Sequential stopping: fly at least this many reps, and stop the bucket
-  // early when every flown episode was accepted AND they agree within
-  // early_stop_spread -- a gate STRICTER than estimate_consistency, so an
-  // early stop only happens on evidence better than what a full bucket is
-  // required to produce.
-  sched_.min_episodes = std::max(
-    1, std::min(
-      static_cast<int>(declare_parameter<int>("min_episodes_per_rung", 2)),
-      sched_.episodes_per_rung));
-  sched_.early_stop_spread = declare_parameter<double>("early_stop_spread", 1.15);
   // Bidirectional episodes: instead of flying back to the hover point and
   // throwing that leg away, record it. The setpoint walks
   // 0 -> +d -> 0 -> -d -> 0 ...; every leg is a clean step of size d from
@@ -319,7 +328,7 @@ TuningConductor::TuningConductor(const rclcpp::NodeOptions & options)
   safety_ = SafetyMonitor(limits);
 
   // Degenerate configuration must not reach the state machine: every state
-  // indexes axes[axis_idx] and wn_ladder[rung] unguarded, and a vehicle in
+  // indexes axes[axis_idx] unguarded, and a vehicle in
   // OFFBOARD is a bad place to find out the list was empty.
   if (hover_.size() != 3) {
     RCLCPP_ERROR(
@@ -331,10 +340,6 @@ TuningConductor::TuningConductor(const rclcpp::NodeOptions & options)
     RCLCPP_ERROR(get_logger(), "axes is empty (want a subset of x,y,z,yaw); using z,x,y");
     sched_.axes = {"z", "x", "y"};
   }
-  if (wn_ladder_.empty()) {
-    RCLCPP_ERROR(get_logger(), "wn_ladder is empty; using [1.2, 1.6, 2.0]");
-    wn_ladder_ = {1.2, 1.6, 2.0};
-  }
 
   // ---- interfaces ----
   sp_pub_ = create_publisher<trajectory_msgs::msg::MultiDOFJointTrajectory>(
@@ -342,7 +347,7 @@ TuningConductor::TuningConductor(const rclcpp::NodeOptions & options)
   status_pub_ = create_publisher<std_msgs::msg::String>("geo_tuner/status", 10);
   // Structured status for a ground station. The String above is a human
   // log line that only appears when something happens; a panel needs the
-  // state, the progress through the ladder, and the reason it is waiting,
+  // state, the progress through the rounds, and the reason it is waiting,
   // at a steady rate.
   health_pub_ = create_publisher<DiagnosticStatus>("geo_tuner/health", 10);
   odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
@@ -377,6 +382,18 @@ TuningConductor::TuningConductor(const rclcpp::NodeOptions & options)
   while (!ctrl.empty() && ctrl.front() == '/') {ctrl.erase(ctrl.begin());}
   while (!ctrl.empty() && ctrl.back() == '/') {ctrl.pop_back();}
   get_param_cli_ = create_client<GetParameters>("/" + ctrl + "/get_parameters");
+  cmd_sub_ = create_subscription<mav_controllers_ros::msg::SE3Command>(
+    cmd_topic, 10, std::bind(&TuningConductor::cmd_cb, this, std::placeholders::_1));
+  if (!estimator_node_.empty()) {
+    std::string est = estimator_node_;
+    while (!est.empty() && est.front() == '/') {est.erase(est.begin());}
+    if (est.find('/') == std::string::npos) {
+      const auto slash = ctrl.rfind('/');
+      if (slash != std::string::npos) {est = ctrl.substr(0, slash) + "/" + est;}
+    }
+    estimator_node_ = est;
+    estimator_param_cli_ = create_client<GetParameters>("/" + est + "/get_parameters");
+  }
   set_param_cli_ = create_client<SetParameters>("/" + ctrl + "/set_parameters");
 
   // ---- state ----
@@ -440,12 +457,15 @@ TuningConductor::TuningConductor(const rclcpp::NodeOptions & options)
   } else {
     hov << "captured where " << offboard_mode_ << " is engaged";
   }
-  std::vector<std::string> ladder;
-  for (double w : wn_ladder_) {ladder.push_back(fmt(w, 2));}
   RCLCPP_INFO(
-    get_logger(), "Tuning conductor up. axes=[%s] wn_ladder=[%s] zeta=%s hover=%s",
-    join(sched_.axes, ", ").c_str(), join(ladder, ", ").c_str(),
-    fmt(zeta_target_, 2).c_str(), hov.str().c_str());
+    get_logger(),
+    "Tuning conductor up. axes=[%s] wn_target=%s (z %s) zeta=%s PM>=%s/%s deg "
+    "rounds<=%d, %d steps/axis/round, hover=%s, estimator check: %s",
+    join(sched_.axes, ", ").c_str(), fmt(decision_.wn_target, 2).c_str(),
+    fmt(wn_target_z_, 2).c_str(), fmt(zeta_target_, 2).c_str(),
+    fmt(decision_.margins.nominal_deg, 0).c_str(), fmt(decision_.margins.worst_deg, 0).c_str(),
+    max_rounds_, sched_.episodes_per_rung, hov.str().c_str(),
+    estimator_node_.empty() ? "OFF (estimator_node empty)" : ("/" + estimator_node_).c_str());
   RCLCPP_INFO(
     get_logger(),
     "Altitude gate: start at >= %s m AGL (min_tuning_altitude %s, safety floor %s "
@@ -652,6 +672,10 @@ double TuningConductor::min_start_altitude() const
 
 std::pair<bool, std::string> TuningConductor::altitude_gate() const
 {
+  if (agl_required_ && !agl_fresh_) {
+    return {false, "no height-above-ground message in the last " + fmt(agl_timeout_, 1) +
+      " s: not starting with altitude limits on odometry z"};
+  }
   const auto agl = hover_agl();
   if (!agl) {return {false, "no altitude yet"};}
   const double need = min_start_altitude();
@@ -705,9 +729,9 @@ void TuningConductor::begin_flying()
     return;
   }
   if (session_t0_ < 0.0) {session_t0_ = now_s();}
-  // The schedule may be parked on a bucket this session skips (a yaw-only
-  // axes list with yaw_final_rung_only, say): move to one it flies.
-  if (!seek_eligible_axis()) {return;}
+  // The schedule may be parked on an axis already finished (a resume after
+  // an OFFBOARD pause): move to one this round still flies.
+  if (!seek_active_axis()) {return;}
   // In capture mode the setpoint is already the hover point; in fixed mode
   // GOTO_HOVER ramps to it.
   goto_state(TunerState::GOTO_HOVER);
@@ -759,7 +783,7 @@ void TuningConductor::request_gains(std::optional<double> now)
   auto req = std::make_shared<GetParameters::Request>();
   req->names = {"gains.pos.x", "gains.pos.y", "gains.pos.z",
     "gains.vel.x", "gains.vel.y", "gains.vel.z",
-    "yawctrl_tau", "attctrl_tau"};
+    "yawctrl_tau", "attctrl_tau", "mass"};
   auto fut = get_param_cli_->async_send_request(req);
   get_req_id_ = fut.request_id;
   pending_get_ = fut.future.share();
@@ -769,18 +793,21 @@ void TuningConductor::request_gains(std::optional<double> now)
 
 void TuningConductor::apply_yaw_tau(double tau)
 {
-  auto req = std::make_shared<SetParameters::Request>();
-  rcl_interfaces::msg::Parameter p;
-  p.name = "yawctrl_tau";
-  p.value.type = rcl_interfaces::msg::ParameterType::PARAMETER_DOUBLE;
-  p.value.double_value = tau;
-  req->parameters.push_back(p);
-  pending_set_ = set_param_cli_->async_send_request(req).future.share();
+  apply_gains({}, tau);
 }
 
-void TuningConductor::apply_gains(const Gains & gains)
+void TuningConductor::apply_gains(const Gains & gains, std::optional<double> yaw_tau)
 {
+  // One request for everything a round changes: two in-flight requests
+  // would share the single pending_set_ slot and one answer would be lost.
   auto req = std::make_shared<SetParameters::Request>();
+  if (yaw_tau) {
+    rcl_interfaces::msg::Parameter p;
+    p.name = "yawctrl_tau";
+    p.value.type = rcl_interfaces::msg::ParameterType::PARAMETER_DOUBLE;
+    p.value.double_value = *yaw_tau;
+    req->parameters.push_back(p);
+  }
   for (const auto & [ax, kxkv] : gains) {
     for (const auto & [name, val] :
       {std::pair<std::string, double>{"gains.pos." + ax, kxkv.first},
@@ -818,7 +845,24 @@ void TuningConductor::tick()
       std::vector<std::string> texts;
       for (auto v : violations) {texts.emplace_back(to_string(v));}
       abort(join(texts, ", "));
+    } else if (agl_required_ && !agl_fresh_ && state_ != TunerState::TOO_LOW) {
+      // (TOO_LOW is where a session waits for the AGL topic: see altitude_gate.)
+      // The floor was set on the AGL topic; odometry z has an unrelated
+      // origin (6.6 m off on this vehicle). Hold rather than re-base it.
+      abort("height-above-ground topic lost mid-session (no message for " +
+        fmt(agl_timeout_, 1) + " s); not re-basing the altitude floor on odometry z");
     }
+  }
+
+  // After a session (finished or stopped) the conductor keeps publishing so
+  // OFFBOARD stays holdable -- but while the pilot flies another mode, the
+  // held point must follow the vehicle. Otherwise re-engaging OFFBOARD
+  // after flying away snaps the vehicle back to where the session ended
+  // (the 2026-09-08 runaway class). Trim was learned for the old point and
+  // the old session: drop it.
+  if ((state_ == TunerState::ABORT || state_ == TunerState::DONE) && !in_offboard()) {
+    hold_here();
+    a_trim_ = {0.0, 0.0, 0.0};
   }
 
   // Pilot/mode supervision: leaving OFFBOARD mid-session pauses the tuner
@@ -840,6 +884,9 @@ void TuningConductor::tick()
   if (state_ != TunerState::WAIT_ODOM && state_ != TunerState::WAIT_ENABLE) {
     publish_setpoint();
   }
+  // Identification input: the setpoint just published, the latest odometry
+  // and command, the gains in force.
+  record_sample();
 
   switch (state_) {
     case TunerState::WAIT_ODOM: st_wait_odom(now); break;
@@ -850,9 +897,10 @@ void TuningConductor::tick()
     case TunerState::SETTLE: st_settle(now); break;
     case TunerState::STEP: st_step(now); break;
     case TunerState::ANALYZE: st_analyze(now); break;
+    case TunerState::IDENTIFY: st_identify(now); break;
     case TunerState::UPDATE_GAINS: st_update_gains(now); break;
     case TunerState::DONE: break;    // keep publishing hover setpoint
-    case TunerState::ABORT: break;   // hold hover; pilot takes over via RC
+    case TunerState::ABORT: st_abort(now); break;   // hold; confirm the restore
   }
 }
 
@@ -885,6 +933,7 @@ void TuningConductor::st_wait_enable(double now)
   // for the operator to press start.
   if (baseline_read_) {
     if (start_requested_) {
+      if (!estimator_ok(now)) {return;}
       if (in_offboard()) {
         begin_flying();
       } else {
@@ -920,8 +969,23 @@ void TuningConductor::st_wait_enable(double now)
       abort("could not read controller gains");
       return;
     }
+    // Every later limit is relative to these, so they must be real numbers:
+    // an integer-typed or unset parameter reads as double_value 0.0.
     std::vector<double> vals;
-    for (size_t i = 0; i < 6; ++i) {vals.push_back(res->values[i].double_value);}
+    for (size_t i = 0; i < 6; ++i) {
+      using rcl_interfaces::msg::ParameterType;
+      const auto & pv = res->values[i];
+      const double val = pv.type == ParameterType::PARAMETER_DOUBLE ? pv.double_value :
+        pv.type == ParameterType::PARAMETER_INTEGER ? static_cast<double>(pv.integer_value) :
+        std::numeric_limits<double>::quiet_NaN();
+      if (!std::isfinite(val) || val <= 0.0) {
+        abort(std::string("controller gain ") + (i < 3 ? "gains.pos." : "gains.vel.") +
+          "xyz"[i % 3] + " is not a positive number (type " + std::to_string(pv.type) +
+          "): refusing to tune from it");
+        return;
+      }
+      vals.push_back(val);
+    }
     gains_ = Gains{{"x", {vals[0], vals[3]}},
       {"y", {vals[1], vals[4]}},
       {"z", {vals[2], vals[5]}}};
@@ -963,8 +1027,20 @@ void TuningConductor::st_wait_enable(double now)
       }
     }
     if (att_tau > 0.0) {
-      // Seeds the in-loop lag prior for the closed-loop identification.
       attctrl_tau_ = att_tau;
+    }
+    // The controller publishes mass * a_des; its own mass turns that back
+    // into the commanded acceleration the identification needs.
+    if (res->values.size() >= 9 &&
+      res->values[8].type == rcl_interfaces::msg::ParameterType::PARAMETER_DOUBLE &&
+      res->values[8].double_value > 0.0)
+    {
+      controller_mass_ = res->values[8].double_value;
+    } else {
+      abort(
+        "controller has no positive 'mass' parameter: cannot convert its force command to "
+        "the commanded acceleration identification needs");
+      return;
     }
     if (yaw_tau > 0.0) {
       yaw_tau_ = yaw_tau;
@@ -972,6 +1048,7 @@ void TuningConductor::st_wait_enable(double now)
       yaw_tau_ = att_tau;
     }
     baseline_yaw_tau_ = yaw_tau_;
+    safe_yaw_tau_ = yaw_tau_;
     const bool wants_yaw =
       std::find(sched_.axes.begin(), sched_.axes.end(), "yaw") != sched_.axes.end();
     if (wants_yaw) {
@@ -987,11 +1064,14 @@ void TuningConductor::st_wait_enable(double now)
           fmt(yaw_T_target_, 2) + "s)");
       }
     }
+    axis_prog_.clear();
+    for (const auto & ax : sched_.axes) {axis_prog_[ax] = AxisProgress{};}
     baseline_read_ = true;
     if (require_enable_ && !start_requested_) {
       status("Gains read. Waiting for the ~/start service (require_enable is set)");
       return;
     }
+    if (!estimator_ok(now)) {return;}
     if (!in_offboard()) {
       status(
         "Waiting for PX4 mode " + offboard_mode_ +
@@ -1000,6 +1080,125 @@ void TuningConductor::st_wait_enable(double now)
     } else {
       begin_flying();
     }
+  }
+}
+
+bool TuningConductor::estimator_ok(double now)
+{
+  // Precondition, checked on the LIVE node rather than trusted to launch
+  // plumbing: on every tuning flight 2026-09-09..13 the launch-file pin that
+  // was meant to turn this estimator off lost to the persisted override
+  // (an exact node-name key beats a /** wildcard in ROS 2 parameter files),
+  // and nothing noticed.
+  if (estimator_node_.empty() || (estimator_off_ && *estimator_off_)) {return true;}
+  if (pending_est_ && ready(*pending_est_)) {
+    const auto res = pending_est_->get();
+    pending_est_.reset();
+    // Only an explicit boolean false passes: an undeclared or mistyped
+    // parameter proves nothing about what the node is running.
+    const bool readable = res && !res->values.empty() &&
+      res->values[0].type == rcl_interfaces::msg::ParameterType::PARAMETER_BOOL;
+    const bool on = !readable || res->values[0].bool_value;
+    estimator_off_ = !on;
+    if (on) {
+      // The node reads the flag once at startup: "ros2 param set" changes the
+      // parameter without changing the estimator, so only a relaunch fixes it.
+      const std::string why = readable ?
+        "/" + estimator_node_ + " has enable_thrust_estimator=true: it adapts the plant "
+        "gain this session measures. Relaunch the stack with the tuner session overrides "
+        "(the node reads the flag only at startup; ros2 param set does NOT turn it off)" :
+        "/" + estimator_node_ + " did not return a boolean enable_thrust_estimator: cannot "
+        "verify the thrust estimator is off";
+      if (why != precondition_) {status("REFUSED: " + why);}   // say it once, keep asking
+      precondition_ = why;
+      est_request_t0_ = now;   // re-ask after the retry interval
+    } else {
+      precondition_.clear();
+      status("/" + estimator_node_ + ": thrust estimator is off (verified)");
+    }
+    return !on;
+  }
+  if (pending_est_) {
+    if (now - est_request_t0_ > service_timeout_) {
+      estimator_param_cli_->remove_pending_request(est_req_id_);
+      pending_est_.reset();
+      const std::string why = "no answer from /" + estimator_node_ + "/get_parameters: "
+        "cannot verify the thrust estimator is off (set estimator_node:='' only if this "
+        "stack has no geometric_mavros node)";
+      if (why != precondition_) {status("REFUSED: " + why);}
+      precondition_ = why;
+    }
+    return false;
+  }
+  if (now - est_request_t0_ < 2.0 && est_request_t0_ > 0.0) {return false;}
+  if (!estimator_param_cli_->service_is_ready()) {
+    if (precondition_.empty()) {
+      precondition_ = "waiting for /" + estimator_node_ + " to verify the thrust estimator is off";
+      status(precondition_);
+    }
+    est_request_t0_ = now;
+    return false;
+  }
+  auto req = std::make_shared<GetParameters::Request>();
+  req->names = {"enable_thrust_estimator"};
+  auto fut = estimator_param_cli_->async_send_request(req);
+  est_req_id_ = fut.request_id;
+  pending_est_ = fut.future.share();
+  est_request_t0_ = now;
+  return false;
+}
+
+void TuningConductor::cmd_cb(const mav_controllers_ros::msg::SE3Command::SharedPtr msg)
+{
+  last_cmd_force_ = {msg->force.x, msg->force.y, msg->force.z};
+  last_cmd_t_ = now_s();
+}
+
+void TuningConductor::record_sample()
+{
+  const double now = now_s();
+  // Not in UPDATE_GAINS: the new gains are recorded as in force before the
+  // controller has confirmed them.
+  const bool flying = is_active_state(state_) && state_ != TunerState::TOO_LOW &&
+    state_ != TunerState::UPDATE_GAINS;
+  const bool fresh = sched_.odom && last_cmd_force_ && (now - last_cmd_t_) < 0.1 &&
+    (now - sched_.odom->t) < 0.1;
+  if (!flying || !fresh || !gains_ || controller_mass_ <= 0.0) {
+    rec_gap_ = true;
+    return;
+  }
+  if (rec_gap_ && !recording_.samples.empty()) {++rec_seg_;}
+  rec_gap_ = false;
+  SessionSample smp;
+  smp.t = session_t0_ >= 0.0 ? now - session_t0_ : 0.0;
+  smp.seg = rec_seg_;
+  const auto & f = *last_cmd_force_;
+  for (int i = 0; i < 3; ++i) {
+    const std::string ax(1, "xyz"[i]);
+    smp.r[i] = sched_.setpoint[i];
+    smp.v[i] = sched_.odom->vel[i];
+    smp.u[i] = f[i] / controller_mass_ - (i == 2 ? kGravity : 0.0);
+    smp.kx[i] = gains_->at(ax).first;
+    smp.kv[i] = gains_->at(ax).second;
+  }
+  recording_.samples.push_back(smp);
+}
+
+void TuningConductor::save_session_recording()
+{
+  if (recording_.samples.empty()) {return;}
+  std::string dir = output_dir_;
+  if (dir.empty()) {dir = std::filesystem::path(report_path_).parent_path().string();}
+  if (dir.empty()) {return;}
+  const auto path = std::filesystem::path(dir) /
+    ("geo_tuner_session_" + (session_stamp_.empty() ? std::string("unknown") : session_stamp_) +
+    ".csv");
+  std::error_code ec;
+  std::filesystem::create_directories(dir, ec);
+  if (recording_.save_csv(path.string())) {
+    session_csv_ = path.string();
+  } else {
+    RCLCPP_WARN(get_logger(), "could not write session recording %s", path.string().c_str());
   }
 }
 
@@ -1015,8 +1214,8 @@ void TuningConductor::st_wait_offboard(double)
   }
   if (in_offboard()) {
     status(
-      offboard_mode_ + " engaged; resuming (rung " + std::to_string(rung_ + 1) + "/" +
-      std::to_string(wn_ladder_.size()) + ", axis " + sched_.axes[sched_.axis_idx] + ")");
+      offboard_mode_ + " engaged; resuming (round " + std::to_string(round_ + 1) + "/" +
+      std::to_string(max_rounds_) + ", axis " + sched_.axes[sched_.axis_idx] + ")");
     begin_flying();
   }
 }
@@ -1080,8 +1279,8 @@ void TuningConductor::st_goto_hover(double now)
     sched_.odom->vel[2] * sched_.odom->vel[2]);
   if (ramp_done && err < hover_capture_radius_ && speed < hover_capture_speed_) {
     status(
-      "At hover point; settling (<= " + fmt(settle_time_, 1) + "s) (rung " +
-      std::to_string(rung_ + 1) + "/" + std::to_string(wn_ladder_.size()) +
+      "At hover point; settling (<= " + fmt(settle_time_, 1) + "s) (round " +
+      std::to_string(round_ + 1) + "/" + std::to_string(max_rounds_) +
       ", axis " + sched_.axes[sched_.axis_idx] + ")");
     goto_state(TunerState::SETTLE);
     return;
@@ -1157,7 +1356,9 @@ void TuningConductor::st_settle(double now)
   // -- and the unabsorbed bias corrupted every low-gain episode (T4 in
   // TUNER_IMPROVEMENTS_PLAN.md). The residual force each axis is missing
   // equals kx * offset: that is what the feedback is currently supplying.
-  if (sched_.odom && gains_ && trim_updates_ < max_trim_updates_) {
+  // Only from a quiet vehicle: at the settle_time cap in gusts the offset is
+  // the gust, and learning it as trim is a feedforward push in its direction.
+  if (sched_.odom && gains_ && trim_updates_ < max_trim_updates_ && sched_.is_quiet(now)) {
     bool updated = false;
     for (const auto & ax2 : {std::string("x"), std::string("y"), std::string("z")}) {
       const int i = axis_index(ax2);
@@ -1295,9 +1496,9 @@ void TuningConductor::dump_episode(
     std::filesystem::create_directories(dir);
     std::ostringstream name;
     name << "ep" << std::setw(3) << std::setfill('0') << episode_seq_++ <<
-      "_" << ax << "_rung" << rung_ << "_rep" << sched_.rep << ".csv";
+      "_" << ax << "_round" << round_ << "_rep" << sched_.rep << ".csv";
     std::ofstream f(std::filesystem::path(dir) / name.str());
-    f << "# axis=" << ax << " step=" << step << " rung=" << rung_ <<
+    f << "# axis=" << ax << " step=" << step << " round=" << round_ <<
       " rep=" << sched_.rep << "\n";
     f << "t,y\n" << std::setprecision(9);
     for (Eigen::Index i = 0; i < t.size(); ++i) {
@@ -1319,7 +1520,7 @@ void TuningConductor::analyze_yaw()
   dump_episode("yaw", t, y, step);
   YAML::Node rec;
   rec["axis"] = "yaw";
-  rec["rung"] = static_cast<int>(rung_);
+  rec["round"] = static_cast<int>(round_);
   rec["rep"] = sched_.rep;
   rec["T_target"] = yaml_double(yaw_T_target_);
   rec["step"] = yaml_double(round_to(step, 3));
@@ -1353,60 +1554,10 @@ void TuningConductor::analyze_yaw()
       ", at_bounds=" + (fit.at_bounds ? "y" : "n") + "); episode discarded");
   } else {
     rec["action"] = "accepted";
-    sched_.bucket.add(fit.T, fit.delay);
+    axis_prog_["yaw"].yaw_T.push_back(fit.T);
   }
   results_.push_back(rec);
   episode_finished();
-}
-
-void TuningConductor::finalize_yaw_bucket()
-{
-  // All reps for this yaw bucket flown: aggregate the accepted T
-  // estimates and update yawctrl_tau from their median.
-  const auto est = robust_ratio_estimate(
-    sched_.bucket.alphas, std::min(2, sched_.episodes_per_rung), consistency_);
-  YAML::Node rec;
-  rec["axis"] = "yaw";
-  rec["rung"] = static_cast<int>(rung_);
-  rec["n_episodes"] = sched_.rep;
-  rec["n_used"] = est.n_used;
-  if (std::isfinite(est.spread)) {
-    rec["spread"] = yaml_double(round_to(est.spread, 3));
-  } else {
-    rec["spread"] = YAML::Node(YAML::NodeType::Null);
-  }
-  if (!est.ok) {
-    if (extend_bucket("yaw", est.reason)) {return;}
-    rec["action"] = "keeping yawctrl_tau (" + est.reason + ")";
-    results_.push_back(rec);
-    session_result_["yaw"] = "kept: " + est.reason;
-    status("yaw: " + est.reason + "; keeping tau");
-    advance_axis();
-    return;
-  }
-  if (est.n_trimmed > 0) {
-    rec["n_trimmed"] = est.n_trimmed;
-  }
-  const double T_med = est.value;
-  // T scales with the applied tau through the same (unknown) efficiency
-  // factor, which cancels in the ratio update.
-  double tau_new = *yaw_tau_ * yaw_T_target_ / T_med;
-  tau_new = std::clamp(tau_new, *yaw_tau_ / max_change_, *yaw_tau_ * max_change_);
-  tau_new = std::clamp(tau_new, yaw_tau_min_, yaw_tau_max_);
-  rec["T_median"] = yaml_double(round_to(T_med, 3));
-  rec["yaw_tau_new"] = yaml_double(round_to(tau_new, 3));
-  rec["action"] = "tau updated (median)";
-  results_.push_back(rec);
-  session_result_["yaw"] =
-    "T " + fmt(T_med, 2) + "s (n=" + std::to_string(est.n_used) + ", spread " +
-    fmt(est.spread, 2) + "x)";
-  status(
-    "yaw: median T=" + fmt(T_med, 2) + "s (n=" + std::to_string(est.n_used) +
-    ", spread " + fmt(est.spread, 2) + "x) -> tau " + fmt(*yaw_tau_, 3) + " -> " +
-    fmt(tau_new, 3));
-  yaw_tau_ = tau_new;
-  apply_yaw_tau(tau_new);
-  goto_state(TunerState::UPDATE_GAINS);
 }
 
 void TuningConductor::st_analyze(double)
@@ -1416,6 +1567,11 @@ void TuningConductor::st_analyze(double)
     analyze_yaw();
     return;
   }
+  // No per-episode fitting: one step cannot separate plant gain from lag
+  // against a gust (see core/accel_loop_id.hpp). The episode is excitation
+  // for the round-end identification, which reads the session recording;
+  // here only what the record itself shows is kept -- the overshoot, which
+  // validation checks.
   const double step = sched_.step_applied;
   Eigen::VectorXd t(sched_.recording.size()), y(sched_.recording.size());
   for (size_t i = 0; i < sched_.recording.size(); ++i) {
@@ -1423,265 +1579,341 @@ void TuningConductor::st_analyze(double)
     y[static_cast<Eigen::Index>(i)] = sched_.recording[i].second;
   }
   dump_episode(ax, t, y, step);
-  const double kx_now = gains_->at(ax).first;
-  const double kv_now = gains_->at(ax).second;
-  const double wn_target = wn_ladder_[rung_];
+  const double os = measured_overshoot(sched_.recording, step);
   YAML::Node rec;
   rec["axis"] = ax;
-  rec["rung"] = static_cast<int>(rung_);
+  rec["round"] = static_cast<int>(round_);
   rec["rep"] = sched_.rep;
-  rec["wn_target"] = yaml_double(wn_target);
   rec["step"] = yaml_double(step);
-  rec["kx_applied"] = yaml_double(round_to(kx_now, 3));
-  rec["kv_applied"] = yaml_double(round_to(kv_now, 3));
+  rec["kx_applied"] = yaml_double(round_to(gains_->at(ax).first, 3));
+  rec["kv_applied"] = yaml_double(round_to(gains_->at(ax).second, 3));
+  rec["overshoot"] = yaml_double(round_to(os, 3));
   rec["settle_s"] = yaml_double(round_to(last_settle_dur_, 2));
   rec["record_s"] = yaml_double(round_to(t.size() > 0 ? t[t.size() - 1] : 0.0, 2));
-
-  LoopFitResult fit;
-  const auto frozen = axis_tau_.find(ax);
-  const bool hold_tau = lag_mode_ == "per_axis" && frozen != axis_tau_.end();
-  try {
-    // Identify against the loop we actually commanded: kx and kv are
-    // known, so the only dynamic unknowns are the plant-gain factor and
-    // the in-loop lag. attctrl_tau seeds the lag; it does not constrain it.
-    // In per_axis lag mode the axis's identified lag is frozen after its
-    // first clean episode (T2), and only alpha remains dynamic.
-    fit = fit_closed_loop(
-      t, y, step, kx_now, kv_now, attctrl_tau_.value_or(0.15),
-      /*model_output_delay=*/false, hold_tau ? frozen->second : 0.0);
-    // tau carries the transport delay too; see loop_fit.hpp.
-  } catch (const std::exception & e) {
-    rec["action"] = std::string("episode discarded (fit error: ") + e.what() + ")";
-    results_.push_back(rec);
-    status("closed-loop fit failed on " + ax + " (" + e.what() + "); discarding episode");
-    episode_finished();
-    return;
-  }
-
-  // Floor-fit rescue. A lag resting on the solver floor is a failed FIT,
-  // not always a failed RECORD: on the direct-thrust z path the true lag
-  // (20-60 ms on the 2026-09-13 flight) sits close enough to the floor
-  // that the alpha/tau trade-off routinely parks legitimate episodes
-  // there -- that session discarded 4 of 6 z episodes and left z
-  // unidentified on both rungs. So once this axis has clean estimates,
-  // retry with the lag frozen at their median (the T2 mechanism), which
-  // removes the trade-off and yields an honest alpha. A corrupted record
-  // then shows itself: its frozen-tau alpha lands far from the axis's
-  // accepted ones (0.52/0.67 vs ~1.0 for the 2026-09-10 poisoned
-  // episodes, vs ratios <= 1.32 for the legitimate 2026-09-13 z ones),
-  // and the estimate_consistency factor separates the two cleanly.
-  // Replayed against both sessions: test_core.cpp FieldReplay13.
-  bool rescued = false;
-  if (!fit.ok() && fit.tau_at_floor && !fit.ambiguous) {
-    const auto hist = accepted_fits_.find(ax);
-    if (hist != accepted_fits_.end() && !hist->second.empty()) {
-      std::vector<double> alphas, taus;
-      for (const auto & p : hist->second) {
-        alphas.push_back(p.first);
-        taus.push_back(p.second);
-      }
-      const double tau_axis = median(taus);
-      const double alpha_axis = median(alphas);
-      try {
-        const LoopFitResult refit = fit_closed_loop(
-          t, y, step, kx_now, kv_now, attctrl_tau_.value_or(0.15),
-          /*model_output_delay=*/false, tau_axis);
-        const double ratio = refit.alpha > alpha_axis ?
-          refit.alpha / alpha_axis : alpha_axis / refit.alpha;
-        if (refit.ok() && ratio <= consistency_ &&
-          refit.alpha >= kAlphaMin && refit.alpha <= kAlphaMax)
-        {
-          rec["alpha_free"] = yaml_double(round_to(fit.alpha, 3));
-          rec["tau_frozen_at"] = yaml_double(round_to(tau_axis, 3));
-          status(
-            ax + ": lag rested on the floor; refit with tau frozen at " +
-            fmt(tau_axis * 1e3, 0) + " ms -> alpha " + fmt(refit.alpha, 2) +
-            " (was " + fmt(fit.alpha, 2) + ")");
-          fit = refit;
-          rescued = true;
-        }
-      } catch (const std::exception &) {
-        // fall through to the normal discard path
-      }
-    }
-  }
-
-  const double wn_meas = fit.wn_effective(kx_now);
-  rec["alpha"] = yaml_double(round_to(fit.alpha, 3));
-  rec["tau_lag"] = yaml_double(round_to(fit.tau, 3));
-  rec["nrmse"] = yaml_double(round_to(fit.nrmse, 3));
-  rec["overshoot"] = yaml_double(round_to(fit.overshoot, 3));
-  rec["wn_meas"] = yaml_double(round_to(wn_meas, 3));
-  rec["zeta_meas"] = yaml_double(round_to(fit.zeta_effective(kx_now, kv_now), 3));
-  status(
-    ax + ": alpha=" + fmt(fit.alpha, 2) + " tau=" + fmt(fit.tau * 1e3, 0) +
-    "ms nrmse=" + fmt(fit.nrmse, 3) +
-    " (wn_eff=" + fmt(wn_meas, 2) + ") os=" + fmt(fit.overshoot * 100.0, 0) + "%");
-
-  if (!fit.ok()) {
-    rec["action"] = fit.ambiguous ?
-      "fit ambiguous (near-equal minima disagree on alpha)" :
-      (fit.at_bounds ? "fit rested on a solver bound" : "fit rejected");
-    results_.push_back(rec);
-    status("Fit quality gate failed on " + ax + " (" +
-      rec["action"].as<std::string>() + "); episode discarded");
-    episode_finished();
-    return;
-  }
-
-  // Plausibility gate. Unlike the old fit, alpha here was estimated
-  // WITHOUT being confined to this range, so a value outside it is real
-  // evidence that the episode was corrupted rather than an artefact of
-  // the estimator being held inside a prior.
-  if (!(fit.alpha >= kAlphaMin && fit.alpha <= kAlphaMax)) {
-    rec["action"] = "alpha implausible; episode discarded";
-    results_.push_back(rec);
-    status(
-      ax + ": alpha=" + fmt(fit.alpha, 2) + " outside [" + fmt(kAlphaMin, 1) + ", " +
-      fmt(kAlphaMax, 1) + "]; discarding episode");
-    episode_finished();
-    return;
-  }
-
-  rec["action"] = rescued ?
-    "accepted (lag frozen at the axis median after a floor fit)" : "accepted";
+  rec["action"] = "recorded";
   results_.push_back(rec);
-  sched_.bucket.add(fit.alpha, fit.tau);
-  // Rescued fits stay out of the rescue reference: their tau IS the
-  // median, and keeping the reference anchored to freely-fitted episodes
-  // stops a run of rescues from drifting it.
-  if (!rescued) {
-    accepted_fits_[ax].emplace_back(fit.alpha, fit.tau);
-  }
-  if (lag_mode_ == "per_axis" && !hold_tau) {
-    axis_tau_[ax] = fit.tau;
-    rec["axis_tau_frozen"] = yaml_double(round_to(fit.tau, 3));
-    status(
-      ax + ": in-loop lag frozen at " + fmt(fit.tau * 1e3, 0) +
-      " ms for the rest of the session (lag_mode per_axis)");
-  }
+  axis_prog_[ax].overshoots.push_back(os);
+  status(ax + ": step " + fmt(step, 2) + " flown, overshoot " + fmt(100.0 * os, 0) + "%");
   episode_finished();
 }
 
-void TuningConductor::finalize_pos_bucket(const std::string & ax)
+void TuningConductor::decide_position_axis(const std::string & ax, Gains & to_apply)
 {
-  // All reps for this (axis, rung) flown: aggregate the accepted alpha
-  // estimates and update gains from their median.
+  auto & pr = axis_prog_[ax];
   const double kx_now = gains_->at(ax).first;
   const double kv_now = gains_->at(ax).second;
-  const double wn_target = wn_ladder_[rung_];
-  const auto est = robust_ratio_estimate(
-    sched_.bucket.alphas, std::min(2, sched_.episodes_per_rung), consistency_);
+  DecisionConfig dc = decision_;
+  if (ax == "z") {dc.wn_target = wn_target_z_;}
+  const bool rounds_left = round_ + 1 < static_cast<size_t>(max_rounds_);
+
   YAML::Node rec;
   rec["axis"] = ax;
-  rec["rung"] = static_cast<int>(rung_);
-  rec["wn_target"] = yaml_double(wn_target);
-  rec["n_episodes"] = sched_.rep;
-  rec["n_used"] = est.n_used;
-  if (std::isfinite(est.spread)) {
-    rec["spread"] = yaml_double(round_to(est.spread, 3));
-  } else {
-    rec["spread"] = YAML::Node(YAML::NodeType::Null);
-  }
-  if (!est.ok) {
-    if (extend_bucket(ax, est.reason)) {return;}
-    rec["action"] = "keeping gains (" + est.reason + ")";
-    results_.push_back(rec);
-    session_result_[ax] = "kept: " + est.reason;
-    status(ax + ": " + est.reason + "; keeping gains");
-    advance_axis();
-    return;
-  }
-  if (est.n_trimmed > 0) {
-    rec["n_trimmed"] = est.n_trimmed;
+  rec["round"] = static_cast<int>(round_);
+  rec["kx_in_force"] = yaml_double(round_to(kx_now, 3));
+  rec["kv_in_force"] = yaml_double(round_to(kv_now, 3));
+  const auto put_id = [](YAML::Node & n, const AccelLoopResult & id) {
+      n["ok"] = id.ok;
+      if (!id.ok) {n["reason"] = id.reason;}
+      n["alpha"] = yaml_double(round_to(id.alpha, 3));
+      n["alpha_ci"] = std::vector<double>{round_to(id.alpha_lo, 3), round_to(id.alpha_hi, 3)};
+      n["lag_ms"] = yaml_double(round_to(1e3 * id.lag, 0));
+      n["lag_ci_ms"] = std::vector<double>{round_to(1e3 * id.lag_lo, 0),
+        round_to(1e3 * id.lag_hi, 0)};
+      n["delay_ms"] = yaml_double(round_to(1e3 * id.delay, 0));
+      n["tau_ms"] = yaml_double(round_to(1e3 * id.tau, 0));
+      n["r2"] = yaml_double(round_to(id.r2, 3));
+      n["r2_raw"] = yaml_double(round_to(id.r2_raw, 3));
+      n["excited_s"] = yaml_double(round_to(id.excited_s, 1));
+    };
+
+  // 1. Gains applied last round: accept or restore, on THIS round's data.
+  if (pr.pending_validation) {
+    pr.pending_validation = false;
+    const auto id_val = round_ids_[ax].validation;
+    const double os = pr.overshoots.empty() ? 0.0 : median(pr.overshoots);
+    const auto v = validate_gains(
+      kx_now, kv_now, id_val, pr.id_design, os, dc.margins, max_overshoot_);
+    YAML::Node vn;
+    put_id(vn, id_val);
+    vn["overshoot_median"] = yaml_double(round_to(os, 3));
+    vn["pm_nominal_deg"] = yaml_double(round_to(v.pm_nominal_deg, 1));
+    vn["pm_worst_deg"] = yaml_double(round_to(v.pm_worst_deg, 1));
+    vn["pass"] = v.pass;
+    vn["why"] = v.why;
+    rec["validation"] = vn;
+    if (!v.pass) {
+      const auto entry = baseline_gains_->at(ax);
+      to_apply[ax] = entry;
+      (*gains_)[ax] = entry;
+      (*safe_gains_)[ax] = entry;
+      pr.active = false;
+      pr.outcome = "validation failed (" + v.why + "); entry gains restored";
+      rec["action"] = pr.outcome;
+      results_.push_back(rec);
+      session_result_[ax] = pr.outcome;
+      status(ax + ": " + pr.outcome);
+      return;
+    }
+    pr.validated = true;
+    (*safe_gains_)[ax] = gains_->at(ax);
+    status(ax + ": applied gains " + v.why);
   }
 
-  // Stability margin, from the identified in-loop lag rather than a rule
-  // of thumb. The closed loop is tau*s^3 + s^2 + alpha*kv*s + alpha*kx,
-  // and Routh-Hurwitz puts the instability boundary at kv = tau*kx. With
-  // the design rule kx = wn^2, kv = 2*zeta*wn that is wn = 2*zeta/tau, so
-  // holding the Routh product `stability_margin` times clear of the
-  // boundary caps the ladder at
-  //
-  //     wn_target <= 2*zeta_target / (stability_margin * tau)
-  //
-  // At the default margin of 4 and zeta 0.95 this is wn*tau <= 0.475,
-  // which is deliberately about as conservative as the wn*delay <= 0.45
-  // heuristic it replaces -- but derived from a measured quantity, and it
-  // now scales correctly when zeta_target is changed.
-  const double tau_med = sched_.bucket.median_lag();
-  const double wn_cap = tau_med > 0.0 ?
-    2.0 * zeta_target_ / (stability_margin_ * tau_med) :
-    std::numeric_limits<double>::infinity();
-  rec["tau_median"] = yaml_double(round_to(tau_med, 3));
-  rec["wn_stability_cap"] = yaml_double(round_to(wn_cap, 3));
-  if (wn_target > wn_cap) {
-    const std::string action =
-      "wn_target " + fmt(wn_target, 2) + " exceeds the stability cap " +
-      fmt(wn_cap, 2) + " rad/s implied by the measured in-loop lag " +
-      fmt(tau_med * 1e3, 0) + " ms (margin " + fmt(stability_margin_, 1) +
-      "x on the Routh product); ladder stopped";
-    rec["action"] = action;
+  // 2. The plant does not depend on the gains: identify from everything.
+  const auto id = round_ids_[ax].all;
+  pr.id_last = id;
+  const auto dec = decide_axis(kx_now, kv_now, id, dc);
+  YAML::Node idn;
+  put_id(idn, id);
+  rec["identification"] = idn;
+  rec["verdict"] = to_string(dec.verdict);
+  rec["why"] = dec.why;
+  if (dec.verdict != AxisVerdict::NO_ESTIMATE) {
+    rec["pm_now_nominal_deg"] = yaml_double(round_to(dec.pm_now_nominal_deg, 1));
+    rec["pm_now_worst_deg"] = yaml_double(round_to(dec.pm_now_worst_deg, 1));
+    YAML::Node dn;
+    dn["wn"] = yaml_double(round_to(dec.design.wn, 3));
+    dn["kx"] = yaml_double(round_to(dec.design.kx, 3));
+    dn["kv"] = yaml_double(round_to(dec.design.kv, 3));
+    dn["pm_nominal_deg"] = yaml_double(round_to(dec.design.pm_nominal_deg, 1));
+    dn["pm_worst_deg"] = yaml_double(round_to(dec.design.pm_worst_deg, 1));
+    dn["wn_limited_by_margin"] = dec.design.limited;
+    rec["design"] = dn;
+  }
+  status(
+    ax + ": alpha " + fmt(id.alpha, 2) + " [" + fmt(id.alpha_lo, 2) + ", " +
+    fmt(id.alpha_hi, 2) + "], lag " + fmt(1e3 * id.lag, 0) + " ms [" + fmt(1e3 * id.lag_lo, 0) +
+    ", " + fmt(1e3 * id.lag_hi, 0) + "] -> " + dec.why);
+
+  const std::string prefix = pr.validated ? "validated; " : "";
+  switch (dec.verdict) {
+    case AxisVerdict::INCONCLUSIVE:
+      if (rounds_left) {
+        pr.outcome = "inconclusive; flying another round to narrow the interval";
+      } else {
+        pr.active = false;
+        pr.outcome = prefix + "kept, " + dec.why;
+      }
+      break;
+    case AxisVerdict::NO_ESTIMATE:
+      if (rounds_left) {
+        pr.outcome = "no estimate yet (" + id.reason + "); flying another round";
+      } else {
+        pr.active = false;
+        pr.outcome = prefix + "kept: " + dec.why;
+      }
+      break;
+    case AxisVerdict::CONFIRMED:
+      pr.active = false;
+      pr.outcome = pr.validated ? "validated: " + dec.why : dec.why;
+      break;
+    case AxisVerdict::UPDATE:
+      if (rounds_left) {
+        // max_gain_change_factor bounds the whole session against the gains
+        // it started from, not each round against the last: per round it
+        // compounds (1.6^2 = 2.56x over three rounds).
+        const auto entry = baseline_gains_->at(ax);
+        const double f = dc.max_change;
+        const double kx_new = std::clamp(dec.kx_new, entry.first / f, entry.first * f);
+        const double kv_new = std::clamp(dec.kv_new, entry.second / f, entry.second * f);
+        const bool at_limit = kx_new != dec.kx_new || kv_new != dec.kv_new;
+        to_apply[ax] = {kx_new, kv_new};
+        (*gains_)[ax] = {kx_new, kv_new};
+        pr.pending_validation = true;
+        pr.id_design = id;
+        pr.outcome = "applied kx " + fmt(kx_new, 3) + " kv " + fmt(kv_new, 3) +
+          (at_limit ? " (at the session change limit " + fmt(f, 2) + "x of entry gains)" : "") +
+          ", validating next round";
+      } else {
+        pr.active = false;
+        pr.outcome = prefix + "update indicated but no round left to validate it; gains kept (" +
+          dec.why + ")";
+      }
+      break;
+  }
+  rec["action"] = pr.outcome;
+  results_.push_back(rec);
+  session_result_[ax] = pr.outcome;
+}
+
+bool TuningConductor::decide_yaw()
+{
+  auto & pr = axis_prog_["yaw"];
+  const bool rounds_left = round_ + 1 < static_cast<size_t>(max_rounds_);
+  const auto est = robust_ratio_estimate(
+    pr.yaw_T, std::min(2, sched_.episodes_per_rung), consistency_);
+  YAML::Node rec;
+  rec["axis"] = "yaw";
+  rec["round"] = static_cast<int>(round_);
+  rec["n_used"] = est.n_used;
+  rec["yaw_tau_in_force"] = yaml_double(round_to(*yaw_tau_, 3));
+  if (std::isfinite(est.spread)) {rec["spread"] = yaml_double(round_to(est.spread, 3));}
+  const auto log_err = [this](double T) {return std::abs(std::log(T / yaw_T_target_));};
+  const double tol = std::log(1.0 + yaw_tolerance_);
+
+  if (pr.pending_validation) {
+    pr.pending_validation = false;
+    // The applied tau must have moved T toward the target (or into the band).
+    const bool pass = est.ok &&
+      (log_err(est.value) <= tol || log_err(est.value) < log_err(pr.yaw_T_design));
+    rec["validation"] = pass ? "pass" : "fail";
+    if (!pass) {
+      yaw_tau_ = baseline_yaw_tau_;
+      pr.active = false;
+      pr.outcome = std::string("validation failed (") +
+        (est.ok ? "T " + fmt(est.value, 2) + " s no closer to target " +
+        fmt(yaw_T_target_, 2) + " than before" : est.reason) +
+        "); entry yawctrl_tau restored";
+      rec["action"] = pr.outcome;
+      results_.push_back(rec);
+      session_result_["yaw"] = pr.outcome;
+      status("yaw: " + pr.outcome);
+      return true;
+    }
+    pr.validated = true;
+    safe_yaw_tau_ = yaw_tau_;
+  }
+  if (!est.ok) {
+    if (rounds_left) {
+      pr.outcome = "no estimate yet (" + est.reason + ")";
+    } else {
+      pr.active = false;
+      pr.outcome = "kept: " + est.reason;
+    }
+    rec["action"] = pr.outcome;
     results_.push_back(rec);
-    session_result_[ax] = "kept: stability cap " + fmt(wn_cap, 2) + " rad/s (lag " +
-      fmt(tau_med * 1e3, 0) + " ms)";
-    status(action);
+    session_result_["yaw"] = pr.outcome;
+    return false;
+  }
+  rec["T_median"] = yaml_double(round_to(est.value, 3));
+  bool applied = false;
+  if (log_err(est.value) <= tol) {
+    pr.active = false;
+    pr.outcome = std::string(pr.validated ? "validated" : "confirmed") + ": T " +
+      fmt(est.value, 2) + " s within " + fmt(100.0 * yaw_tolerance_, 0) + " % of " +
+      fmt(yaw_T_target_, 2) + " s";
+  } else if (rounds_left) {
+    double tau_new = *yaw_tau_ * yaw_T_target_ / est.value;
+    tau_new = std::clamp(tau_new, *yaw_tau_ / max_change_, *yaw_tau_ * max_change_);
+    tau_new = std::clamp(tau_new, yaw_tau_min_, yaw_tau_max_);
+    pr.pending_validation = true;
+    pr.yaw_T_design = est.value;
+    pr.outcome = "T " + fmt(est.value, 2) + " s -> yawctrl_tau " + fmt(*yaw_tau_, 3) + " -> " +
+      fmt(tau_new, 3) + ", validating next round";
+    yaw_tau_ = tau_new;
+    rec["yaw_tau_new"] = yaml_double(round_to(tau_new, 3));
+    applied = true;
+  } else {
+    pr.active = false;
+    pr.outcome = "T " + fmt(est.value, 2) + " s outside the band but no round left to "
+      "validate an update; yawctrl_tau kept";
+  }
+  rec["action"] = pr.outcome;
+  results_.push_back(rec);
+  session_result_["yaw"] = pr.outcome;
+  status("yaw: " + pr.outcome);
+  return applied;
+}
+
+void TuningConductor::finish_round()
+{
+  // Snap the setpoint home before the (short) decision/parameter phase.
+  sched_.setpoint = hover_pt_;
+  sched_.setpoint_yaw = hover_yaw_;
+  sched_.leg_offset = 0.0;
+  status("round " + std::to_string(round_ + 1) + "/" + std::to_string(max_rounds_) +
+    " flown; identifying");
+
+  save_session_recording();   // survives the node dying mid-session
+
+  // Snapshot the inputs on this thread; the recording keeps growing.
+  struct Job
+  {
+    bool validate;
+    std::vector<AxisSegment> round, all;
+  };
+  std::map<std::string, Job> jobs;
+  for (const auto & ax : sched_.axes) {
+    if (ax == "yaw" || !axis_prog_[ax].active) {continue;}
+    const int i = axis_index(ax);
+    Job j;
+    j.validate = axis_prog_[ax].pending_validation;
+    if (j.validate) {j.round = recording_.segments(i, round_first_sample_);}
+    j.all = recording_.segments(i, 0);
+    jobs[ax] = std::move(j);
+  }
+  id_future_ = std::async(
+    std::launch::async, [jobs = std::move(jobs), cfg = id_cfg_]() {
+      std::map<std::string, RoundIds> out;
+      for (const auto & [ax, j] : jobs) {
+        RoundIds r;
+        if (j.validate) {r.validation = identify_accel_loop(j.round, cfg);}
+        r.all = identify_accel_loop(j.all, cfg);
+        out[ax] = r;
+      }
+      return out;
+    });
+  goto_state(TunerState::IDENTIFY);
+}
+
+void TuningConductor::st_identify(double now)
+{
+  // Holding the hover point meanwhile; safety and staleness keep running.
+  if (id_future_.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+    if (now - state_t0_ > max_identify_s_) {
+      abort("round identification did not finish in " + fmt(max_identify_s_, 0) + " s");
+    }
+    return;
+  }
+  round_ids_ = id_future_.get();
+  status("identification took " + fmt(now - state_t0_, 2) + " s");
+  conclude_round();
+}
+
+void TuningConductor::conclude_round()
+{
+  Gains to_apply;
+  bool yaw_changed = false;
+  for (const auto & ax : sched_.axes) {
+    if (!axis_prog_[ax].active) {continue;}
+    if (ax == "yaw") {
+      yaw_changed = decide_yaw();
+    } else {
+      decide_position_axis(ax, to_apply);
+    }
+  }
+  const bool any_active = std::any_of(
+    axis_prog_.begin(), axis_prog_.end(), [](const auto & kv) {return kv.second.active;});
+  if (!to_apply.empty() || yaw_changed) {
+    finish_after_update_ = !any_active;
+    apply_gains(to_apply, yaw_changed ? yaw_tau_ : std::nullopt);
+    goto_state(TunerState::UPDATE_GAINS);
+    return;
+  }
+  if (!any_active) {
     finish();
     return;
   }
+  start_next_round();
+}
 
-  const double alpha = est.value;
-  auto corr = correct_gains_from_identification(
-    kx_now, std::sqrt(alpha * kx_now), wn_target, zeta_target_);
-  // Rate-limit gain changes per bucket
-  const double kx_new =
-    std::clamp(corr.kx_new, kx_now / max_change_, kx_now * max_change_);
-  const double kv_new =
-    std::clamp(corr.kv_new, kv_now / max_change_, kv_now * max_change_);
-  rec["alpha"] = yaml_double(round_to(alpha, 3));
-
-  // A ladder rung's design can sit BELOW the gains the session entered
-  // with -- on an already-tuned vehicle every rung but the last does, by
-  // construction. Applying that design de-tunes a proven vehicle mid-
-  // session, and if the FINAL rung's bucket then fails its gate, the
-  // session ends there: strictly worse than not flying at all (field
-  // 2026-09-13, 10:38 flight -- x ended at kx 1.50 against the 2.40 it
-  // entered with). The identification itself never needs the down-step:
-  // fits are made against whatever gains were applied. So intermediate
-  // rungs only ever tune UP; only a final-rung identification, which has
-  // passed every gate, may lower gains (that is the designed correction).
-  const bool final_rung = rung_ + 1 >= wn_ladder_.size();
-  if (!final_rung && kx_new < kx_now) {
-    rec["action"] = "identified (alpha " + fmt(alpha, 2) +
-      "); current gains already above this rung's design -- not de-tuning";
-    results_.push_back(rec);
-    safe_gains_ = gains_;   // current set flew safely
-    session_result_[ax] =
-      "alpha " + fmt(alpha, 2) + " (n=" + std::to_string(est.n_used) +
-      "), holding above-rung gains";
-    status(
-      ax + ": median alpha=" + fmt(alpha, 2) + " but rung design kx " +
-      fmt(kx_new, 2) + " < current " + fmt(kx_now, 2) + "; not de-tuning");
-    advance_axis();
-    return;
+void TuningConductor::start_next_round()
+{
+  ++round_;
+  round_first_sample_ = recording_.size();
+  for (auto & [ax, pr] : axis_prog_) {
+    pr.overshoots.clear();
+    pr.yaw_T.clear();
   }
-
-  rec["kx_new"] = yaml_double(round_to(kx_new, 3));
-  rec["kv_new"] = yaml_double(round_to(kv_new, 3));
-  rec["action"] = "gains updated (median)";
-  results_.push_back(rec);
-
-  safe_gains_ = gains_;   // current set flew safely
-  session_result_[ax] =
-    "alpha " + fmt(alpha, 2) + " (n=" + std::to_string(est.n_used) + ", spread " +
-    fmt(est.spread, 2) + "x)";
-  (*gains_)[ax] = {kx_new, kv_new};
-  apply_gains(Gains{{ax, gains_->at(ax)}});
-  status(
-    ax + ": median alpha=" + fmt(alpha, 2) + " (n=" + std::to_string(est.n_used) +
-    ", spread " + fmt(est.spread, 2) + "x) -> kx " + fmt(kx_now, 2) + "->" +
-    fmt(kx_new, 2) + ", kv " + fmt(kv_now, 2) + "->" + fmt(kv_new, 2));
-  goto_state(TunerState::UPDATE_GAINS);
+  sched_.axis_idx = 0;
+  sched_.rep = 0;
+  sched_.leg_offset = 0.0;
+  sched_.bucket = EpisodeBucket();
+  sched_.setpoint = hover_pt_;
+  sched_.setpoint_yaw = hover_yaw_;
+  if (!seek_active_axis()) {return;}
+  status("round " + std::to_string(round_ + 1) + "/" + std::to_string(max_rounds_));
+  goto_state(TunerState::GOTO_HOVER);
 }
 
 void TuningConductor::st_update_gains(double now)
@@ -1704,7 +1936,12 @@ void TuningConductor::st_update_gains(double now)
     abort("controller rejected parameter update");
     return;
   }
-  advance_axis();
+  if (finish_after_update_) {
+    finish_after_update_ = false;
+    finish();
+    return;
+  }
+  start_next_round();
 }
 
 void TuningConductor::fly_next_rep()
@@ -1721,78 +1958,38 @@ void TuningConductor::fly_next_rep()
   }
 }
 
-bool TuningConductor::extend_bucket(const std::string & ax, const std::string & why)
-{
-  if (sched_.extra_reps >= max_extra_episodes_) {return false;}
-  ++sched_.extra_reps;
-  status(
-    ax + ": " + why + " after " + std::to_string(sched_.rep) +
-    " episodes; flying one more (" + std::to_string(sched_.extra_reps) + "/" +
-    std::to_string(max_extra_episodes_) + " extra)");
-  fly_next_rep();
-  return true;
-}
-
 void TuningConductor::episode_finished()
 {
-  // One step episode analyzed (accepted or discarded). Fly the next
-  // repetition of the same (axis, rung), or -- when the bucket is full
-  // (or already consistent enough) -- aggregate and decide on a gain
-  // update.
-  //
-  // Alternate step direction to stay centered on the hover point.
+  // Alternate step direction to stay centred on the hover point.
   // Bidirectional: flip only after the leg that returns to centre, giving
   // the 0 -> +d -> 0 -> -d -> 0 sequence.
   if (!sched_.bidirectional || sched_.leg_offset == 0.0) {
     sched_.step_sign *= -1.0;
   }
   ++sched_.rep;
-  if (sched_.rep < sched_.episodes_per_rung + sched_.extra_reps &&
-    !sched_.bucket_settled())
-  {
+  if (sched_.rep < sched_.episodes_per_rung) {
     fly_next_rep();
     return;
   }
-  if (sched_.bucket.count() == sched_.rep && sched_.rep < sched_.episodes_per_rung) {
-    status(
-      "bucket consistent after " + std::to_string(sched_.rep) + " episodes (spread <= " +
-      fmt(sched_.early_stop_spread, 2) + "x); stopping early");
-  }
-  const std::string ax = sched_.axes[sched_.axis_idx];
-  if (ax == "yaw") {
-    finalize_yaw_bucket();
-  } else {
-    finalize_pos_bucket(ax);
-  }
+  advance_axis();
 }
 
 void TuningConductor::advance_axis()
 {
   if (sched_.advance_axis(hover_pt_, hover_yaw_)) {
-    ++rung_;
-    if (rung_ >= wn_ladder_.size()) {
-      finish();
-      return;
-    }
+    finish_round();
+    return;
   }
-  if (!seek_eligible_axis()) {return;}
+  if (!seek_active_axis()) {return;}
   goto_state(TunerState::GOTO_HOVER);
 }
 
-bool TuningConductor::seek_eligible_axis()
+bool TuningConductor::seek_active_axis()
 {
-  while (!axis_eligible(
-      sched_.axes[sched_.axis_idx], rung_, wn_ladder_.size(), yaw_final_rung_only_))
-  {
-    status(
-      "skipping " + sched_.axes[sched_.axis_idx] + " on rung " +
-      std::to_string(rung_ + 1) + " (tuned once, on the final rung)");
+  while (!axis_prog_[sched_.axes[sched_.axis_idx]].active) {
     if (sched_.advance_axis(hover_pt_, hover_yaw_)) {
-      ++rung_;
-      if (rung_ >= wn_ladder_.size()) {
-        finish();
-        return false;
-      }
+      finish_round();
+      return false;
     }
   }
   return true;
@@ -1804,6 +2001,7 @@ void TuningConductor::finish()
   sched_.setpoint_yaw = hover_yaw_;
   sched_.leg_offset = 0.0;
   set_trim_diagnosis();
+  save_session_recording();
   write_report("complete");
   status("Tuning complete. Report: " + report_path_);
   goto_state(TunerState::DONE);
@@ -1846,7 +2044,9 @@ void TuningConductor::srv_abort(Trigger::Request::SharedPtr, Trigger::Response::
   }
   abort("aborted from the ground station");
   res->success = true;
-  res->message = "Aborted: gains restored, holding hover.";
+  res->message = restore_state_ == "pending" ?
+    "Aborted: holding position; restoring the last validated gains (see health 'restore')." :
+    "Aborted: holding position; no gains had been changed.";
 }
 
 void TuningConductor::srv_accept(Trigger::Request::SharedPtr, Trigger::Response::SharedPtr res)
@@ -1896,6 +2096,12 @@ void TuningConductor::srv_reset(Trigger::Request::SharedPtr, Trigger::Response::
       ". Abort first if you want to stop it.";
     return;
   }
+  if (restore_state_ == "pending" || restore_state_ == "UNCONFIRMED") {
+    res->success = false;
+    res->message = "Gain restore is " + restore_state_ +
+      ": a new session would start from unknown gains. Land and check the controller's gains.";
+    return;
+  }
 
   // Fly on whatever gains are currently in force: an abort has already
   // restored the safe set, and silently changing them here would hide
@@ -1905,7 +2111,21 @@ void TuningConductor::srv_reset(Trigger::Request::SharedPtr, Trigger::Response::
   results_.clear();
   sched_.recording.clear();
   sched_.bucket = EpisodeBucket();
-  rung_ = 0;
+  round_ = 0;
+  round_first_sample_ = 0;
+  recording_.clear();
+  rec_seg_ = 0;
+  rec_gap_ = true;
+  session_csv_.clear();
+  axis_prog_.clear();
+  finish_after_update_ = false;
+  restore_state_.clear();
+  restore_tries_ = 0;
+  // Re-verify the estimator: it may have been switched on since.
+  estimator_off_.reset();
+  pending_est_.reset();
+  est_request_t0_ = 0.0;
+  precondition_.clear();
   sched_.axis_idx = 0;
   sched_.rep = 0;
   sched_.leg_offset = 0.0;
@@ -1919,7 +2139,6 @@ void TuningConductor::srv_reset(Trigger::Request::SharedPtr, Trigger::Response::
   last_settle_dur_ = 0.0;
   a_trim_ = {0.0, 0.0, 0.0};
   trim_updates_ = 0;
-  axis_tau_.clear();
   start_requested_ = !require_enable_;
   safety_.reset();
   hold_here();
@@ -1947,6 +2166,7 @@ static const char * phase_string(TunerState s)
     case TunerState::SETTLE: return "holding steady before the next test step";
     case TunerState::STEP: return "flying a test step";
     case TunerState::ANALYZE: return "analyzing the response";
+    case TunerState::IDENTIFY: return "identifying the round";
     case TunerState::UPDATE_GAINS: return "applying updated gains";
     case TunerState::DONE: return "finished";
     case TunerState::ABORT: return "stopped";
@@ -1994,9 +2214,10 @@ void TuningConductor::publish_health()
     "axis_index", sched_.axes.empty() ? "-" :
     std::to_string(sched_.axis_idx + 1) + "/" + std::to_string(sched_.axes.size()));
   add(
-    "rung", wn_ladder_.empty() ? "-" :
-    std::to_string(rung_ + 1) + "/" + std::to_string(wn_ladder_.size()));
-  add("wn_target", rung_ < wn_ladder_.size() ? fmt(wn_ladder_[rung_], 2) : "-");
+    "rung", std::to_string(round_ + 1) + "/" + std::to_string(max_rounds_));
+  add("round", std::to_string(round_ + 1) + "/" + std::to_string(max_rounds_));
+  add("wn_target", fmt(decision_.wn_target, 2));
+  add("precondition", precondition_);
   add(
     "episode",
     std::to_string(sched_.rep + 1) + "/" + std::to_string(sched_.episodes_per_rung));
@@ -2005,8 +2226,8 @@ void TuningConductor::publish_health()
   // reports 100% even when buckets closed early -- finished is finished.
   {
     const auto [done, total] = session_progress(
-      sched_.axes, wn_ladder_.size(), sched_.episodes_per_rung,
-      rung_, sched_.axis_idx, sched_.rep, yaw_final_rung_only_);
+      sched_.axes, static_cast<size_t>(max_rounds_), sched_.episodes_per_rung,
+      round_, sched_.axis_idx, sched_.rep, false);
     const bool finished = state_ == TunerState::DONE;
     add("steps_done", std::to_string(finished ? total : done));
     add("steps_total", std::to_string(total));
@@ -2093,6 +2314,7 @@ void TuningConductor::publish_health()
     fmt(sched_.setpoint[0], 2) + "," + fmt(sched_.setpoint[1], 2) + "," +
     fmt(sched_.setpoint[2], 2));
   add("results", std::to_string(results_.size()));
+  add("restore", restore_state_.empty() ? "-" : restore_state_);
 
   health_pub_->publish(st);
 }
@@ -2118,27 +2340,87 @@ void TuningConductor::abort(const std::string & reason)
   // manoeuvre: in the first field session the abort re-commanded a hover
   // point 13.8 m above the vehicle and flew it there at full thrust.
   hold_here();
-  if (safe_gains_ && gains_ != safe_gains_) {
-    gains_ = safe_gains_;
-    apply_gains(*gains_);
-    RCLCPP_WARN(get_logger(), "Restored last known-safe gains");
+  // Unvalidated changes do not survive an abort: position gains AND
+  // yawctrl_tau go back to the last validated (or entry) values. The FULL
+  // safe set is always sent, not only when the books say something differs:
+  // the books record intent, and an earlier write may have been lost (a
+  // validation-failure restore that timed out left failed gains live while
+  // gains_ already equalled safe_gains_). st_abort confirms the answer.
+  restore_tries_ = 0;
+  if (safe_gains_ || (yaw_tau_ && safe_yaw_tau_)) {
+    if (safe_gains_) {gains_ = safe_gains_;}
+    if (yaw_tau_ && safe_yaw_tau_) {yaw_tau_ = safe_yaw_tau_;}
+    send_restore(now_s());
+  } else {
+    restore_state_.clear();   // no gains were read: nothing was ever changed
   }
+  save_session_recording();
   write_report("aborted: " + reason);
   goto_state(TunerState::ABORT);
+}
+
+void TuningConductor::send_restore(double now)
+{
+  ++restore_tries_;
+  restore_t0_ = now;
+  restore_state_ = "pending";
+  apply_gains(safe_gains_ ? *safe_gains_ : Gains{},
+    yaw_tau_ && safe_yaw_tau_ ? safe_yaw_tau_ : std::nullopt);
+  RCLCPP_WARN(get_logger(), "Restoring last known-safe gains (attempt %d)", restore_tries_);
+}
+
+void TuningConductor::st_abort(double now)
+{
+  if (restore_state_ != "pending") {return;}
+  constexpr int kMaxTries = 5;
+  std::string failure;
+  if (pending_set_ && ready(*pending_set_)) {
+    const auto res = pending_set_->get();
+    pending_set_.reset();
+    bool ok = res != nullptr;
+    if (res) {
+      for (const auto & r : res->results) {ok = ok && r.successful;}
+    }
+    if (ok) {
+      restore_state_ = "confirmed";
+      std::string text = "gain restore confirmed by the controller:";
+      if (safe_gains_) {
+        for (const auto & [ax, kxkv] : *safe_gains_) {
+          text += " " + ax + " " + fmt(kxkv.first, 3) + "/" + fmt(kxkv.second, 3);
+        }
+      }
+      if (yaw_tau_ && safe_yaw_tau_) {text += ", yawctrl_tau " + fmt(*safe_yaw_tau_, 3);}
+      status(text);
+      return;
+    }
+    failure = "controller rejected the restore";
+  } else if (now - restore_t0_ > service_timeout_) {
+    pending_set_.reset();
+    failure = "no answer to the restore in " + fmt(service_timeout_, 0) + " s";
+  } else {
+    return;
+  }
+  if (restore_tries_ < kMaxTries) {
+    status(failure + "; retrying (" + std::to_string(restore_tries_ + 1) + "/" +
+      std::to_string(kMaxTries) + ")");
+    send_restore(now);
+    return;
+  }
+  restore_state_ = "UNCONFIRMED";
+  RCLCPP_ERROR(get_logger(), "GAIN RESTORE UNCONFIRMED after %d attempts: %s", kMaxTries,
+    failure.c_str());
+  status("GAIN RESTORE UNCONFIRMED (" + failure + "): the controller may still run unvalidated "
+    "gains. Land, then check gains.pos/vel and yawctrl_tau with ros2 param get.");
 }
 
 // ---------------------------------------------------------------------
 
 void TuningConductor::write_report(const std::string & status_text)
 {
-  // last identified plant-gain factor per axis (lumps thrust-map error
-  // and inner-loop lag); effective wn = sqrt(alpha * kx)
-  std::map<std::string, double> alpha_by_axis;
-  for (const auto & r : results_) {
-    if (r["alpha"]) {
-      alpha_by_axis[r["axis"].as<std::string>()] = r["alpha"].as<double>();
-    }
-  }
+  // Final gains with what the session concluded about them. No "effective"
+  // wn/zeta computed from the alpha that designed them: that restates the
+  // design target and proves nothing. The evidence is the identification
+  // (with its interval), the phase margins, and the validation result.
   YAML::Node final_gains(YAML::NodeType::Map);
   if (gains_) {
     for (const auto & [ax, kxkv] : *gains_) {
@@ -2149,12 +2431,20 @@ void TuningConductor::write_report(const std::string & status_text)
       f["kv"] = yaml_double(round_to(kv, 3));
       f["wn_nominal"] = yaml_double(round_to(wn, 3));
       f["zeta_nominal"] = yaml_double(round_to(zeta, 3));
-      const auto it = alpha_by_axis.find(ax);
-      if (it != alpha_by_axis.end()) {
-        const double a = it->second;
-        f["alpha"] = yaml_double(a);
-        f["wn_effective"] = yaml_double(round_to(std::sqrt(a * kx), 3));
-        f["zeta_effective"] = yaml_double(round_to(a * kv / (2.0 * std::sqrt(a * kx)), 3));
+      const auto it = axis_prog_.find(ax);
+      if (it != axis_prog_.end()) {
+        const auto & id = it->second.id_last;
+        f["outcome"] = it->second.outcome;
+        f["validated"] = it->second.validated;
+        if (id.ok) {
+          f["alpha"] = yaml_double(round_to(id.alpha, 3));
+          f["alpha_ci"] = std::vector<double>{round_to(id.alpha_lo, 3), round_to(id.alpha_hi, 3)};
+          f["lag_ms"] = yaml_double(round_to(1e3 * id.lag, 0));
+          f["lag_ci_ms"] = std::vector<double>{round_to(1e3 * id.lag_lo, 0),
+            round_to(1e3 * id.lag_hi, 0)};
+          f["pm_nominal_deg"] = yaml_double(round_to(nominal_phase_margin_deg(kx, kv, id), 1));
+          f["pm_worst_deg"] = yaml_double(round_to(worst_phase_margin_deg(kx, kv, id), 1));
+        }
       }
       final_gains[ax] = f;
     }
@@ -2163,8 +2453,6 @@ void TuningConductor::write_report(const std::string & status_text)
   YAML::Node episodes(YAML::NodeType::Sequence);
   for (const auto & r : results_) {episodes.push_back(r);}
 
-  YAML::Node ladder(YAML::NodeType::Sequence);
-  for (double w : wn_ladder_) {ladder.push_back(yaml_double(w));}
 
   YAML::Node trim(YAML::NodeType::Sequence);
   for (double a : a_trim_) {trim.push_back(yaml_double(round_to(a, 3)));}
@@ -2206,7 +2494,12 @@ void TuningConductor::write_report(const std::string & status_text)
     report["session_duration_s"] = yaml_double(round_to(now_s() - session_t0_, 1));
   }
   report["zeta_target"] = yaml_double(zeta_target_);
-  report["wn_ladder"] = ladder;
+  report["wn_target"] = yaml_double(decision_.wn_target);
+  report["wn_target_z"] = yaml_double(wn_target_z_);
+  report["pm_nominal_deg"] = yaml_double(decision_.margins.nominal_deg);
+  report["pm_worst_deg"] = yaml_double(decision_.margins.worst_deg);
+  report["rounds_flown"] = static_cast<int>(round_ + 1);
+  report["session_recording"] = session_csv_;
   report["episodes"] = episodes;
   report["final_gains"] = final_gains;
   report["controller_yaml_snippet"] = snippet;
