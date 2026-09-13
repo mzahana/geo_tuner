@@ -218,6 +218,10 @@ LoopFitResult fit_closed_loop(
     pinned(tau, lb[1], ub[1]) ||
     (model_output_delay && pinned(td, lb[2], ub[2], /*skip_lo=*/true)) ||
     pinned(amp, lb[3], ub[3]);
+  // pinned() flags within 1 % of the span on either side; the floor case
+  // specifically is tau near lb[1].
+  const bool tau_at_floor =
+    !tau_frozen && (tau - lb[1] < 0.01 * (ub[1] - lb[1]));
 
   const Eigen::VectorXd res = best->fun;
   const double rmse =
@@ -248,6 +252,7 @@ LoopFitResult fit_closed_loop(
   out.converged = best->success;
   out.at_bounds = at_bounds;
   out.ambiguous = ambiguous;
+  out.tau_at_floor = tau_at_floor;
   return out;
 }
 

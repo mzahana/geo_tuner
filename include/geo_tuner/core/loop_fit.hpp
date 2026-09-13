@@ -83,6 +83,11 @@ struct LoopFitResult
   bool converged{false};
   bool at_bounds{false};   // a parameter rested on a numerical sanity bound
   bool ambiguous{false};   // two near-equal minima disagreed about alpha
+  // The specific bound was tau's lower one (never set when tau is frozen).
+  // Informative only -- ok() keeps rejecting these fits. The conductor uses
+  // it to retry a floor fit with the lag frozen at the axis's accepted
+  // median, which removes the alpha/tau trade-off that produced the floor.
+  bool tau_at_floor{false};
 
   /// Effective closed-loop natural frequency implied by the fit.
   double wn_effective(double kx) const {return std::sqrt(alpha * kx);}

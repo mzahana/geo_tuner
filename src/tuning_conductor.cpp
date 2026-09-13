@@ -1446,6 +1446,54 @@ void TuningConductor::st_analyze(double)
     return;
   }
 
+  // Floor-fit rescue. A lag resting on the solver floor is a failed FIT,
+  // not always a failed RECORD: on the direct-thrust z path the true lag
+  // (20-60 ms on the 2026-09-13 flight) sits close enough to the floor
+  // that the alpha/tau trade-off routinely parks legitimate episodes
+  // there -- that session discarded 4 of 6 z episodes and left z
+  // unidentified on both rungs. So once this axis has clean estimates,
+  // retry with the lag frozen at their median (the T2 mechanism), which
+  // removes the trade-off and yields an honest alpha. A corrupted record
+  // then shows itself: its frozen-tau alpha lands far from the axis's
+  // accepted ones (0.52/0.67 vs ~1.0 for the 2026-09-10 poisoned
+  // episodes, vs ratios <= 1.32 for the legitimate 2026-09-13 z ones),
+  // and the estimate_consistency factor separates the two cleanly.
+  // Replayed against both sessions: test_core.cpp FieldReplay13.
+  bool rescued = false;
+  if (!fit.ok() && fit.tau_at_floor && !fit.ambiguous) {
+    const auto hist = accepted_fits_.find(ax);
+    if (hist != accepted_fits_.end() && !hist->second.empty()) {
+      std::vector<double> alphas, taus;
+      for (const auto & p : hist->second) {
+        alphas.push_back(p.first);
+        taus.push_back(p.second);
+      }
+      const double tau_axis = median(taus);
+      const double alpha_axis = median(alphas);
+      try {
+        const LoopFitResult refit = fit_closed_loop(
+          t, y, step, kx_now, kv_now, attctrl_tau_.value_or(0.15),
+          /*model_output_delay=*/false, tau_axis);
+        const double ratio = refit.alpha > alpha_axis ?
+          refit.alpha / alpha_axis : alpha_axis / refit.alpha;
+        if (refit.ok() && ratio <= consistency_ &&
+          refit.alpha >= kAlphaMin && refit.alpha <= kAlphaMax)
+        {
+          rec["alpha_free"] = yaml_double(round_to(fit.alpha, 3));
+          rec["tau_frozen_at"] = yaml_double(round_to(tau_axis, 3));
+          status(
+            ax + ": lag rested on the floor; refit with tau frozen at " +
+            fmt(tau_axis * 1e3, 0) + " ms -> alpha " + fmt(refit.alpha, 2) +
+            " (was " + fmt(fit.alpha, 2) + ")");
+          fit = refit;
+          rescued = true;
+        }
+      } catch (const std::exception &) {
+        // fall through to the normal discard path
+      }
+    }
+  }
+
   const double wn_meas = fit.wn_effective(kx_now);
   rec["alpha"] = yaml_double(round_to(fit.alpha, 3));
   rec["tau_lag"] = yaml_double(round_to(fit.tau, 3));
@@ -1483,9 +1531,16 @@ void TuningConductor::st_analyze(double)
     return;
   }
 
-  rec["action"] = "accepted";
+  rec["action"] = rescued ?
+    "accepted (lag frozen at the axis median after a floor fit)" : "accepted";
   results_.push_back(rec);
   sched_.bucket.add(fit.alpha, fit.tau);
+  // Rescued fits stay out of the rescue reference: their tau IS the
+  // median, and keeping the reference anchored to freely-fitted episodes
+  // stops a run of rescues from drifting it.
+  if (!rescued) {
+    accepted_fits_[ax].emplace_back(fit.alpha, fit.tau);
+  }
   if (lag_mode_ == "per_axis" && !hold_tau) {
     axis_tau_[ax] = fit.tau;
     rec["axis_tau_frozen"] = yaml_double(round_to(fit.tau, 3));

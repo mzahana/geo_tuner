@@ -316,6 +316,10 @@ private:
   // the lag each axis's first clean episode identified.
   std::string lag_mode_{"per_episode"};
   std::map<std::string, double> axis_tau_;
+  // Every accepted (alpha, tau) this session, per axis, in all lag modes.
+  // Feeds the floor-fit rescue in st_analyze: a free fit resting on the
+  // tau floor is retried with the lag frozen at this axis's median.
+  std::map<std::string, std::vector<std::pair<double, double>>> accepted_fits_;
   double max_trim_{3.0};            // m/s^2 per axis
   int max_trim_updates_{8};
   std::optional<rclcpp::Client<GetParameters>::SharedFuture> pending_get_;

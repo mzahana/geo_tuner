@@ -716,10 +716,11 @@ struct FieldEpisode
   Eigen::VectorXd t, y;
 };
 
-FieldEpisode load_field_csv(const std::string & name)
+FieldEpisode load_field_csv(
+  const std::string & name, const std::string & flight = "field_2026-09-10")
 {
   const std::string path = std::string(GEO_TUNER_TEST_DATA_DIR) +
-    "/field_2026-09-10/" + name;
+    "/" + flight + "/" + name;
   std::ifstream f(path);
   EXPECT_TRUE(f.good()) << "missing fixture " << path;
   FieldEpisode ep;
@@ -911,5 +912,103 @@ TEST(FixedTauFit, CleanAlphasInvariantUnderFrozenLag)
       ep.t, ep.y, ep.step, 1.230, 1.948, 0.138, false, 0.138);
     EXPECT_TRUE(fit.ok()) << c.file;
     EXPECT_NEAR(fit.alpha, c.free_alpha, 0.05) << c.file;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Field replay, 2026-09-13 lab flight (test/data/field_2026-09-13).
+//
+// The complement of the 2026-09-10 story: on the direct-thrust z path the
+// true lag is 20-60 ms, close enough to the solver floor that the
+// alpha/tau trade-off parked 4 of 6 legitimate z episodes there. The T1
+// gate (correctly) refused them all and the session left z unidentified
+// on both rungs. These tests pin the rescue: a floor fit retried with the
+// lag frozen at the axis's accepted median yields an honest alpha, and
+// the estimate_consistency factor (1.35) separates legitimate rescues
+// (ratios <= 1.32 here) from the corrupted 2026-09-10 episodes (ratios
+// >= 1.75), whose frozen-tau alphas land far from their axis's accepted
+// ones. Applied gains from geo_tuner_report.yaml alongside the data.
+
+// The two z rung-1 floor episodes carry the tau_at_floor flag -- including
+// ep000, whose 19 ms lag pins by the 1 %-of-span proximity rule rather
+// than landing on the floor exactly.
+TEST(FieldReplay13, FloorFitsAreFlagged)
+{
+  for (const char * file :
+    {"ep000_z_rung0_rep0.csv", "ep001_z_rung0_rep1.csv",
+      "ep008_z_rung1_rep0.csv", "ep009_z_rung1_rep1.csv"})
+  {
+    const auto ep = load_field_csv(file, "field_2026-09-13");
+    const auto fit = fit_closed_loop(ep.t, ep.y, ep.step, 2.778, 2.504, 0.3);
+    EXPECT_TRUE(fit.at_bounds) << file;
+    EXPECT_TRUE(fit.tau_at_floor) << file;
+    EXPECT_FALSE(fit.ok()) << file;
+  }
+}
+
+// A clean fit never carries the flag, and freezing never sets it.
+TEST(FieldReplay13, CleanAndFrozenFitsAreNotFlagged)
+{
+  const auto ep = load_field_csv("ep010_z_rung1_rep2.csv", "field_2026-09-13");
+  const auto free_fit = fit_closed_loop(ep.t, ep.y, ep.step, 2.778, 2.504, 0.3);
+  EXPECT_TRUE(free_fit.ok());
+  EXPECT_FALSE(free_fit.tau_at_floor);
+  const auto ep8 = load_field_csv("ep008_z_rung1_rep0.csv", "field_2026-09-13");
+  const auto frozen = fit_closed_loop(ep8.t, ep8.y, ep8.step, 2.778, 2.504, 0.3,
+    false, 0.064);
+  EXPECT_FALSE(frozen.tau_at_floor);
+}
+
+// The rescue itself: refit the two z rung-1 floor episodes with the lag
+// frozen at the axis's accepted tau (0.064 s, from ep002 -- the only
+// clean z estimate before them). Both come back clean with alphas within
+// the consistency factor of the accepted alpha (0.981), so the flown
+// session's z rung-1 bucket would have held 3 estimates (spread 1.19)
+// and updated the z gains at the design rung.
+TEST(FieldReplay13, FloorFitsRescuedByFrozenLag)
+{
+  const double tau_axis = 0.064, alpha_axis = 0.981;
+  const struct {const char * file; double alpha_expect;} cases[] = {
+    {"ep008_z_rung1_rep0.csv", 0.887},
+    {"ep009_z_rung1_rep1.csv", 0.743},
+  };
+  for (const auto & c : cases) {
+    const auto ep = load_field_csv(c.file, "field_2026-09-13");
+    const auto fit = fit_closed_loop(
+      ep.t, ep.y, ep.step, 2.778, 2.504, 0.3, false, tau_axis);
+    EXPECT_TRUE(fit.ok()) << c.file;
+    EXPECT_NEAR(fit.alpha, c.alpha_expect, 0.05) << c.file;
+    const double ratio = std::max(fit.alpha, alpha_axis) /
+      std::min(fit.alpha, alpha_axis);
+    EXPECT_LE(ratio, 1.35) << c.file << ": a legitimate rescue must pass "
+      "the consistency gate";
+  }
+}
+
+// The load-bearing negative: the corrupted 2026-09-10 floor episodes ALSO
+// refit cleanly under a frozen lag (ok() passes), but their alphas land
+// far from their axis's accepted median -- the consistency ratio is what
+// keeps them out. If this test fails, the rescue has become a way to
+// re-admit poisoned records.
+TEST(FieldReplay13, CorruptedFloorFitsFailTheConsistencyGate)
+{
+  const struct
+  {
+    const char * file;
+    double kx, kv, tau_axis, alpha_axis;
+  } cases[] = {
+    // z: accepted alphas 1.194/0.902/0.954 (median 0.954), taus median 0.125.
+    {"ep009_z_rung1_rep1.csv", 1.736, 2.389, 0.125, 0.954},
+    // x: accepted alphas 0.944/1.248/1.171 (median 1.171), taus median 0.188.
+    {"ep011_x_rung1_rep0.csv", 1.230, 1.948, 0.188, 1.171},
+  };
+  for (const auto & c : cases) {
+    const auto ep = load_field_csv(c.file);
+    const auto fit = fit_closed_loop(
+      ep.t, ep.y, ep.step, c.kx, c.kv, 0.3, false, c.tau_axis);
+    EXPECT_TRUE(fit.ok()) << c.file << ": ok() alone must NOT be the gate";
+    const double ratio = std::max(fit.alpha, c.alpha_axis) /
+      std::min(fit.alpha, c.alpha_axis);
+    EXPECT_GT(ratio, 1.35) << c.file;
   }
 }
