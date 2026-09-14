@@ -102,7 +102,12 @@ def generate_launch_description():
             "step_size": step_size,
             "step_size_z": step_size_z,
             "yaw_step": yaw_step,
-            "settle_time": 3.0,
+            # Settle and episode end follow the conductor's defaults unless
+            # overridden, so the sim times what the field flies; A/B runs set
+            # settle_time:=4.0 episode_end:=settled for the pre-2026-09-14 rules.
+            "settle_time": ParameterValue(
+                LaunchConfiguration("settle_time"), value_type=float),
+            "episode_end": LaunchConfiguration("episode_end"),
             # episode_time deliberately NOT pinned: the conductor's 8 s
             # default (T3) is part of what this loop exists to exercise.
             "axes": "z,x,y,yaw",
@@ -141,6 +146,8 @@ def generate_launch_description():
         DeclareLaunchArgument("kx_z", default_value="3.0"),
         DeclareLaunchArgument("kv_z", default_value="3.3"),
         DeclareLaunchArgument("require_offboard", default_value="false"),
+        DeclareLaunchArgument("settle_time", default_value="1.5"),
+        DeclareLaunchArgument("episode_end", default_value="motion"),
         DeclareLaunchArgument("agl_topic", default_value=""),
         controller, sim, conductor,
     ])

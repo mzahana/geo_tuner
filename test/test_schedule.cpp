@@ -237,6 +237,60 @@ TEST(SettlePredicate, YawAxisAlsoChecksHeading)
   EXPECT_TRUE(c.is_quiet(1.5));
 }
 
+// ------------------------------------------------------- parked (trim gate)
+
+TEST(ParkedPredicate, SteadyOffsetCountsAsParked)
+{
+  // The 2026-09-14 quad_sim case: a steady wind holds the vehicle 12 cm off
+  // the setpoint. is_quiet can never pass there; the trim learner must.
+  auto c = make_schedule();
+  c.odom = fake_odom({0.12, 0.0, 3.0}, {0.0, 0.0, 0.0});
+  EXPECT_FALSE(c.is_quiet(0.0));
+  EXPECT_FALSE(c.is_quiet(2.0));
+  EXPECT_FALSE(c.is_parked(0.0));
+  EXPECT_FALSE(c.is_parked(0.5));
+  EXPECT_TRUE(c.is_parked(1.05));
+}
+
+TEST(ParkedPredicate, SlowDriftIsNotParked)
+{
+  // A gust pushing the vehicle slowly (below the speed gate) moves it out of
+  // the spread: that offset is the gust, not a trim to learn.
+  auto c = make_schedule();
+  for (int k = 0; k <= 40; ++k) {
+    const double t = 0.05 * k;
+    c.odom = fake_odom({0.08 * t, 0.0, 3.0}, {0.08, 0.0, 0.0});
+    EXPECT_FALSE(c.is_parked(t)) << "t=" << t;
+  }
+}
+
+TEST(ParkedPredicate, SpeedResetsTheWindow)
+{
+  auto c = make_schedule();
+  c.odom = fake_odom({0.12, 0.0, 3.0}, {0.0, 0.0, 0.0});
+  c.is_parked(0.0);
+  c.odom = fake_odom({0.12, 0.0, 3.0}, {0.3, 0.0, 0.0});
+  EXPECT_FALSE(c.is_parked(0.6));
+  c.odom = fake_odom({0.12, 0.0, 3.0}, {0.0, 0.0, 0.0});
+  EXPECT_FALSE(c.is_parked(0.7));
+  EXPECT_FALSE(c.is_parked(1.5));
+  EXPECT_TRUE(c.is_parked(1.75));
+}
+
+TEST(MotionQuiet, EndsWhenStoppedAwayFromTheTarget)
+{
+  // Stopped 7 cm short of a 1 m step (hover wander): the old band test never
+  // passes; stopping is what ends a position episode now.
+  auto c = make_schedule();
+  c.step_applied = 1.0;
+  c.odom = fake_odom({0.93, 0.0, 3.0}, {0.0, 0.0, 0.0});
+  EXPECT_FALSE(c.motion_quiet(3.0));
+  EXPECT_FALSE(c.motion_quiet(3.3));
+  EXPECT_TRUE(c.motion_quiet(3.55));
+  c.odom = fake_odom({0.93, 0.0, 3.0}, {0.0, 0.2, 0.0});
+  EXPECT_FALSE(c.motion_quiet(3.6));
+}
+
 // ----------------------------------------------------- adaptive episode end
 
 TEST(AdaptiveEpisodeEnd, SettledResponseEndsTheEpisode)

@@ -160,6 +160,61 @@ bool TuningSchedule::is_quiet(double now)
   return (now - *quiet_t0_) >= settle_quiet_time;
 }
 
+bool TuningSchedule::is_parked(double now)
+{
+  const auto still = [this]() {
+      return odom && std::sqrt(
+        odom->vel[0] * odom->vel[0] + odom->vel[1] * odom->vel[1] +
+        odom->vel[2] * odom->vel[2]) < settle_tol_vel;
+    };
+  if (!still()) {
+    park_window_.clear();
+    park_t0_.reset();
+    return false;
+  }
+  if (!park_t0_) {park_t0_ = now;}
+  park_window_.emplace_back(now, odom->pos);
+  // Drop samples that no longer agree with the newest within park_spread; the
+  // still run then restarts at the oldest sample that does.
+  for (int i = 0; i < 3; ++i) {
+    double lo = odom->pos[i], hi = odom->pos[i];
+    size_t k = park_window_.size();
+    while (k > 0) {
+      const double v = park_window_[k - 1].second[i];
+      if (std::max(hi, v) - std::min(lo, v) > park_spread) {break;}
+      lo = std::min(lo, v);
+      hi = std::max(hi, v);
+      --k;
+    }
+    if (k > 0) {
+      park_window_.erase(park_window_.begin(), park_window_.begin() + static_cast<long>(k));
+      park_t0_ = park_window_.front().first;
+    }
+  }
+  // Only the last park_time needs checking against new samples.
+  while (park_window_.size() > 1 && now - park_window_[1].first >= park_time) {
+    park_window_.erase(park_window_.begin());
+  }
+  return now - *park_t0_ >= park_time;
+}
+
+bool TuningSchedule::motion_quiet(double now)
+{
+  if (!odom) {
+    motion_t0_.reset();
+    return false;
+  }
+  const double speed = std::sqrt(
+    odom->vel[0] * odom->vel[0] + odom->vel[1] * odom->vel[1] +
+    odom->vel[2] * odom->vel[2]);
+  if (speed >= settle_tol_vel) {
+    motion_t0_.reset();
+    return false;
+  }
+  if (!motion_t0_) {motion_t0_ = now;}
+  return now - *motion_t0_ >= episode_quiet_time;
+}
+
 bool TuningSchedule::response_settled(double t_end_abs) const
 {
   const double t_end = t_end_abs - step_t0;

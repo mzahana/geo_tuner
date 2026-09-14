@@ -103,6 +103,11 @@ struct AxisProgress
   std::vector<double> yaw_T;       // yaw: this round's accepted time constants
   AccelLoopResult id_last;         // latest identification, for the report
   std::string outcome;             // final one-liner for report/panel
+  // What the session did to this axis, as one machine-readable word, because
+  // `validated` alone reads as a failure on an axis that was confirmed and
+  // never needed changing: confirmed | updated_validated | restored |
+  // kept_inconclusive | kept_no_estimate | kept_update_unvalidated | unfinished.
+  std::string result{"unfinished"};
 };
 
 class TuningConductor : public rclcpp::Node
@@ -174,6 +179,14 @@ private:
   void start_next_round();
   void finish();
   void set_trim_diagnosis();
+  /// Command-accel limits of the controller [m/s^2]: (lateral, vertical),
+  /// 0 where unknown.
+  std::pair<double, double> command_limits() const;
+  /// Why a step of `step` m on a lateral (or vertical) axis would drive the
+  /// command near its limit at the current gains; empty when it would not.
+  std::string step_saturation_reason(double step, bool vertical) const;
+  /// Non-empty (the reason) while either configured step would saturate.
+  std::string saturation_gate() const;
   void abort(const std::string & reason);
 
   // ---- hover point and altitude ----
@@ -224,6 +237,7 @@ private:
 
   void publish_health();
   void write_report(const std::string & status);
+  void freeze_session_end();
 
   // ---- interfaces ----
   rclcpp::Publisher<trajectory_msgs::msg::MultiDOFJointTrajectory>::SharedPtr sp_pub_;
@@ -303,6 +317,18 @@ private:
   std::string estimator_node_;
   double min_settle_time_{0.3};
   bool adaptive_episode_{true};
+  // How a position episode ends: "motion" (stopped, past the minimum
+  // transient time) or "settled" (parked within a band of the step -- the
+  // pre-2026-09-14 rule, kept for A/B runs).
+  std::string episode_end_{"motion"};
+  // Command-limit guard: a step whose predicted peak command kx*step exceeds
+  // this fraction of the controller's limit is refused, and an episode whose
+  // measured peak does is flagged. <= 0 disables.
+  double saturation_margin_{0.8};
+  double ctrl_max_accel_{0.0};     // m/s^2, 0 = unknown
+  double ctrl_max_tilt_{0.0};      // rad, 0 = unknown
+  double ep_u_peak_lat_{0.0};      // this episode's peak commanded accel [m/s^2]
+  double ep_u_peak_z_{0.0};
   double min_episode_time_{2.0};
   double episode_settle_periods_{4.0};
   double hover_capture_radius_{0.3};
@@ -360,6 +386,17 @@ private:
   // but transparently and bounded. Sent as the setpoint's acceleration,
   // which the controller uses as feedforward a_ref.
   std::array<double, 3> a_trim_{0.0, 0.0, 0.0};
+  // What the session ended with, frozen when it completes or aborts. The
+  // report is written again on accept, typically after landing: by then
+  // leaving OFFBOARD has zeroed a_trim_ and the clock has run on (2026-09-14:
+  // report said trim [0, 0, 0] and 358 s for a 313 s session).
+  struct SessionEnd
+  {
+    double t{0.0};                       // node clock [s]
+    std::array<double, 3> trim{};
+    std::string stamp;                   // local wall time
+  };
+  std::optional<SessionEnd> session_end_;
   int trim_updates_{0};
   double trim_update_threshold_{0.05};   // m; SETTLE-phase learner gate (T4)
   std::map<std::string, AxisProgress> axis_prog_;

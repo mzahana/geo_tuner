@@ -9,6 +9,7 @@
 #include <limits>
 #include <sstream>
 #include <stdexcept>
+#include <tuple>
 
 #include <geometry_msgs/msg/transform.hpp>
 #include <geometry_msgs/msg/twist.hpp>
@@ -35,6 +36,16 @@ std::string fmt(double v, int precision)
   os.precision(precision);
   os << v;
   return os.str();
+}
+
+std::string local_stamp()
+{
+  char buf[32];
+  const std::time_t t = std::time(nullptr);
+  std::tm tm_local{};
+  localtime_r(&t, &tm_local);
+  std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm_local);
+  return buf;
 }
 
 double round_to(double v, int digits)
@@ -155,7 +166,11 @@ TuningConductor::TuningConductor(const rclcpp::NodeOptions & options)
   agl_required_ = !agl_topic.empty();
   sched_.step_size = declare_parameter<double>("step_size", 0.5);        // m
   sched_.step_size_z = declare_parameter<double>("step_size_z", 0.4);    // m
-  settle_time_ = declare_parameter<double>("settle_time", 4.0);          // s before each step
+  // 1.5 s, not 4: the acceleration-loop identification needs no parked
+  // start, and the quiet gate (6 cm on all axes) is below 2026-09-14's 7 cm
+  // hover wander, so 27 of 40 settles ran to the old 4 s cap -- 126 s of a
+  // 313 s session. Quiet still ends it sooner; trim learning is not bound by it.
+  settle_time_ = declare_parameter<double>("settle_time", 1.5);          // s before each step
   hover_timeout_ = declare_parameter<double>("hover_timeout", 20.0);     // s to reach hover point
   // 8 s, not 6: rung-2 rise times measured 2.0-3.6 s on 2026-09-10, and a
   // de-tuned rung must still show the fit >= 2 rise times (T3).
@@ -282,6 +297,14 @@ TuningConductor::TuningConductor(const rclcpp::NodeOptions & options)
   // transient can have finished (min_episode_time and
   // episode_settle_periods/(zeta*wn)). episode_time is the cap.
   adaptive_episode_ = declare_parameter<bool>("adaptive_episode", true);
+  episode_end_ = declare_parameter<std::string>("episode_end", "motion");
+  if (episode_end_ != "motion" && episode_end_ != "settled") {
+    RCLCPP_WARN(get_logger(), "episode_end '%s' unknown; using 'motion'", episode_end_.c_str());
+    episode_end_ = "motion";
+  }
+  sched_.park_time = declare_parameter<double>("park_time", 1.0);        // s
+  sched_.park_spread = declare_parameter<double>("park_spread", 0.03);   // m
+  saturation_margin_ = declare_parameter<double>("saturation_margin", 0.8);
   min_episode_time_ = declare_parameter<double>("min_episode_time", 2.0);      // s
   sched_.episode_quiet_time = declare_parameter<double>("episode_quiet_time", 0.5);  // s
   sched_.episode_settle_band =
@@ -554,6 +577,15 @@ rcl_interfaces::msg::SetParametersResult TuningConductor::on_set_parameters(
         return result;
       }
     }
+    if (p.get_name() != "yaw_step") {
+      const auto why = step_saturation_reason(value, p.get_name() == "step_size_z");
+      if (!why.empty()) {
+        result.successful = false;
+        result.reason = p.get_name() + " " + fmt(value, 2) + " m: " + why;
+        RCLCPP_WARN(get_logger(), "rejected %s", result.reason.c_str());
+        return result;
+      }
+    }
     const auto [ok, note] =
       sched_.validate_step(value, it->second, safety_.limits().max_pos_error);
     if (!ok) {
@@ -728,7 +760,27 @@ void TuningConductor::begin_flying()
     goto_state(TunerState::TOO_LOW);
     return;
   }
-  if (session_t0_ < 0.0) {session_t0_ = now_s();}
+  // Command-limit gate, same shape: hold, say why, and start by itself once
+  // the operator lowers the step from the panel (st_too_low re-checks).
+  if (const auto sat = saturation_gate(); !sat.empty()) {
+    hold_here();
+    too_low_log_t_ = now_s();
+    status(sat + ". Lower it from the ground station; the session starts once it fits.");
+    goto_state(TunerState::TOO_LOW);
+    return;
+  }
+  if (session_t0_ < 0.0) {
+    session_t0_ = now_s();
+    // The startup lines print the configured envelope; the panel can change
+    // it before the start (2026-09-14 flew 1 m steps under a logged 0.5/0.4 m
+    // envelope and a 2.80 m floor clearance). Record what this session flies.
+    const auto agl = hover_agl();
+    status(
+      "Session envelope: steps " + fmt(sched_.step_size, 2) + " m lateral, " +
+      fmt(sched_.step_size_z, 2) + " m vertical, " + fmt(sched_.yaw_step, 2) +
+      " rad yaw; start gate " + fmt(min_start_altitude(), 2) + " m AGL (hover at " +
+      (agl ? fmt(*agl, 2) : std::string("?")) + " m)");
+  }
   // The schedule may be parked on an axis already finished (a resume after
   // an OFFBOARD pause): move to one this round still flies.
   if (!seek_active_axis()) {return;}
@@ -783,7 +835,7 @@ void TuningConductor::request_gains(std::optional<double> now)
   auto req = std::make_shared<GetParameters::Request>();
   req->names = {"gains.pos.x", "gains.pos.y", "gains.pos.z",
     "gains.vel.x", "gains.vel.y", "gains.vel.z",
-    "yawctrl_tau", "attctrl_tau", "mass"};
+    "yawctrl_tau", "attctrl_tau", "mass", "max_accel", "max_tilt_angle"};
   auto fut = get_param_cli_->async_send_request(req);
   get_req_id_ = fut.request_id;
   pending_get_ = fut.future.share();
@@ -1042,6 +1094,20 @@ void TuningConductor::st_wait_enable(double now)
         "the commanded acceleration identification needs");
       return;
     }
+    // Command limits, for the saturation guard (unknown on controllers that
+    // do not expose them: the guard then stays silent).
+    {
+      using rcl_interfaces::msg::ParameterType;
+      const auto num = [&](size_t i) {
+          if (res->values.size() <= i) {return 0.0;}
+          const auto & pv = res->values[i];
+          return pv.type == ParameterType::PARAMETER_DOUBLE ? pv.double_value :
+                 pv.type == ParameterType::PARAMETER_INTEGER ?
+                 static_cast<double>(pv.integer_value) : 0.0;
+        };
+      ctrl_max_accel_ = std::max(0.0, num(9));
+      ctrl_max_tilt_ = std::max(0.0, num(10));
+    }
     if (yaw_tau > 0.0) {
       yaw_tau_ = yaw_tau;
     } else if (att_tau > 0.0) {
@@ -1226,7 +1292,11 @@ void TuningConductor::st_too_low(double now)
   // working altitude. Nothing is commanded to move: the way out is the
   // pilot climbing (which needs manual control, so the mode change back
   // to OFFBOARD re-enters here) or the operator lowering the gate.
-  const auto [ok, why] = altitude_gate();
+  auto [ok, why] = altitude_gate();
+  if (ok) {
+    why = saturation_gate();
+    ok = why.empty();
+  }
   if (ok) {
     capture_hover();
     status(
@@ -1341,24 +1411,71 @@ void TuningConductor::set_trim_diagnosis()
   }
 }
 
+std::pair<double, double> TuningConductor::command_limits() const
+{
+  // The controller clamps the feedback acceleration's norm to max_accel and
+  // its tilt to max_tilt_angle; near hover the tilt allows g*tan(tilt)
+  // laterally. PX4 and the motors saturate beyond that, where the linear
+  // loop the identification assumes stops holding.
+  double lat = ctrl_max_accel_;
+  if (ctrl_max_tilt_ > 0.0 && ctrl_max_tilt_ < 1.5) {
+    const double tilt_lat = kGravity * std::tan(ctrl_max_tilt_);
+    lat = lat > 0.0 ? std::min(lat, tilt_lat) : tilt_lat;
+  }
+  return {lat, ctrl_max_accel_};
+}
+
+std::string TuningConductor::saturation_gate() const
+{
+  for (const auto & [label, vertical, mag] :
+    {std::tuple<const char *, bool, double>{"step_size", false, sched_.step_size},
+      std::tuple<const char *, bool, double>{"step_size_z", true, sched_.step_size_z}})
+  {
+    const auto why = step_saturation_reason(mag, vertical);
+    if (!why.empty()) {return std::string("refusing to start: ") + label + " " + fmt(mag, 2) +
+             " m -- " + why;}
+  }
+  return "";
+}
+
+std::string TuningConductor::step_saturation_reason(double step, bool vertical) const
+{
+  if (saturation_margin_ <= 0.0 || !gains_) {return "";}
+  const auto [lat, vert] = command_limits();
+  const double limit = vertical ? vert : lat;
+  if (limit <= 0.0) {return "";}
+  double kx = 0.0;
+  for (const auto & ax : vertical ? std::vector<std::string>{"z"} :
+    std::vector<std::string>{"x", "y"})
+  {
+    kx = std::max(kx, gains_->at(ax).first);
+  }
+  // A position step's command starts at kx * step and only falls from there.
+  const double peak = kx * std::abs(step);
+  if (peak <= saturation_margin_ * limit) {return "";}
+  return "the step commands ~" + fmt(peak, 1) + " m/s^2 at kx " + fmt(kx, 2) +
+         ", above " + fmt(100.0 * saturation_margin_, 0) + " % of the controller's " +
+         fmt(limit, 1) + " m/s^2 " + (vertical ? "acceleration" : "lateral") +
+         " limit; past it the loop is not the linear one being identified. Use <= " +
+         fmt(saturation_margin_ * limit / kx, 2) + " m";
+}
+
 void TuningConductor::st_settle(double now)
 {
   const double elapsed = now - state_t0_;
+  // Both predicates track their own windows: evaluate each once per tick.
+  const bool quiet = sched_.is_quiet(now);
+  const bool parked = sched_.is_parked(now);
   if (elapsed < min_settle_time_) {return;}
-  // settle_time remains the hard cap: with a noisy/windy plant this
-  // degrades exactly to the previous fixed-time behaviour.
-  if (elapsed < settle_time_ && !sched_.is_quiet(now)) {return;}
-  // The vehicle is parked (quiet, or as steady as it gets): absorb any
-  // remaining steady offset into the accel trim BEFORE stepping, then
-  // let it re-settle under the new trim so the step record starts from a
-  // trimmed equilibrium. Without this the trim only ever learned when
-  // GOTO_HOVER failed to capture for 5 s -- once per flight in practice
-  // -- and the unabsorbed bias corrupted every low-gain episode (T4 in
-  // TUNER_IMPROVEMENTS_PLAN.md). The residual force each axis is missing
-  // equals kx * offset: that is what the feedback is currently supplying.
-  // Only from a quiet vehicle: at the settle_time cap in gusts the offset is
-  // the gust, and learning it as trim is a feedforward push in its direction.
-  if (sched_.odom && gains_ && trim_updates_ < max_trim_updates_ && sched_.is_quiet(now)) {
+  // A parked vehicle with a steady offset: absorb it into the accel trim
+  // BEFORE stepping, then re-settle under the new trim so the step starts
+  // from a trimmed equilibrium (T4 in TUNER_IMPROVEMENTS_PLAN.md). The
+  // residual force each axis is missing equals kx * offset: that is what
+  // the feedback is currently supplying. Gated on PARKED (holding still
+  // wherever it is), not quiet: quiet demands closeness to the setpoint, so
+  // it refused precisely the offsets this exists to remove. A gust keeps the
+  // vehicle moving and fails the parked test, so it is not learned as trim.
+  if (parked && sched_.odom && gains_ && trim_updates_ < max_trim_updates_) {
     bool updated = false;
     for (const auto & ax2 : {std::string("x"), std::string("y"), std::string("z")}) {
       const int i = axis_index(ax2);
@@ -1393,6 +1510,9 @@ void TuningConductor::st_settle(double now)
       return;
     }
   }
+  // settle_time remains the hard cap: a windy vehicle that never goes quiet
+  // steps anyway.
+  if (elapsed < settle_time_ && !quiet) {return;}
   last_settle_dur_ = elapsed;
   const std::string ax = sched_.axes[sched_.axis_idx];
   sched_.recording.clear();
@@ -1450,6 +1570,8 @@ void TuningConductor::st_settle(double now)
     std::max(
       min_episode_time_,
       episode_settle_periods_ / std::max(zeta_target_ * wn_equiv, 1e-3)));
+  ep_u_peak_lat_ = 0.0;
+  ep_u_peak_z_ = 0.0;
   goto_state(TunerState::STEP);
 }
 
@@ -1477,9 +1599,16 @@ void TuningConductor::st_step(double now)
     goto_state(TunerState::ANALYZE);
     return;
   }
-  if (adaptive_episode_ && elapsed >= episode_min_time_ && sched_.odom &&
-    sched_.response_settled(sched_.odom->t_stamp))
-  {
+  if (last_cmd_force_ && controller_mass_ > 0.0) {
+    const auto & f = *last_cmd_force_;
+    const double ux = f[0] / controller_mass_, uy = f[1] / controller_mass_;
+    ep_u_peak_lat_ = std::max(ep_u_peak_lat_, std::hypot(ux, uy));
+    ep_u_peak_z_ = std::max(ep_u_peak_z_, std::abs(f[2] / controller_mass_ - kGravity));
+  }
+  if (!adaptive_episode_ || elapsed < episode_min_time_ || !sched_.odom) {return;}
+  const bool ended = (ax != "yaw" && episode_end_ == "motion") ?
+    sched_.motion_quiet(now) : sched_.response_settled(sched_.odom->t_stamp);
+  if (ended) {
     goto_state(TunerState::ANALYZE);
   }
 }
@@ -1590,10 +1719,26 @@ void TuningConductor::st_analyze(double)
   rec["overshoot"] = yaml_double(round_to(os, 3));
   rec["settle_s"] = yaml_double(round_to(last_settle_dur_, 2));
   rec["record_s"] = yaml_double(round_to(t.size() > 0 ? t[t.size() - 1] : 0.0, 2));
+  const bool vertical = ax == "z";
+  const double u_peak = vertical ? ep_u_peak_z_ : ep_u_peak_lat_;
+  rec["u_peak"] = yaml_double(round_to(u_peak, 2));
+  const auto limits = command_limits();
+  const double u_limit = vertical ? limits.second : limits.first;
+  std::string sat_note;
+  if (u_limit > 0.0) {
+    rec["u_peak_frac"] = yaml_double(round_to(u_peak / u_limit, 2));
+    if (saturation_margin_ > 0.0 && u_peak > saturation_margin_ * u_limit) {
+      rec["near_saturation"] = true;
+      sat_note = "; WARNING peak command " + fmt(u_peak, 1) + " m/s^2 is " +
+        fmt(100.0 * u_peak / u_limit, 0) + " % of the " + fmt(u_limit, 1) +
+        " m/s^2 limit -- consider a smaller step";
+    }
+  }
   rec["action"] = "recorded";
   results_.push_back(rec);
   axis_prog_[ax].overshoots.push_back(os);
-  status(ax + ": step " + fmt(step, 2) + " flown, overshoot " + fmt(100.0 * os, 0) + "%");
+  status(ax + ": step " + fmt(step, 2) + " flown, overshoot " + fmt(100.0 * os, 0) + "%" +
+    sat_note);
   episode_finished();
 }
 
@@ -1647,6 +1792,7 @@ void TuningConductor::decide_position_axis(const std::string & ax, Gains & to_ap
       (*gains_)[ax] = entry;
       (*safe_gains_)[ax] = entry;
       pr.active = false;
+      pr.result = "restored";
       pr.outcome = "validation failed (" + v.why + "); entry gains restored";
       rec["action"] = pr.outcome;
       results_.push_back(rec);
@@ -1692,6 +1838,7 @@ void TuningConductor::decide_position_axis(const std::string & ax, Gains & to_ap
         pr.outcome = "inconclusive; flying another round to narrow the interval";
       } else {
         pr.active = false;
+        pr.result = pr.validated ? "updated_validated" : "kept_inconclusive";
         pr.outcome = prefix + "kept, " + dec.why;
       }
       break;
@@ -1700,11 +1847,13 @@ void TuningConductor::decide_position_axis(const std::string & ax, Gains & to_ap
         pr.outcome = "no estimate yet (" + id.reason + "); flying another round";
       } else {
         pr.active = false;
+        pr.result = pr.validated ? "updated_validated" : "kept_no_estimate";
         pr.outcome = prefix + "kept: " + dec.why;
       }
       break;
     case AxisVerdict::CONFIRMED:
       pr.active = false;
+      pr.result = pr.validated ? "updated_validated" : "confirmed";
       pr.outcome = pr.validated ? "validated: " + dec.why : dec.why;
       break;
     case AxisVerdict::UPDATE:
@@ -1726,6 +1875,7 @@ void TuningConductor::decide_position_axis(const std::string & ax, Gains & to_ap
           ", validating next round";
       } else {
         pr.active = false;
+        pr.result = pr.validated ? "updated_validated" : "kept_update_unvalidated";
         pr.outcome = prefix + "update indicated but no round left to validate it; gains kept (" +
           dec.why + ")";
       }
@@ -1760,6 +1910,7 @@ bool TuningConductor::decide_yaw()
     if (!pass) {
       yaw_tau_ = baseline_yaw_tau_;
       pr.active = false;
+      pr.result = "restored";
       pr.outcome = std::string("validation failed (") +
         (est.ok ? "T " + fmt(est.value, 2) + " s no closer to target " +
         fmt(yaw_T_target_, 2) + " than before" : est.reason) +
@@ -1778,6 +1929,7 @@ bool TuningConductor::decide_yaw()
       pr.outcome = "no estimate yet (" + est.reason + ")";
     } else {
       pr.active = false;
+      pr.result = pr.validated ? "updated_validated" : "kept_no_estimate";
       pr.outcome = "kept: " + est.reason;
     }
     rec["action"] = pr.outcome;
@@ -1789,6 +1941,7 @@ bool TuningConductor::decide_yaw()
   bool applied = false;
   if (log_err(est.value) <= tol) {
     pr.active = false;
+    pr.result = pr.validated ? "updated_validated" : "confirmed";
     pr.outcome = std::string(pr.validated ? "validated" : "confirmed") + ": T " +
       fmt(est.value, 2) + " s within " + fmt(100.0 * yaw_tolerance_, 0) + " % of " +
       fmt(yaw_T_target_, 2) + " s";
@@ -1805,6 +1958,7 @@ bool TuningConductor::decide_yaw()
     applied = true;
   } else {
     pr.active = false;
+    pr.result = pr.validated ? "updated_validated" : "kept_update_unvalidated";
     pr.outcome = "T " + fmt(est.value, 2) + " s outside the band but no round left to "
       "validate an update; yawctrl_tau kept";
   }
@@ -2001,6 +2155,7 @@ void TuningConductor::finish()
   sched_.setpoint_yaw = hover_yaw_;
   sched_.leg_offset = 0.0;
   set_trim_diagnosis();
+  freeze_session_end();
   save_session_recording();
   write_report("complete");
   status("Tuning complete. Report: " + report_path_);
@@ -2138,6 +2293,7 @@ void TuningConductor::srv_reset(Trigger::Request::SharedPtr, Trigger::Response::
   session_t0_ = -1.0;
   last_settle_dur_ = 0.0;
   a_trim_ = {0.0, 0.0, 0.0};
+  session_end_.reset();
   trim_updates_ = 0;
   start_requested_ = !require_enable_;
   safety_.reset();
@@ -2354,6 +2510,7 @@ void TuningConductor::abort(const std::string & reason)
   } else {
     restore_state_.clear();   // no gains were read: nothing was ever changed
   }
+  freeze_session_end();
   save_session_recording();
   write_report("aborted: " + reason);
   goto_state(TunerState::ABORT);
@@ -2415,6 +2572,11 @@ void TuningConductor::st_abort(double now)
 
 // ---------------------------------------------------------------------
 
+void TuningConductor::freeze_session_end()
+{
+  session_end_ = SessionEnd{now_s(), a_trim_, local_stamp()};
+}
+
 void TuningConductor::write_report(const std::string & status_text)
 {
   // Final gains with what the session concluded about them. No "effective"
@@ -2434,6 +2596,7 @@ void TuningConductor::write_report(const std::string & status_text)
       const auto it = axis_prog_.find(ax);
       if (it != axis_prog_.end()) {
         const auto & id = it->second.id_last;
+        f["result"] = it->second.result;
         f["outcome"] = it->second.outcome;
         f["validated"] = it->second.validated;
         if (id.ok) {
@@ -2454,14 +2617,13 @@ void TuningConductor::write_report(const std::string & status_text)
   for (const auto & r : results_) {episodes.push_back(r);}
 
 
+  // Session facts come from its end, not from the moment the report is
+  // written: accept usually happens on the ground (see session_end_).
   YAML::Node trim(YAML::NodeType::Sequence);
-  for (double a : a_trim_) {trim.push_back(yaml_double(round_to(a, 3)));}
-
-  char timebuf[32];
-  const std::time_t now_t = std::time(nullptr);
-  std::tm tm_local{};
-  localtime_r(&now_t, &tm_local);
-  std::strftime(timebuf, sizeof(timebuf), "%Y-%m-%d %H:%M:%S", &tm_local);
+  for (double a : session_end_ ? session_end_->trim : a_trim_) {
+    trim.push_back(yaml_double(round_to(a, 3)));
+  }
+  const std::string written_at = local_stamp();
 
   YAML::Node snippet_gains(YAML::NodeType::Map);
   if (final_gains.size() > 0) {
@@ -2486,12 +2648,16 @@ void TuningConductor::write_report(const std::string & status_text)
   report["accel_trim"] = trim;
   if (yaw_tau_) {
     report["final_yawctrl_tau"] = yaml_double(round_to(*yaw_tau_, 3));
+    const auto yit = axis_prog_.find("yaw");
+    if (yit != axis_prog_.end()) {report["yaw_result"] = yit->second.result;}
   } else {
     report["final_yawctrl_tau"] = YAML::Node(YAML::NodeType::Null);
   }
-  report["time"] = std::string(timebuf);
+  report["time"] = session_end_ ? session_end_->stamp : written_at;
+  if (status_text == "accepted") {report["accepted_at"] = written_at;}
   if (session_t0_ >= 0.0) {
-    report["session_duration_s"] = yaml_double(round_to(now_s() - session_t0_, 1));
+    const double t_end = session_end_ ? session_end_->t : now_s();
+    report["session_duration_s"] = yaml_double(round_to(t_end - session_t0_, 1));
   }
   report["zeta_target"] = yaml_double(zeta_target_);
   report["wn_target"] = yaml_double(decision_.wn_target);

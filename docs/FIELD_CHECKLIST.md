@@ -193,11 +193,13 @@ Before arming:
   - [ ] safety block: `min_altitude`, `max_altitude`, `max_pos_error`
         match your field, not someone else's.
   - [ ] `step_size` / `step_size_z` / `yaw_step`: the vehicle stays within
-        +/- these of the hover point for the whole session (defaults
-        0.5 m / 0.4 m / 0.5 rad). Set them to the space you have, plus
-        margin for overshoot and wind. Below ~0.25 m the fit gets noisy —
-        see TUNING_GUIDE A.7b. They can also be changed in flight from the
-        RViz Tuner panel.
+        +/- these of the hover point for the whole session (node defaults
+        0.5 m / 0.4 m / 0.5 rad; the iHunter profile flies 1 m / 1 m).
+        Bigger steps confirm in fewer rounds -- the interval narrows in
+        proportion to the step -- up to the command limit, which the
+        conductor enforces (`saturation_margin`). A down step needs
+        floor + 2x step of height. They can also be changed from the RViz
+        Tuner panel.
 - [ ] Fresh battery. With the default adaptive schedule a full
       3-round session is ~2-5 min of flight (axes that are confirmed
       stop flying early) — budget a battery, wind lengthens the settles.

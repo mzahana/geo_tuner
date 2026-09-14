@@ -96,6 +96,8 @@ public:
   double episode_quiet_time{0.5};
   double episode_settle_band{0.04};
   double episode_settle_floor{0.01};
+  double park_time{1.0};      // s the vehicle must hold still to count as parked
+  double park_spread{0.03};   // m, per-axis position range allowed over park_time
   int episodes_per_rung{3};
   int min_episodes{2};
   double early_stop_spread{1.15};
@@ -139,6 +141,26 @@ public:
   /// a genuinely quiet state or the fit sees a superimposed transient.
   bool is_quiet(double now);
 
+  /// Vehicle holding still -- speed below settle_tol_vel and every position
+  /// axis within park_spread -- for park_time, WHEREVER it is.
+  ///
+  /// The trim learner's gate. is_quiet also demands closeness to the
+  /// setpoint, which is exactly what a steady offset denies: with a 5 cm
+  /// learn threshold and a 6 cm quiet tolerance the learner could only
+  /// absorb offsets between 5 and 6 cm, and a steady wind holding the
+  /// vehicle 12 cm off was never trimmed (quad_sim, 2026-09-14). A gust
+  /// still moves the vehicle, so it fails the spread test and is not learned.
+  bool is_parked(double now);
+
+  /// The vehicle has stopped moving (speed below settle_tol_vel) for
+  /// episode_quiet_time. The end-of-episode test for position axes.
+  ///
+  /// Stopping, not arriving: response_settled demands the mean within 4 % of
+  /// the step, which 7 cm of hover wander on a 1 m step almost never allows,
+  /// so episodes ran to their cap. The acceleration-loop identification does
+  /// not need a parked tail -- its information is in the transient.
+  bool motion_quiet(double now);
+
   /// The recorded response has reached and held its steady state.
   ///
   /// Recording past that point adds only flat samples: they carry no
@@ -176,12 +198,21 @@ public:
   /// snap to north the moment the session starts).
   bool advance_axis(const std::array<double, 3> & hover, double hover_yaw);
 
-  void reset_quiet() {quiet_t0_.reset();}
+  void reset_quiet()
+  {
+    quiet_t0_.reset();
+    park_window_.clear();
+    park_t0_.reset();
+    motion_t0_.reset();
+  }
 
   static double yaw_of(const std::array<double, 4> & q);
 
 private:
   std::optional<double> quiet_t0_;   // SETTLE quiet-window start
+  std::vector<std::pair<double, std::array<double, 3>>> park_window_;   // (t, pos) while still
+  std::optional<double> park_t0_;    // start of the current still run
+  std::optional<double> motion_t0_;  // STEP stopped-window start
 };
 
 }  // namespace geo_tuner

@@ -506,22 +506,36 @@ identified gains):
    the setpoint walks $0 \to +d \to 0 \to -d \to 0 \dots$ and the
    episode yield per unit time doubles. The excursion envelope, the step
    size and the ± alternation are all unchanged.
-2. **Quiet-based settling** (`settle_quiet_time`, `settle_tol_pos/vel`).
-   A step must start from rest, but *rest* is a condition, not a
-   duration: SETTLE now ends once the vehicle holds the setpoint within
-   `settle_tol_pos` / `settle_tol_vel` for `settle_quiet_time`. This
-   gate is *tighter* than the old fixed wait implied (it is checked, not
-   assumed) and `settle_time` remains the hard cap — a noisy or windy
-   plant simply degrades to the old fixed-time behaviour.
-3. **Adaptive episode length** (`adaptive_episode`). Recording stops
-   once the response has held its steady state for `episode_quiet_time`
-   within `episode_settle_band`·|step| — flat tail samples carry no
-   information about $(\omega_n, \zeta, T_d)$. It can never fire before
-   `max(min_episode_time, episode_settle_periods/(\zeta\omega_n))`,
-   i.e. before the transient of the *currently applied* loop could have
-   finished, and `episode_time` is still the cap. The amplitude check
-   ($|\bar y| \ge 0.6|step|$, correct sign) prevents the flat piece
-   during the transport delay from being mistaken for settling.
+2. **Short settle** (`settle_time` 1.5 s cap, `settle_quiet_time`,
+   `settle_tol_pos/vel`). SETTLE ends once the vehicle holds the setpoint
+   within `settle_tol_pos` / `settle_tol_vel` for `settle_quiet_time`, or at
+   the `settle_time` cap. The cap was 4 s while each step's fit needed a
+   parked start; the acceleration-loop identification does not, and in
+   field air (7 cm hover wander against the 6 cm gate) 27 of 40 settles on
+   2026-09-14 ran to the cap — 126 s of a 313 s session.
+   The accel trim is learned while the vehicle is **parked** — speed below
+   `settle_tol_vel` and every axis within `park_spread` for `park_time`,
+   wherever it is — not while it is quiet: quiet requires closeness to the
+   setpoint, which a steady offset denies, so the learner could only ever
+   absorb offsets between its 5 cm threshold and the 6 cm quiet tolerance.
+3. **Adaptive episode length** (`adaptive_episode`, `episode_end`). A
+   position episode ends once the vehicle has **stopped** (speed below
+   `settle_tol_vel` for `episode_quiet_time`), and never before
+   `max(min_episode_time, episode_settle_periods/(\zeta\omega_n))`, the time
+   the applied loop's transient needs; `episode_time` is the cap. The
+   information is in the transient: a well-damped step's command falls
+   below 15 % of its peak within 0.4–2 s. The old rule (`episode_end:
+   settled`) waited for the mean to sit within `episode_settle_band`·|step|
+   of the target, which hover wander on a 1 m step rarely allows. Yaw keeps
+   the settled rule — its first-order fit needs the final value.
+
+   **Step size** sets how much each step tells: the α interval narrows in
+   proportion to the step (the wind does not grow with it), so halving the
+   step needs ~4× the steps. The ceiling is the command limit:
+   `saturation_margin` (0.8) refuses to start while `kx·step` exceeds that
+   fraction of the controller's `max_accel` (or `g·tan(max_tilt_angle)`
+   laterally) and flags any episode whose measured peak command does.
+
 4. **Sequential stopping** (`min_episodes_per_rung`, `early_stop_spread`).
    A bucket ends after `min_episodes_per_rung` reps *only if* every
    flown episode was accepted (no fit rejections, no implausible α) and
