@@ -1,0 +1,21 @@
+#!/usr/bin/env python3
+"""Entry point for geo-tuner-doctor.
+
+Works from the source tree (scripts/ next to doctor/) and from the installed
+layout (lib/geo_tuner/ with the geo_tuner_doctor package installed alongside),
+so `ros2 run geo_tuner geo-tuner-doctor` and a direct source-tree invocation
+behave the same.
+"""
+import sys
+from pathlib import Path
+
+_here = Path(__file__).resolve().parent
+for _cand in (_here, _here.parent / "doctor"):
+    if (_cand / "geo_tuner_doctor").is_dir():
+        sys.path.insert(0, str(_cand))
+        break
+
+from geo_tuner_doctor.cli import main  # noqa: E402
+
+if __name__ == "__main__":
+    sys.exit(main())

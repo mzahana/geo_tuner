@@ -170,6 +170,13 @@ install(DIRECTORY rviz_config/ DESTINATION share/${PROJECT_NAME}/rviz)
 # The only Python left: the offline ulog analyser (pyulog) and the 3D
 # tracking-trail republisher.
 install(PROGRAMS scripts/geo-tuner-hover scripts/tracking_viz.py scripts/geo-tuner-bag-export
+  scripts/geo-tuner-doctor
+  DESTINATION lib/${PROJECT_NAME}
+)
+# The doctor's analysis package rides next to its entry script, so the
+# installed layout mirrors the source tree (scripts/ finds ../doctor there,
+# lib/geo_tuner finds the package beside itself when installed).
+install(DIRECTORY doctor/geo_tuner_doctor
   DESTINATION lib/${PROJECT_NAME}
 )
 
@@ -185,6 +192,14 @@ if(BUILD_TESTING)
     # Field-flight session recordings (test_identification.cpp, FieldFlights).
     target_compile_definitions(test_geo_tuner_core PRIVATE
       GEO_TUNER_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/data")
+  endif()
+  # Doctor unit tests are pure Python; the field-fixture tests skip
+  # themselves where the fetched logs tree is absent (see doctor/tests/).
+  find_package(ament_cmake_pytest QUIET)
+  if(ament_cmake_pytest_FOUND)
+    ament_add_pytest_test(test_geo_tuner_doctor doctor/tests
+      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    )
   endif()
 endif()
 
