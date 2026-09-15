@@ -59,7 +59,8 @@ def _axis_table(s: Session) -> list[str]:
 
 def render_markdown(s: Session, findings: list[Finding],
                     recommendations: list[dict],
-                    plots: list[str] | None = None) -> str:
+                    plots: list[str] | None = None,
+                    history_md: list[str] | None = None) -> str:
     verdict, why = banner(findings)
     art = s.artifacts
     out = [f"# Tuning session {s.name} — {verdict}", "", why, ""]
@@ -113,6 +114,9 @@ def render_markdown(s: Session, findings: list[Finding],
             trig = ", ".join(rec["triggered_by"])
             out.append(f"{i}. {rec['text']} _(triggered by: {trig})_")
         out.append("")
+
+    if history_md:
+        out += history_md
 
     if plots:
         out += ["## Plots", ""]

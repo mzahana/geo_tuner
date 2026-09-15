@@ -56,4 +56,10 @@ def run_identify(csv_path: Path, segments: tuple[int, int] | None = None,
     try:
         return json.loads(proc.stdout)
     except json.JSONDecodeError as e:
+        # A pre-doctor binary ignores an unpaired --json flag and prints the
+        # text report: tell the user to rebuild rather than "bad JSON".
+        if not proc.stdout.lstrip().startswith("{"):
+            raise IdentifyUnavailable(
+                "this geo-tuner-identify predates --json; rebuild geo_tuner "
+                "(rrv pkgs sync + image rebuild on a laptop)") from e
         raise IdentifyUnavailable(f"unparsable --json output: {e}") from e

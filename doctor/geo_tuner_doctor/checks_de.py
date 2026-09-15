@@ -14,7 +14,6 @@ from . import ensembles, imu_analysis, signals
 from .checks import Context
 from .findings import FAIL, INFO, PASS, WARN, Finding, skip
 from .identify import IdentifyUnavailable, run_identify
-from .report import GEN_LEGACY
 from .session import Session
 
 D2_RMS_PASS = 0.03
@@ -130,11 +129,14 @@ def check_d2_model_vs_flown(s: Session, ctx: Context) -> list[Finding]:
         return [skip("MODEL_MISMATCH", "model vs flown steps",
                      "needs the bag and the report")]
     doc = _full_identify(s, ctx)
+    models = _models_from_identify(doc) if doc else None
+    # ensembles are built even without identify: D3's before/after A/B and
+    # the ensembles plot need no model, only the flown responses
+    groups = ensembles.build_ensembles(s.bag, s.report, models)
+    ctx._ensembles = groups  # D3 and the plots reuse them
     if doc is None:
         return [skip("MODEL_MISMATCH", "model vs flown steps",
                      getattr(ctx, "_identify_error", "identify unavailable"))]
-    groups = ensembles.build_ensembles(s.bag, s.report, _models_from_identify(doc))
-    ctx._ensembles = groups  # D3 reuses them
     out = []
     for g in groups:
         if g.rms is None:

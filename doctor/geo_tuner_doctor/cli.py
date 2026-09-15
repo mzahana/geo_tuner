@@ -45,8 +45,33 @@ def main(argv=None) -> int:
                     help="skip reading the bag (fast; bag checks are skipped)")
     ap.add_argument("--no-plots", action="store_true",
                     help="skip writing plots/*.png")
+    ap.add_argument("--utc-offset", metavar="+HH:MM", default=None,
+                    help="the VEHICLE's UTC offset (e.g. +03:00), when this "
+                         "machine's timezone differs from it; local report "
+                         "stamps are interpreted in that offset when "
+                         "matching the UTC-named log and bag")
+    ap.add_argument("--history", nargs="?", const="", default=None,
+                    metavar="DIR", type=str,
+                    help="append the cross-session trend table (legacy "
+                         "sessions re-identified from their bags); DIR "
+                         "defaults to the logs tree being analysed")
     ap.add_argument("--version", action="version", version=__version__)
     args = ap.parse_args(argv)
+
+    if args.utc_offset:
+        import re as _re
+        import time as _time
+        m = _re.fullmatch(r"([+-])(\d{2}):(\d{2})", args.utc_offset)
+        if not m:
+            print("error: --utc-offset must look like +03:00", file=sys.stderr)
+            return 2
+        # POSIX TZ inverts the sign: TZ=LT-3 means UTC+3. Every loader takes
+        # its default tz from the process-local clock, so setting it here
+        # covers them all.
+        sign = "-" if m.group(1) == "+" else "+"
+        import os as _os
+        _os.environ["TZ"] = f"LT{sign}{int(m.group(2))}:{m.group(3)}"
+        _time.tzset()
 
     try:
         sessions = discover(args.target, latest=args.latest)
@@ -73,6 +98,18 @@ def main(argv=None) -> int:
               "(or point at one report)", file=sys.stderr)
         return 2
 
+    history_rows = history_findings = history_md = None
+    if args.history is not None:
+        from .history import build_history, gains_timeline, render_history_md
+        hist_root = Path(args.history).expanduser() if args.history else args.target.expanduser()
+        if not (hist_root / "mav_controllers_config").is_dir():
+            print(f"warning: --history {hist_root} is not a logs tree; skipped",
+                  file=sys.stderr)
+        else:
+            cache = hist_root / "doctor" / "history_cache"
+            history_rows, history_findings = build_history(hist_root, cache)
+            history_md = render_history_md(history_rows, gains_timeline(hist_root))
+
     failures = 0
     for art in sessions:
         if args.out is not None:
@@ -90,6 +127,8 @@ def main(argv=None) -> int:
 
         ctx = build_context(s)
         findings = run_checks(s, ctx)
+        if history_findings:
+            findings.extend(history_findings)
         recs = collect(findings)
         plot_names: list[str] = []
         if not args.no_plots:
@@ -99,7 +138,7 @@ def main(argv=None) -> int:
             except Exception as e:  # plots are decoration, never a failure
                 print(f"  (plots skipped: {type(e).__name__}: {e})")
         (out_dir / "report.md").write_text(
-            render_markdown(s, findings, recs, plot_names))
+            render_markdown(s, findings, recs, plot_names, history_md))
         (out_dir / "findings.json").write_text(render_json(s, findings, recs))
 
         verdict, why = banner(findings)

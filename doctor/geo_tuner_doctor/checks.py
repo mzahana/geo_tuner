@@ -604,6 +604,13 @@ def check_c7_yaw(s: Session, ctx: Context) -> list[Finding]:
         return [Finding("YAW_IDENTIFIED", PASS, "yaw identified and confirmed",
                         axis="yaw", evidence=ev,
                         source=[str(r.path)] + ([str(s.artifacts.log)] if s.log else []))]
+    if s.log is None and r.yaw_result is None:
+        # A pre-9a7b429 report never records the yaw outcome; without the
+        # log there is no evidence either way (a partial fetch, not a fault).
+        return [Finding("YAW_UNKNOWN", INFO,
+                        "yaw confirmation unknown (no launch log, and the "
+                        "report predates yaw_result)",
+                        axis="yaw", evidence=ev, source=[str(r.path)])]
     return [Finding("YAW_NOT_IDENTIFIED", WARN, "yaw never confirmed",
                     axis="yaw", evidence=ev, source=[str(r.path)],
                     explanation="yaw estimates stayed inconsistent across "

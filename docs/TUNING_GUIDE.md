@@ -209,6 +209,72 @@ Important clarifications:
 
 ---
 
+## Reading a session with the doctor
+
+A field session leaves six artifacts behind (report, 50 Hz session CSV,
+per-episode dumps, launch log, bag, gain-override history). `geo-tuner-doctor`
+reads all of them and writes one answer — did the session work, what was
+marginal, and what to do next — in about a minute. It replaced an analysis
+that took a session of ad-hoc scripts after the 2026-09-14 flight.
+
+```bash
+# on a laptop with the ihunter CLI (runs in the rrv panels image):
+ihunter fetch --doctor            # fetch, then analyse what arrived
+ihunter doctor                    # latest fetched session + history table
+ihunter doctor <report.yaml>      # one specific session
+
+# anywhere geo_tuner is built and ROS 2 is sourced:
+ros2 run geo_tuner geo-tuner-doctor ~/src/ihunter_logs --latest --history
+ros2 run geo_tuner geo-tuner-doctor ~/src/ihunter_logs --list
+```
+
+Output lands in `<logs>/doctor/<session>/`: `report.md` (verdict banner,
+session facts, per-axis gains table, findings, recommendations, trend table,
+plots), `findings.json` (stable finding ids, diffable across sessions) and
+`plots/*.png`.
+
+What it checks, in groups:
+
+- **A — data integrity.** All artifacts present and matched across the two
+  clocks (report/CSV stamps are LOCAL, log/bag names UTC; matching is by
+  time window, never by name). Bag closed cleanly; odometry rate/gaps;
+  report generation; report-vs-log consistency (a pre-9a7b429 report written
+  at completion loses the accept-time trim and duration — the log wins);
+  re-identification of the session CSV must reproduce the report.
+- **B — preconditions.** Thrust estimator verified off (the 09-10/09-13
+  sessions flew with it ON, which is exactly what this catches); override
+  provenance vs the `.bak` history; `max_thrust` calibration from hover
+  thrust (>5 % off → re-run the hover test); envelope actually flown vs the
+  profile; command headroom vs the controller clamp.
+- **C — session process.** Time budget and settle-cap statistics; hover
+  wander vs the quiet gate (air quality, not a controller defect); verdict
+  trajectory per axis per round; knife-edge intervals; CI growth; trim;
+  yaw; pauses/aborts; whether the accepted gains were actually saved and
+  match the override on disk.
+- **D — independent verification.** Each round identified alone
+  (`geo-tuner-identify --segments`) must agree with the others; the
+  ensemble of flown steps must match the identified model (score ensembles,
+  never single steps — one 1 m step's overshoot is ±7 % noise in 7 cm
+  wander); an in-flight A/B when gains changed mid-session; phase margins
+  of the final gains on the nominal and worst interval plant.
+- **E — plant health.** IMU and d/dt-velocity cross-checks of the z plant
+  (labelled OLS — biased under feedback; the 2SLS number is the plant), the
+  incremental thrust slope at hover, lag per axis, battery, vibration.
+- **F — history** (`--history`). One row per session ever fetched; legacy
+  sessions are re-identified from their bags through `geo-tuner-bag-export`,
+  so the whole table speaks the principled method (the old bags say
+  z kv 2.50 → update to ~3.0 — the update 09-14 then validated in flight).
+  Alpha/lag drifting beyond the intervals between sessions flags a plant
+  change (props, ESC, payload).
+
+Every check that is missing an input skips with the reason instead of
+failing, and each finding carries its evidence and source. The tool is
+**diagnostic only**: it never changes gains, configs or files on the drone,
+never needs the drone reachable, and never suggests committing tuned gains
+to a repository — vehicle gains live on the vehicle. If the analysis runs
+on a machine whose timezone differs from the vehicle's, pass the vehicle's
+offset: `--utc-offset +03:00`.
+
 ## 5. Appendix A — Mathematical foundations
 
 Complete derivations for every rule and formula the tooling implements.
